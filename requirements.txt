@@ -1,0 +1,6 @@
+# The toolkit runs on the Python standard library only.
+# External dependencies are binaries, not Python packages:
+#   * ffmpeg / ffprobe built with the in-house libwz264 / libwz265 encoders
+#   * awscli v2 (only needed for --upload / --import / --upload-only / --import-only)
+#
+# Nothing to pip install. Python 3.8+ is required (3.11 recommended).

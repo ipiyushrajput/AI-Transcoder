@@ -1,0 +1,165 @@
+{
+  "paths": {
+    "ffmpeg_executable": "./bin/ffmpeg",
+    "ffprobe_executable": "./bin/ffprobe"
+  },
+
+  "defaults": {
+    "input_video": "assets/input.mp4",
+    "output_dir": "hls_output_264_wz",
+    "subtitle_file": null,
+    "subtitle_language": "en",
+
+    "template": "h264_standard",
+    "resolutions": "1080p,720p,540p,360p",
+
+    "esam": false,
+    "audio_norm": false,
+    "upload": false,
+    "import": false,
+
+    "log_file": "logs/wz_vod_hls.log",
+
+    "hls_settings": {
+      "hls_time": 6,
+      "hls_playlist_type": "vod",
+      "hls_flags": "independent_segments",
+      "hls_segment_type": "mpegts"
+    },
+
+    "InputClippings": [],
+
+    "mediapackage": {
+      "packaging_group_id": "vod_packaging_group",
+      "vod_role_name": "MediaPackage_VOD_Role",
+      "vod_role_arn": "arn:aws:iam::{{RoleArn}}:role/MediaPackage_VOD_Role",
+      "region": "us-east-1",
+      "package_type": "CMAF",
+      "debug_aws": false
+    }
+  },
+
+  "s3": {
+    "bucket_name": "",
+    "key_prefix": ""
+  },
+
+  "thumbnail_generation": {
+    "enabled": false
+  },
+
+  "audio_normalization": {
+    "loudnorm_settings": {
+      "i": -23.0,
+      "lra": 7.0,
+      "tp": -2.0
+    }
+  },
+
+  "Esam": {
+    "SignalProcessingNotification": {
+      "SccXml": ""
+    },
+    "ManifestConfirmConditionNotification": {
+      "MccXml": ""
+    }
+  },
+
+  "video_templates": {
+    "h264_standard": [
+      {
+        "name": "1080p",
+        "width": 1920,
+        "height": 1080,
+        "codec": "H_264",
+        "codec_params": "vbv-maxrate=6000:vbv-bufsize=12000",
+        "bitrate": "6M",
+        "crf": null,
+        "preset": "medium",
+        "threads": 8,
+        "video_format": "yuv420p",
+        "interlace_mode": "PROGRESSIVE",
+        "frame_rate": "",
+        "GopSize": 6.0
+      },
+      {
+        "name": "720p",
+        "width": 1280,
+        "height": 720,
+        "codec": "H_264",
+        "codec_params": "vbv-maxrate=3500:vbv-bufsize=7000",
+        "bitrate": "3500k",
+        "crf": null,
+        "preset": "medium",
+        "threads": 6,
+        "video_format": "yuv420p",
+        "interlace_mode": "PROGRESSIVE",
+        "frame_rate": "",
+        "GopSize": 6.0
+      },
+      {
+        "name": "540p",
+        "width": 960,
+        "height": 540,
+        "codec": "H_264",
+        "codec_params": "vbv-maxrate=2000:vbv-bufsize=4000",
+        "bitrate": "2M",
+        "crf": null,
+        "preset": "medium",
+        "threads": 4,
+        "video_format": "yuv420p",
+        "interlace_mode": "PROGRESSIVE",
+        "frame_rate": "",
+        "GopSize": 6.0
+      },
+      {
+        "name": "360p",
+        "width": 640,
+        "height": 360,
+        "codec": "H_264",
+        "codec_params": "vbv-maxrate=1000:vbv-bufsize=2000",
+        "bitrate": "1M",
+        "crf": null,
+        "preset": "medium",
+        "threads": 2,
+        "video_format": "yuv420p",
+        "interlace_mode": "PROGRESSIVE",
+        "frame_rate": "",
+        "GopSize": 6.0
+      }
+    ],
+
+    "h265_standard": [
+      {
+        "name": "1080p",
+        "width": 1920,
+        "height": 1080,
+        "codec": "H_265",
+        "codec_params": "vbv-maxrate=4500:vbv-bufsize=9000",
+        "bitrate": "4500k",
+        "crf": null,
+        "preset": "medium",
+        "threads": 8,
+        "video_format": "yuv420p",
+        "interlace_mode": "PROGRESSIVE",
+        "frame_rate": "",
+        "GopSize": 6.0
+      },
+      {
+        "name": "720p",
+        "width": 1280,
+        "height": 720,
+        "codec": "H_265",
+        "codec_params": "vbv-maxrate=2500:vbv-bufsize=5000",
+        "bitrate": "2500k",
+        "crf": null,
+        "preset": "medium",
+        "threads": 6,
+        "video_format": "yuv420p",
+        "interlace_mode": "PROGRESSIVE",
+        "frame_rate": "",
+        "GopSize": 6.0
+      }
+    ]
+  }
+}

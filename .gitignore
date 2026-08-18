@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime artefacts
+.wz_temp/
+logs/
+hls_output*/
+*.log
+
+# Custom ffmpeg build and media assets are not tracked
+bin/
+assets/
