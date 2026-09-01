@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
+from hls_toolkit.job_context import log
 from hls_toolkit.time_utils import timecode_to_seconds
 
 
@@ -57,13 +58,13 @@ def parse_vtt_file(vtt_path: Path, video_fps: float = 29.97002997002997) -> List
     """
     cues = []
     if not vtt_path.exists():
-        logging.warning(f"VTT file not found: {vtt_path}")
+        log().warning(f"VTT file not found: {vtt_path}")
         return cues
 
     with open(vtt_path, "r", encoding="utf-8") as f:
         lines = f.read().splitlines()
     if not lines or not lines[0].strip().startswith("WEBVTT"):
-        logging.error(f"Invalid VTT file header for {vtt_path}. Expected 'WEBVTT'.")
+        log().error(f"Invalid VTT file header for {vtt_path}. Expected 'WEBVTT'.")
         return cues
 
     current_cue_id = None
@@ -96,7 +97,7 @@ def parse_vtt_file(vtt_path: Path, video_fps: float = 29.97002997002997) -> List
                                    text="\n".join(current_cue_text_lines),
                                    settings=settings))
             except Exception as e:
-                logging.error(f"Error parsing cue from {vtt_path}: "
+                log().error(f"Error parsing cue from {vtt_path}: "
                               f"{current_cue_time_line} - {e}. Skipping cue.")
         finally:
             current_cue_id = None
@@ -192,15 +193,15 @@ def generate_merged_subtitle_file(input_subtitle_path: Path,
     merged_subtitle_path = None
     cumulative_timeline_offset = 0.0
     if not input_subtitle_path or not input_subtitle_path.exists() or not clippings:
-        logging.info("No input subtitle file, or no clippings provided for subtitle merging.")
+        log().info("No input subtitle file, or no clippings provided for subtitle merging.")
         return (None, None, 0.0)
     try:
         Path(temp_dir).mkdir(parents=True, exist_ok=True)
         temp_subtitle_dir = Path(tempfile.mkdtemp(prefix="hls_sub_clips_", dir=temp_dir))
-        logging.info(f"Created temporary directory for subtitle clips: {temp_subtitle_dir}")
+        log().info(f"Created temporary directory for subtitle clips: {temp_subtitle_dir}")
         all_original_cues = parse_vtt_file(input_subtitle_path, video_fps=video_fps)
         if not all_original_cues:
-            logging.warning(f"No cues found in original subtitle file: {input_subtitle_path}. "
+            log().warning(f"No cues found in original subtitle file: {input_subtitle_path}. "
                             "Skipping subtitle processing.")
             return (None, None, 0.0)
 
@@ -209,17 +210,17 @@ def generate_merged_subtitle_file(input_subtitle_path: Path,
             start_timecode_str = clip.get("StartTimecode")
             end_timecode_str = clip.get("EndTimecode")
             if not start_timecode_str or not end_timecode_str:
-                logging.warning(f"Warning: Clipping {i + 1} is missing StartTimecode or "
+                log().warning(f"Warning: Clipping {i + 1} is missing StartTimecode or "
                                 "EndTimecode. Skipping subtitle part.")
                 continue
             clip_start_abs = timecode_to_seconds(start_timecode_str, str(video_fps))
             clip_end_abs = timecode_to_seconds(end_timecode_str, str(video_fps))
             clip_duration = clip_end_abs - clip_start_abs
             if clip_duration <= 0:
-                logging.warning(f"Warning: Clipping {i + 1} has non-positive duration "
+                log().warning(f"Warning: Clipping {i + 1} has non-positive duration "
                                 f"({clip_duration}s). Skipping subtitle part.")
                 continue
-            logging.info(f"Processing subtitle clipping: Clip {i + 1} - Original "
+            log().info(f"Processing subtitle clipping: Clip {i + 1} - Original "
                          f"start={start_timecode_str}, end={end_timecode_str}, "
                          f"duration={float(clip_duration):.3f}s")
             clipped_cues_for_this_segment = clip_and_offset_vtt_cues(
@@ -235,7 +236,7 @@ def generate_merged_subtitle_file(input_subtitle_path: Path,
             cumulative_timeline_offset += clip_duration
 
         if not global_timeline_cues:
-            logging.info("No valid subtitle cues generated after clipping. "
+            log().info("No valid subtitle cues generated after clipping. "
                          "Creating an empty merged VTT.")
             merged_subtitle_path = temp_subtitle_dir / "merged_subtitles.vtt"
             with open(merged_subtitle_path, "w", encoding="utf-8") as f:
@@ -249,11 +250,11 @@ def generate_merged_subtitle_file(input_subtitle_path: Path,
             f.write("WEBVTT\n\n")
             for cue in final_merged_cues_after_processing:
                 f.write(str(cue) + "\n\n")
-        logging.info("Globally merged subtitle file (with MediaConvert-like merging) "
+        log().info("Globally merged subtitle file (with MediaConvert-like merging) "
                      f"created: {merged_subtitle_path}")
         return (merged_subtitle_path, temp_subtitle_dir, cumulative_timeline_offset)
     except Exception as e:
-        logging.error(f"An error occurred during subtitle clipping or merging: {e}",
+        log().error(f"An error occurred during subtitle clipping or merging: {e}",
                       exc_info=True)
         if temp_subtitle_dir and temp_subtitle_dir.exists():
             shutil.rmtree(temp_subtitle_dir)
@@ -274,13 +275,13 @@ def segment_vtt_for_hls(merged_vtt_path: Path,
     hls_playlist_entries = []
 
     if not merged_vtt_path or not merged_vtt_path.exists():
-        logging.error(f"Merged VTT file not found for segmentation: {merged_vtt_path}")
+        log().error(f"Merged VTT file not found for segmentation: {merged_vtt_path}")
         return (False, None)
 
     global_timeline_cues = parse_vtt_file(merged_vtt_path)
 
     if not global_timeline_cues:
-        logging.warning(f"No cues found in merged VTT file {merged_vtt_path}. "
+        log().warning(f"No cues found in merged VTT file {merged_vtt_path}. "
                         "Generating empty HLS playlist for VTT.")
         hls_playlist_path = output_dir / f"channel_{sub_lang}-vtt-{vtt_index}.m3u8"
         with open(hls_playlist_path, "w", encoding="utf-8") as f:
@@ -297,10 +298,10 @@ def segment_vtt_for_hls(merged_vtt_path: Path,
     segment_boundaries = [s[0] for s in video_segments]
 
     if not segment_boundaries or len(segment_boundaries) < 2:
-        logging.error("Invalid video_segments provided for VTT segmentation. Cannot proceed.")
+        log().error("Invalid video_segments provided for VTT segmentation. Cannot proceed.")
         return (False, None)
 
-    logging.debug(f"Final VTT segment boundaries based on video: {segment_boundaries}")
+    log().debug(f"Final VTT segment boundaries based on video: {segment_boundaries}")
 
     segment_index = 0
     hls_sub_playlist_path = output_dir / f"channel_{sub_lang}-vtt-{vtt_index}.m3u8"
@@ -364,5 +365,5 @@ def segment_vtt_for_hls(merged_vtt_path: Path,
         f.writelines(hls_playlist_entries)
         f.write("#EXT-X-ENDLIST\n")
 
-    logging.info(f"VTT HLS playlist generated: {hls_sub_playlist_path}")
+    log().info(f"VTT HLS playlist generated: {hls_sub_playlist_path}")
     return (True, hls_sub_playlist_path)

@@ -3,10 +3,13 @@
 
 Thin launcher around the ``wz_vod_hls`` CLI so the whole pipeline can be run with:
 
-    python app.py --config config.json --input input.mp4 --output hls_out
+    python app.py --config config.json
+    python app.py --input s3://bucket/key.mp4 --output my_asset
 
-Every flag accepted by ``wz_vod_hls`` is accepted here unchanged; run
-``python app.py --help`` for the full list.
+Inputs may be local paths or ``s3://`` URIs. Every flag accepted by
+``wz_vod_hls`` is accepted here unchanged; run ``python app.py --help``.
+
+To run the HTTP service instead, start ``python -m api.app``.
 """
 import os
 import sys

@@ -1,0 +1,27 @@
+[Unit]
+Description=AI-Transcoder API
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/ai-transcoder
+EnvironmentFile=/etc/ai-transcoder.env
+ExecStart=/opt/ai-transcoder/.venv/bin/gunicorn \
+    --workers 1 \
+    --threads 8 \
+    --timeout 0 \
+    --bind 0.0.0.0:8000 \
+    --access-logfile - \
+    --error-logfile - \
+    "api.app:create_app()"
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+# Transcodes are long; give in-flight jobs time to stop cleanly.
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

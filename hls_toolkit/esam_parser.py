@@ -6,6 +6,7 @@ import math
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
+from hls_toolkit.job_context import log
 from hls_toolkit.time_utils import timecode_to_seconds
 from hls_toolkit.playlist_utils import (is_master_playlist, find_variants,
                                         parse_variant_segments, bump_segment_lines,
@@ -20,12 +21,12 @@ FLOAT_TOLERANCE = 0.05
 def parse_esam_xml_string(xml_string):
     try:
         root = ET.fromstring(xml_string.strip())
-        logging.debug(f"Parsed XML Root: {root.tag}, Attributes: {root.attrib}")
+        log().debug(f"Parsed XML Root: {root.tag}, Attributes: {root.attrib}")
     except ET.ParseError as e:
-        logging.error(f"Error parsing ESAM XML string: {e}. Returning empty event list.")
+        log().error(f"Error parsing ESAM XML string: {e}. Returning empty event list.")
         return []
     except Exception as e:
-        logging.error(f"Unexpected error during ESAM XML parsing: {e}. Returning empty event list.")
+        log().error(f"Unexpected error during ESAM XML parsing: {e}. Returning empty event list.")
         return []
 
     events = []
@@ -33,12 +34,12 @@ def parse_esam_xml_string(xml_string):
         point = rs.find(f"{SIG_NS}NPTPoint")
         seginfo = rs.find(f"{SIG_NS}SCTE35PointDescriptor/{SIG_NS}SegmentationDescriptorInfo")
         if point is None:
-            logging.warning("ESAM ResponseSignal missing NPTPoint. Skipping event.")
+            log().warning("ESAM ResponseSignal missing NPTPoint. Skipping event.")
             continue
         try:
             npt = float(point.get("nptPoint"))
         except (ValueError, TypeError):
-            logging.warning(f'Invalid NPTPoint value: {point.get("nptPoint")}. Skipping event.')
+            log().warning(f'Invalid NPTPoint value: {point.get("nptPoint")}. Skipping event.')
             continue
 
         ev = {'npt': npt,
@@ -58,7 +59,7 @@ def parse_esam_xml_string(xml_string):
         events.append(ev)
 
     events.sort(key=lambda x: x["npt"])
-    logging.info(f"Parsed {len(events)} ESAM event(s) from XML string")
+    log().info(f"Parsed {len(events)} ESAM event(s) from XML string")
     return events
 
 
@@ -66,7 +67,7 @@ def parse_mcc_xml_asset_tags(xml_string):
     ns_map = {'ns2': "http://www.cablelabs.com/namespaces/metadata/xsd/confirmation/2",
               'ns3': "http://www.cablelabs.com/namespaces/metadata/xsd/signaling/2"}
     if not xml_string:
-        logging.warning("MCC XML string is empty. Returning empty asset tags map.")
+        log().warning("MCC XML string is empty. Returning empty asset tags map.")
         return {}
 
     asset_tags_map = {}
@@ -75,7 +76,7 @@ def parse_mcc_xml_asset_tags(xml_string):
         for manifest_response in root.findall(".//ns2:ManifestResponse", ns_map):
             acquisition_signal_id = manifest_response.get("acquisitionSignalID")
             if not acquisition_signal_id:
-                logging.warning("MCC ManifestResponse missing acquisitionSignalID. Skipping.")
+                log().warning("MCC ManifestResponse missing acquisitionSignalID. Skipping.")
                 continue
             asset_tag = None
             for tag_element in manifest_response.findall(".//ns2:Tag", ns_map):
@@ -89,16 +90,16 @@ def parse_mcc_xml_asset_tags(xml_string):
             if asset_tag:
                 asset_tags_map[acquisition_signal_id] = asset_tag
             else:
-                logging.warning(f"MCC ManifestResponse for acquisitionSignalID "
+                log().warning(f"MCC ManifestResponse for acquisitionSignalID "
                                 f"'{acquisition_signal_id}' missing #EXT-X-ASSET tag. Skipping.")
     except ET.ParseError as e:
-        logging.error(f"Error parsing MCC XML string: {e}. Returning empty asset tags map.")
+        log().error(f"Error parsing MCC XML string: {e}. Returning empty asset tags map.")
         return {}
     except Exception as e:
-        logging.error(f"Unexpected error during MCC XML parsing: {e}. Returning empty asset tags map.")
+        log().error(f"Unexpected error during MCC XML parsing: {e}. Returning empty asset tags map.")
         return {}
 
-    logging.info(f"Parsed {len(asset_tags_map)} asset tag(s) from MCC XML string")
+    log().info(f"Parsed {len(asset_tags_map)} asset tag(s) from MCC XML string")
     return asset_tags_map
 
 
@@ -108,7 +109,7 @@ def inject_elemental_markers(m3u8_path: Path,
                              video_segments: Optional[List[Tuple[float, float, str, int]]] = None) -> int:
     lines, segments, total, _ = parse_variant_segments(m3u8_path)
     if not segments:
-        logging.info(f"{m3u8_path.name}: No segments found, skipping")
+        log().info(f"{m3u8_path.name}: No segments found, skipping")
         return 0
 
     plans = []
@@ -157,7 +158,7 @@ def inject_elemental_markers(m3u8_path: Path,
                 matched = True
 
         if not matched:
-            logging.info(f"{m3u8_path.name}: Skipping signal {npt:.3f}s as it is "
+            log().info(f"{m3u8_path.name}: Skipping signal {npt:.3f}s as it is "
                          "outside segment boundaries.")
 
     if not plans:
@@ -184,7 +185,7 @@ def inject_elemental_markers(m3u8_path: Path,
 
             stype = ev.get("segmentTypeId")
             if str(stype) == "53":
-                logging.info(f"{m3u8_path.name}: Signal {npt_to_log:.3f}s (Type 53) is beyond "
+                log().info(f"{m3u8_path.name}: Signal {npt_to_log:.3f}s (Type 53) is beyond "
                              "total duration. Skipping explicit CUE-IN insertion.")
                 continue
 
@@ -204,13 +205,13 @@ def inject_elemental_markers(m3u8_path: Path,
             for line_to_insert in reversed(lines_to_insert_at_end):
                 lines.insert(insert_pos, line_to_insert)
             inserted_count += len(lines_to_insert_at_end)
-            logging.info(f"{m3u8_path.name}: Signal {npt_to_log:.3f}s is beyond total duration. "
+            log().info(f"{m3u8_path.name}: Signal {npt_to_log:.3f}s is beyond total duration. "
                          f"Inserting EXT-X-CUE-OUT at end of playlist (line {insert_pos}).")
             continue
 
         if idx == -1:
             if not segments:
-                logging.warning(f"{m3u8_path.name}: No segments found, cannot insert at start.")
+                log().warning(f"{m3u8_path.name}: No segments found, cannot insert at start.")
                 continue
             sstart = 0.0
             sfile = "Start of Playlist"
@@ -224,11 +225,11 @@ def inject_elemental_markers(m3u8_path: Path,
             ["#EXT-X-CUE-OUT", "#EXT-X-CUE-OUT-CONT", "#EXT-X-CUE-IN"], window=1)
         if marker_exists:
             if math.isclose(npt_to_log, normalize_float(sstart), abs_tol=FLOAT_TOLERANCE):
-                logging.info(f"{m3u8_path.name}: Marker for {npt_to_log:.3f}s exists near "
+                log().info(f"{m3u8_path.name}: Marker for {npt_to_log:.3f}s exists near "
                              f"{sfile}, skipping insertion.")
                 continue
             else:
-                logging.info(f"{m3u8_path.name}: Found existing marker near {sfile} but not "
+                log().info(f"{m3u8_path.name}: Found existing marker near {sfile} but not "
                              f"aligned with NPT {npt_to_log:.3f}s. Inserting new marker.")
 
         stype = ev.get("segmentTypeId")
@@ -243,10 +244,10 @@ def inject_elemental_markers(m3u8_path: Path,
                 lines.insert(insert_pos, "#EXT-X-CUE-IN\n")
                 inserted_count += 1
                 bump_segment_lines(segments, insert_pos)
-                logging.info(f"{m3u8_path.name}: Inserting EXT-X-CUE-IN after {sfile} "
+                log().info(f"{m3u8_path.name}: Inserting EXT-X-CUE-IN after {sfile} "
                              f"(signal {npt_to_log:.3f}s)")
             else:
-                logging.info(f"{m3u8_path.name}: Skipping insertion of EXT-X-CUE-IN "
+                log().info(f"{m3u8_path.name}: Skipping insertion of EXT-X-CUE-IN "
                              f"(signal {npt_to_log:.3f}s) due to nearby existing and aligned CUE-IN.")
             continue
 
@@ -263,7 +264,7 @@ def inject_elemental_markers(m3u8_path: Path,
             asset_inserted = True
         if ad_break_logic_duration == 0:
             lines_to_insert.append("#EXT-X-CUE-IN\n")
-            logging.info(f"{m3u8_path.name}: Inserting immediate EXT-X-CUE-IN for "
+            log().info(f"{m3u8_path.name}: Inserting immediate EXT-X-CUE-IN for "
                          f"0-duration break after {sfile}.")
 
         current_insert_pos = insert_pos
@@ -271,14 +272,14 @@ def inject_elemental_markers(m3u8_path: Path,
             lines.insert(current_insert_pos + i, line_to_insert)
         inserted_count += len(lines_to_insert)
         bump_segment_lines(segments, insert_pos, delta=len(lines_to_insert))
-        logging.info(f"{m3u8_path.name}: Inserting EXT-X-CUE-OUT "
+        log().info(f"{m3u8_path.name}: Inserting EXT-X-CUE-OUT "
                      f"(duration={cue_out_tag_duration}) after {sfile} "
                      f"(signal {npt_to_log:.3f}s)")
         if asset_inserted:
-            logging.info(f"{m3u8_path.name}: Inserting Asset Tag for signal "
+            log().info(f"{m3u8_path.name}: Inserting Asset Tag for signal "
                          f"{acq_signal_id} after {sfile}")
         if ad_break_logic_duration == 0:
-            logging.info(f"{m3u8_path.name}: Inserting immediate EXT-X-CUE-IN for 0-duration break.")
+            log().info(f"{m3u8_path.name}: Inserting immediate EXT-X-CUE-IN for 0-duration break.")
             continue
 
         anchor_start = normalize_float(sstart, 3)
@@ -295,7 +296,7 @@ def inject_elemental_markers(m3u8_path: Path,
                     lines.insert(insert_pos_cont, "#EXT-X-CUE-IN\n")
                     inserted_count += 1
                     bump_segment_lines(segments, insert_pos_cont)
-                logging.info(f"{m3u8_path.name}: Inserting EXT-X-CUE-IN after {seg_file} "
+                log().info(f"{m3u8_path.name}: Inserting EXT-X-CUE-IN after {seg_file} "
                              f"(elapsed {elapsed:.3f}s)")
                 break
             full_dur_str = f"{ad_break_logic_duration:.3f}"
@@ -305,7 +306,7 @@ def inject_elemental_markers(m3u8_path: Path,
                 lines.insert(insert_pos_cont, cont_tag)
                 inserted_count += 1
                 bump_segment_lines(segments, insert_pos_cont)
-            logging.info(f"{m3u8_path.name}: Inserting EXT-X-CUE-OUT-CONT after {seg_file} "
+            log().info(f"{m3u8_path.name}: Inserting EXT-X-CUE-OUT-CONT after {seg_file} "
                          f"(elapsed {elapsed:.3f}s)")
             j += 1
         else:
@@ -315,7 +316,7 @@ def inject_elemental_markers(m3u8_path: Path,
                 lines.insert(insert_at, "#EXT-X-CUE-IN\n")
                 inserted_count += 1
                 bump_segment_lines(segments, insert_at)
-            logging.info(f"{m3u8_path.name}: Inserting EXT-X-CUE-IN at the end of the "
+            log().info(f"{m3u8_path.name}: Inserting EXT-X-CUE-IN at the end of the "
                          "playlist (ad ran to end)")
 
     m3u8_path.write_text("".join(lines), encoding="utf-8")
@@ -328,28 +329,28 @@ def process_playlist(m3u8_arg: str,
                      video_segments: Optional[List[Tuple[float, float, str, int]]] = None):
     m3u8_path = Path(m3u8_arg).resolve()
     if not m3u8_path.exists():
-        logging.error(f"Playlist not found: {m3u8_path}")
+        log().error(f"Playlist not found: {m3u8_path}")
         return
 
     content = m3u8_path.read_text(encoding="utf-8").splitlines(keepends=True)
     if is_master_playlist(content):
         variants = find_variants(content, m3u8_path.parent)
-        logging.info(f"Master playlist detected, variant count: {len(variants)}")
+        log().info(f"Master playlist detected, variant count: {len(variants)}")
         total_injected = 0
         for uri, abs_path in variants:
             if not abs_path.exists():
-                logging.warning(f"Variant file not found, skipping: {uri} -> {abs_path}")
+                log().warning(f"Variant file not found, skipping: {uri} -> {abs_path}")
                 continue
-            logging.info(f"Processing variant: {uri}")
+            log().info(f"Processing variant: {uri}")
             cnt = inject_elemental_markers(abs_path, esam_events, asset_tags_map,
                                            video_segments=video_segments)
-            logging.info(f"  Injected {cnt} markers into {uri}")
+            log().info(f"  Injected {cnt} markers into {uri}")
             total_injected += cnt
-        logging.info(f"Total injected markers across all variants: {total_injected}")
+        log().info(f"Total injected markers across all variants: {total_injected}")
     else:
         cnt = inject_elemental_markers(m3u8_path, esam_events, asset_tags_map,
                                        video_segments=video_segments)
-        logging.info(f"Injected {cnt} markers into {m3u8_path.name}")
+        log().info(f"Injected {cnt} markers into {m3u8_path.name}")
 
 
 def remap_esam_events_for_merged_clips(original_events: List[Dict[str, Any]],
@@ -358,7 +359,7 @@ def remap_esam_events_for_merged_clips(original_events: List[Dict[str, Any]],
     if not original_events:
         return []
     if not clippings:
-        logging.warning("No clippings provided for ESAM remapping. "
+        log().warning("No clippings provided for ESAM remapping. "
                         "Returning original events without remapping.")
         return original_events
 
@@ -368,25 +369,25 @@ def remap_esam_events_for_merged_clips(original_events: List[Dict[str, Any]],
         start_timecode = clip.get("StartTimecode")
         end_timecode = clip.get("EndTimecode")
         if not start_timecode or not end_timecode:
-            logging.warning(f"Clipping missing StartTimecode or EndTimecode. Skipping: {clip}")
+            log().warning(f"Clipping missing StartTimecode or EndTimecode. Skipping: {clip}")
             continue
         try:
             clip_start_orig = timecode_to_seconds(start_timecode, str(video_fps))
             clip_end_orig = timecode_to_seconds(end_timecode, str(video_fps))
             if clip_end_orig <= clip_start_orig:
-                logging.warning(f"Clipping has non-positive duration. Skipping: {clip}")
+                log().warning(f"Clipping has non-positive duration. Skipping: {clip}")
                 continue
             processed_clippings.append({**{'start_orig': clip_start_orig,
                                            'end_orig': clip_end_orig,
                                            'duration': clip_end_orig - clip_start_orig},
                                         **clip})
         except ValueError as e:
-            logging.error(f"Error parsing timecode in clipping {clip}: {e}. Skipping.")
+            log().error(f"Error parsing timecode in clipping {clip}: {e}. Skipping.")
             continue
 
     processed_clippings.sort(key=lambda x: x["start_orig"])
     if not processed_clippings:
-        logging.warning("No valid clippings after processing. Cannot remap ESAM events.")
+        log().warning("No valid clippings after processing. Cannot remap ESAM events.")
         return []
 
     for original_event in original_events:
@@ -410,7 +411,7 @@ def remap_esam_events_for_merged_clips(original_events: List[Dict[str, Any]],
             if original_npt >= clip_start_orig - FLOAT_TOLERANCE \
                     and original_npt < clip_end_orig + FLOAT_TOLERANCE:
                 remapped_npt = original_npt - clip_start_orig + current_offset
-                logging.debug(f"Remapping event {float(original_npt):.6f}: Within clip {i} "
+                log().debug(f"Remapping event {float(original_npt):.6f}: Within clip {i} "
                               f"({float(clip_start_orig):.6f}-{float(clip_end_orig):.6f}). "
                               f"Offset {float(current_offset):.6f}. New: {float(remapped_npt):.6f}")
                 remapped_event = original_event.copy()
@@ -418,7 +419,7 @@ def remap_esam_events_for_merged_clips(original_events: List[Dict[str, Any]],
                 remapped_events_final.append(remapped_event)
                 event_remapped = True
                 break
-            logging.debug(f"Remapping event {float(original_npt):.6f}: After clip {i} "
+            log().debug(f"Remapping event {float(original_npt):.6f}: After clip {i} "
                           f"({float(clip_start_orig):.6f}-{float(clip_end_orig):.6f}).")
             current_offset += clip_duration
         else:
@@ -429,9 +430,9 @@ def remap_esam_events_for_merged_clips(original_events: List[Dict[str, Any]],
             event_remapped = True
 
         if not event_remapped:
-            logging.debug(f"ESAM event (Original NPT: {original_npt:.2f}s) was not remapped")
+            log().debug(f"ESAM event (Original NPT: {original_npt:.2f}s) was not remapped")
 
     remapped_events_final.sort(key=lambda x: x["npt"])
-    logging.info(f"Remapped {len(remapped_events_final)} ESAM events for compacted timeline. "
+    log().info(f"Remapped {len(remapped_events_final)} ESAM events for compacted timeline. "
                  f"Total original events: {len(original_events)}.")
     return remapped_events_final

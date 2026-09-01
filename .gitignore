@@ -13,3 +13,9 @@ hls_output*/
 # Custom ffmpeg build and media assets are not tracked
 bin/
 assets/
+
+# Environment and secrets
+.env
+
+# Server-side scratch
+/var/tmp/ai-transcoder/

@@ -1,70 +1,45 @@
 {
-  "paths": {
-    "ffmpeg_executable": "./bin/ffmpeg",
-    "ffprobe_executable": "./bin/ffprobe"
-  },
-
   "defaults": {
-    "input_video": "assets/input.mp4",
-    "output_dir": "hls_output_264_wz",
-    "subtitle_file": null,
-    "subtitle_language": "en",
-
-    "template": "h264_standard",
+    "input_video": "s3://dev-us-west-2-transcoder-bucket/Visionular/AETN_AmericanPickers_S10_E03_en.mp4",
+    "output_dir": "Test",
+    "subtitle_file": "s3://dev-us-west-2-transcoder-bucket/Visionular/AETN_AmericanPickers_S10_E03_en.vtt",
     "resolutions": "1080p,720p,540p,360p",
-
-    "esam": false,
-    "audio_norm": false,
-    "upload": false,
-    "import": false,
-
-    "log_file": "logs/wz_vod_hls.log",
-
+    "esam": true,
+    "audio_norm": true,
+    "upload": true,
+    "InputClippings": [
+      {
+        "EndTimecode": "00:10:02:27",
+        "StartTimecode": "00:00:00:00"
+      },
+      {
+        "EndTimecode": "00:19:12:26",
+        "StartTimecode": "00:10:02:28"
+      },
+      {
+        "EndTimecode": "00:26:57:05",
+        "StartTimecode": "00:19:12:27"
+      },
+      {
+        "EndTimecode": "00:35:00:07",
+        "StartTimecode": "00:26:57:06"
+      },
+      {
+        "EndTimecode": "00:42:50:14",
+        "StartTimecode": "00:35:00:08"
+      }
+    ],
     "hls_settings": {
       "hls_time": 6,
       "hls_playlist_type": "vod",
       "hls_flags": "independent_segments",
       "hls_segment_type": "mpegts"
     },
-
-    "InputClippings": [],
-
-    "mediapackage": {
-      "packaging_group_id": "vod_packaging_group",
-      "vod_role_name": "MediaPackage_VOD_Role",
-      "vod_role_arn": "arn:aws:iam::{{RoleArn}}:role/MediaPackage_VOD_Role",
-      "region": "us-east-1",
-      "package_type": "CMAF",
-      "debug_aws": false
-    }
+    "generate_thumbnails": true,
+    "template": "h264_standard",
+    "subtitle_language": "en",
+    "log_dir": "logs"
   },
-
-  "s3": {
-    "bucket_name": "",
-    "key_prefix": ""
-  },
-
-  "thumbnail_generation": {
-    "enabled": false
-  },
-
-  "audio_normalization": {
-    "loudnorm_settings": {
-      "i": -23.0,
-      "lra": 7.0,
-      "tp": -2.0
-    }
-  },
-
-  "Esam": {
-    "SignalProcessingNotification": {
-      "SccXml": ""
-    },
-    "ManifestConfirmConditionNotification": {
-      "MccXml": ""
-    }
-  },
-
   "video_templates": {
     "h264_standard": [
       {
@@ -72,94 +47,179 @@
         "width": 1920,
         "height": 1080,
         "codec": "H_264",
-        "codec_params": "vbv-maxrate=6000:vbv-bufsize=12000",
-        "bitrate": "6M",
-        "crf": null,
-        "preset": "medium",
-        "threads": 8,
-        "video_format": "yuv420p",
         "interlace_mode": "PROGRESSIVE",
-        "frame_rate": "",
-        "GopSize": 6.0
+        "bitrate": "3000k",
+        "codec_params": "rc-lookahead=32:bframes=3:level=4:pref=4:ref=2:nal-hrd=cbr:vbv-maxrate=3000:vbv-bufsize=6000",
+        "GopSize": 6,
+        "GopSizeUnits": "SECONDS",
+        "caeopts": "1",
+        "preset": "slower",
+        "threads": 8
       },
       {
         "name": "720p",
         "width": 1280,
         "height": 720,
         "codec": "H_264",
-        "codec_params": "vbv-maxrate=3500:vbv-bufsize=7000",
-        "bitrate": "3500k",
-        "crf": null,
-        "preset": "medium",
-        "threads": 6,
-        "video_format": "yuv420p",
         "interlace_mode": "PROGRESSIVE",
-        "frame_rate": "",
-        "GopSize": 6.0
+        "bitrate": "1500k",
+        "codec_params": "rc-lookahead=32:bframes=3:level=3.1:pref=4:ref=2:nal-hrd=cbr:vbv-maxrate=1500:vbv-bufsize=3000",
+        "GopSize": 6,
+        "GopSizeUnits": "SECONDS",
+        "caeopts": "1",
+        "preset": "slower",
+        "threads": 8
       },
       {
         "name": "540p",
         "width": 960,
         "height": 540,
         "codec": "H_264",
-        "codec_params": "vbv-maxrate=2000:vbv-bufsize=4000",
-        "bitrate": "2M",
-        "crf": null,
-        "preset": "medium",
-        "threads": 4,
-        "video_format": "yuv420p",
         "interlace_mode": "PROGRESSIVE",
-        "frame_rate": "",
-        "GopSize": 6.0
+        "bitrate": "1000k",
+        "codec_params": "rc-lookahead=32:bframes=3:level=3.1:pref=4:ref=2:nal-hrd=cbr:vbv-maxrate=1000:vbv-bufsize=2000",
+        "GopSize": 6,
+        "GopSizeUnits": "SECONDS",
+        "caeopts": "1",
+        "preset": "slower",
+        "threads": 4
       },
       {
         "name": "360p",
         "width": 640,
         "height": 360,
         "codec": "H_264",
-        "codec_params": "vbv-maxrate=1000:vbv-bufsize=2000",
-        "bitrate": "1M",
-        "crf": null,
-        "preset": "medium",
-        "threads": 2,
-        "video_format": "yuv420p",
         "interlace_mode": "PROGRESSIVE",
-        "frame_rate": "",
-        "GopSize": 6.0
+        "bitrate": "500k",
+        "codec_params": "rc-lookahead=32:bframes=3:level=3.1:pref=4:ref=2:nal-hrd=cbr:vbv-maxrate=500:vbv-bufsize=1000",
+        "GopSize": 6,
+        "GopSizeUnits": "SECONDS",
+        "caeopts": "2",
+        "preset": "slower",
+        "threads": 4
       }
     ],
-
     "h265_standard": [
+      {
+        "name": "2160p",
+        "width": 3840,
+        "height": 2160,
+        "codec": "H_265",
+        "interlace_mode": "PROGRESSIVE",
+        "codec_params": "rc-lookahead=32:bframes=3:level=5:pref=3:ref=2:vbv-maxrate=12500:vbv-bufsize=25000",
+        "GopSize": 6,
+        "GopSizeUnits": "SECONDS",
+        "caeopts": "1",
+        "crf": "26",
+        "preset": "slower",
+        "threads": 12
+      },
+      {
+        "name": "1440p",
+        "width": 2560,
+        "height": 1440,
+        "codec": "H_265",
+        "interlace_mode": "PROGRESSIVE",
+        "codec_params": "rc-lookahead=32:bframes=3:level=5:pref=3:ref=2:vbv-maxrate=6500:vbv-bufsize=13000",
+        "GopSize": 6,
+        "GopSizeUnits": "SECONDS",
+        "caeopts": "1",
+        "crf": "26.7",
+        "preset": "slower",
+        "threads": 12
+      },
       {
         "name": "1080p",
         "width": 1920,
         "height": 1080,
         "codec": "H_265",
-        "codec_params": "vbv-maxrate=4500:vbv-bufsize=9000",
-        "bitrate": "4500k",
-        "crf": null,
-        "preset": "medium",
-        "threads": 8,
-        "video_format": "yuv420p",
         "interlace_mode": "PROGRESSIVE",
-        "frame_rate": "",
-        "GopSize": 6.0
+        "codec_params": "rc-lookahead=32:bframes=3:level=4:pref=3:ref=2:vbv-maxrate=3200:vbv-bufsize=6400",
+        "GopSize": 6,
+        "GopSizeUnits": "SECONDS",
+        "caeopts": "1",
+        "crf": "26.2",
+        "preset": "slower",
+        "threads": 4
       },
       {
         "name": "720p",
         "width": 1280,
         "height": 720,
         "codec": "H_265",
-        "codec_params": "vbv-maxrate=2500:vbv-bufsize=5000",
-        "bitrate": "2500k",
-        "crf": null,
-        "preset": "medium",
-        "threads": 6,
-        "video_format": "yuv420p",
         "interlace_mode": "PROGRESSIVE",
-        "frame_rate": "",
-        "GopSize": 6.0
+        "codec_params": "rc-lookahead=32:bframes=3:level=3.1:pref=3:ref=2:vbv-maxrate=1700:vbv-bufsize=3400",
+        "GopSize": 6,
+        "GopSizeUnits": "SECONDS",
+        "caeopts": "1",
+        "crf": "26.4",
+        "preset": "slower",
+        "threads": 4
+      },
+      {
+        "name": "540p",
+        "width": 960,
+        "height": 540,
+        "codec": "H_265",
+        "interlace_mode": "PROGRESSIVE",
+        "codec_params": "rc-lookahead=32:bframes=3:level=3.1:pref=3:ref=2:vbv-maxrate=1000:vbv-bufsize=2000",
+        "GopSize": 6,
+        "GopSizeUnits": "SECONDS",
+        "caeopts": "1",
+        "crf": "27.1",
+        "preset": "slower",
+        "threads": 4
+      },
+      {
+        "name": "360p",
+        "width": 640,
+        "height": 360,
+        "codec": "H_265",
+        "interlace_mode": "PROGRESSIVE",
+        "codec_params": "rc-lookahead=32:bframes=3:level=3.1:pref=3:ref=2:vbv-maxrate=500:vbv-bufsize=1000",
+        "GopSize": 6,
+        "GopSizeUnits": "SECONDS",
+        "caeopts": "2",
+        "crf": "29.0",
+        "preset": "slower",
+        "threads": 4
       }
     ]
+  },
+  "s3": {
+    "bucket_name": "dev-us-west-2-transcoder-bucket",
+    "key_prefix": "Visionular/V3",
+    "region": "us-west-2"
+  },
+  "paths": {
+    "ffmpeg_executable": "./bin/ffmpeg",
+    "ffprobe_executable": "./bin/ffprobe"
+  },
+  "audio_normalization": {
+    "enabled": true,
+    "loudnorm_settings": {
+      "i": -23,
+      "lra": 7,
+      "tp": -2
+    }
+  },
+  "Esam": {
+    "SignalProcessingNotification": {
+      "SccXml": "<?xml version='1.0' encoding='utf8'?>\n<SignalProcessingNotification xmlns=\"urn:cablelabs:iptvservices:esam:xsd:signal:1\" xmlns:sig=\"urn:cablelabs:md:xsd:signaling:3.0\" xmlns:common=\"urn:cablelabs:iptvservices:esam:xsd:common:1\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" acquisitionPointIdentity=\"ExampleESAM\">\n  <common:BatchInfo batchId=\"1\">\n    <common:Source xsi:type=\"content:MovieType\" />\n  </common:BatchInfo>\n<!--CUE-OUT-->\n<ResponseSignal acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"1\" signalPointID=\"602.90\" action=\"create\">\n    <sig:NPTPoint nptPoint=\"602.90\" />\n  <sig:SCTE35PointDescriptor spliceCommandType=\"06\">\n      <sig:SegmentationDescriptorInfo segmentEventId=\"1\" segmentTypeId=\"52\" upidType=\"09\" upid=\"1\" duration=\"PT0S\" segmentNumber=\"1\" segmentsExpected=\"01\" />\n    </sig:SCTE35PointDescriptor>\n  </ResponseSignal>\n<ConditioningInfo acquisitionSignalIDRef=\"1\" startOffset=\"PT602S\" duration=\"PT0S\" />\n<!--CUE-IN-->\n<ResponseSignal acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"2\" signalPointID=\"602.90\" action=\"create\">\n    <sig:NPTPoint nptPoint=\"602.90\" />\n  <sig:SCTE35PointDescriptor spliceCommandType=\"06\">\n      <sig:SegmentationDescriptorInfo segmentEventId=\"1\" segmentTypeId=\"53\" upidType=\"09\" upid=\"2\" />\n    </sig:SCTE35PointDescriptor>\n  </ResponseSignal>\n<!--CUE-OUT-->\n<ResponseSignal acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"3\" signalPointID=\"1152.79\" action=\"create\">\n    <sig:NPTPoint nptPoint=\"1152.79\" />\n  <sig:SCTE35PointDescriptor spliceCommandType=\"06\">\n      <sig:SegmentationDescriptorInfo segmentEventId=\"2\" segmentTypeId=\"52\" upidType=\"09\" upid=\"3\" duration=\"PT0S\" segmentNumber=\"2\" segmentsExpected=\"01\" />\n    </sig:SCTE35PointDescriptor>\n  </ResponseSignal>\n<ConditioningInfo acquisitionSignalIDRef=\"3\" startOffset=\"PT1152S\" duration=\"PT0S\" />\n<!--CUE-IN-->\n<ResponseSignal acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"4\" signalPointID=\"1152.79\" action=\"create\">\n    <sig:NPTPoint nptPoint=\"1152.79\" />\n  <sig:SCTE35PointDescriptor spliceCommandType=\"06\">\n      <sig:SegmentationDescriptorInfo segmentEventId=\"2\" segmentTypeId=\"53\" upidType=\"09\" upid=\"4\" />\n    </sig:SCTE35PointDescriptor>\n  </ResponseSignal>\n<!--CUE-OUT-->\n<ResponseSignal acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"5\" signalPointID=\"1617.12\" action=\"create\">\n    <sig:NPTPoint nptPoint=\"1617.12\" />\n  <sig:SCTE35PointDescriptor spliceCommandType=\"06\">\n      <sig:SegmentationDescriptorInfo segmentEventId=\"3\" segmentTypeId=\"52\" upidType=\"09\" upid=\"5\" duration=\"PT0S\" segmentNumber=\"3\" segmentsExpected=\"01\" />\n    </sig:SCTE35PointDescriptor>\n  </ResponseSignal>\n<ConditioningInfo acquisitionSignalIDRef=\"5\" startOffset=\"PT1617S\" duration=\"PT0S\" />\n<!--CUE-IN-->\n<ResponseSignal acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"6\" signalPointID=\"1617.12\" action=\"create\">\n    <sig:NPTPoint nptPoint=\"1617.12\" />\n  <sig:SCTE35PointDescriptor spliceCommandType=\"06\">\n      <sig:SegmentationDescriptorInfo segmentEventId=\"3\" segmentTypeId=\"53\" upidType=\"09\" upid=\"6\" />\n    </sig:SCTE35PointDescriptor>\n  </ResponseSignal>\n<!--CUE-OUT-->\n<ResponseSignal acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"7\" signalPointID=\"2100.10\" action=\"create\">\n    <sig:NPTPoint nptPoint=\"2100.10\" />\n  <sig:SCTE35PointDescriptor spliceCommandType=\"06\">\n      <sig:SegmentationDescriptorInfo segmentEventId=\"4\" segmentTypeId=\"52\" upidType=\"09\" upid=\"7\" duration=\"PT0S\" segmentNumber=\"4\" segmentsExpected=\"01\" />\n    </sig:SCTE35PointDescriptor>\n  </ResponseSignal>\n<ConditioningInfo acquisitionSignalIDRef=\"7\" startOffset=\"PT2100S\" duration=\"PT0S\" />\n<!--CUE-IN-->\n<ResponseSignal acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"8\" signalPointID=\"2100.10\" action=\"create\">\n    <sig:NPTPoint nptPoint=\"2100.10\" />\n  <sig:SCTE35PointDescriptor spliceCommandType=\"06\">\n      <sig:SegmentationDescriptorInfo segmentEventId=\"4\" segmentTypeId=\"53\" upidType=\"09\" upid=\"8\" />\n    </sig:SCTE35PointDescriptor>\n  </ResponseSignal>\n<!--CUE-OUT-->\n<ResponseSignal acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"9\" signalPointID=\"2570.37\" action=\"create\">\n    <sig:NPTPoint nptPoint=\"2570.37\" />\n  <sig:SCTE35PointDescriptor spliceCommandType=\"06\">\n      <sig:SegmentationDescriptorInfo segmentEventId=\"5\" segmentTypeId=\"52\" upidType=\"09\" upid=\"9\" duration=\"PT0S\" segmentNumber=\"5\" segmentsExpected=\"01\" />\n    </sig:SCTE35PointDescriptor>\n  </ResponseSignal>\n<ConditioningInfo acquisitionSignalIDRef=\"9\" startOffset=\"PT2570S\" duration=\"PT0S\" />\n<!--CUE-IN-->\n<ResponseSignal acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"10\" signalPointID=\"2570.37\" action=\"create\">\n    <sig:NPTPoint nptPoint=\"2570.37\" />\n  <sig:SCTE35PointDescriptor spliceCommandType=\"06\">\n      <sig:SegmentationDescriptorInfo segmentEventId=\"5\" segmentTypeId=\"53\" upidType=\"09\" upid=\"10\" />\n    </sig:SCTE35PointDescriptor>\n  </ResponseSignal>\n</SignalProcessingNotification>\n"
+    },
+    "ManifestConfirmConditionNotification": {
+      "MccXml": "<?xml version='1.0' encoding='utf8'?>\n<ns2:ManifestConfirmConditionNotification xmlns:ns2=\"http://www.cablelabs.com/namespaces/metadata/xsd/confirmation/2\" xmlns=\"http://www.cablelabs.com/namespaces/metadata/xsd/core/2\" xmlns:ns3=\"http://www.cablelabs.com/namespaces/metadata/xsd/signaling/2\">\n  <!--PRE-ROLL-->\n<ns2:ManifestResponse acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"1\" duration=\"PT0S\" dataPassThrough=\"false\">\n    <ns2:SegmentModify>\n      <ns2:FirstSegment>\n        <ns2:Tag value=\"#EXT-X-CUE-OUT:0\" />\n      <ns2:Tag value=\"#EXT-X-ASSET:CONTENT_EXTID=&quot;AETN_AmericanPickers_S10_E03_en&quot;,CONTENT_ENTID=&quot;6924e66eaa1f72a6ec77760a&quot;,CONTENT_TMSID=&quot;EP012124070120&quot;,CONTENT_LEN=2572,CONTENT_GENRE=&quot;Reality&quot;,CONTENT_RATING=&quot;TV-PG&quot;,CONTENT_LANGUAGE=&quot;en&quot;,CONTENT_TITLE=&quot;Sicilian%20Standoff&quot;,CONTENT_SERIESTITLE=&quot;American%20Pickers&quot;,CONTENT_STUDIO=&quot;Cineflix%20International%20Media%20Lim&quot;,CONTENT_LICENSOR=&quot;AETN&quot;,CONTENT_EPISODENUMBER=3,CONTENT_SEASONNUMBER=10\" />\n      <ns2:Tag value=\"#EXT-X-CUE-IN\" />\n      </ns2:FirstSegment>\n    </ns2:SegmentModify>\n  </ns2:ManifestResponse>\n<ns2:ManifestResponse acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"2\" dataPassThrough=\"false\" />\n<!--MID-ROLL 1-->\n<ns2:ManifestResponse acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"3\" duration=\"PT0S\" dataPassThrough=\"false\">\n    <ns2:SegmentModify>\n      <ns2:FirstSegment>\n        <ns2:Tag value=\"#EXT-X-CUE-OUT:0\" />\n      <ns2:Tag value=\"#EXT-X-ASSET:CONTENT_EXTID=&quot;AETN_AmericanPickers_S10_E03_en&quot;,CONTENT_ENTID=&quot;6924e66eaa1f72a6ec77760a&quot;,CONTENT_TMSID=&quot;EP012124070120&quot;,CONTENT_LEN=2572,CONTENT_GENRE=&quot;Reality&quot;,CONTENT_RATING=&quot;TV-PG&quot;,CONTENT_LANGUAGE=&quot;en&quot;,CONTENT_TITLE=&quot;Sicilian%20Standoff&quot;,CONTENT_SERIESTITLE=&quot;American%20Pickers&quot;,CONTENT_STUDIO=&quot;Cineflix%20International%20Media%20Lim&quot;,CONTENT_LICENSOR=&quot;AETN&quot;,CONTENT_EPISODENUMBER=3,CONTENT_SEASONNUMBER=10\" />\n      <ns2:Tag value=\"#EXT-X-CUE-IN\" />\n      </ns2:FirstSegment>\n    </ns2:SegmentModify>\n  </ns2:ManifestResponse>\n<ns2:ManifestResponse acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"4\" dataPassThrough=\"false\" />\n<!--MID-ROLL 2-->\n<ns2:ManifestResponse acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"5\" duration=\"PT0S\" dataPassThrough=\"false\">\n    <ns2:SegmentModify>\n      <ns2:FirstSegment>\n        <ns2:Tag value=\"#EXT-X-CUE-OUT:0\" />\n      <ns2:Tag value=\"#EXT-X-ASSET:CONTENT_EXTID=&quot;AETN_AmericanPickers_S10_E03_en&quot;,CONTENT_ENTID=&quot;6924e66eaa1f72a6ec77760a&quot;,CONTENT_TMSID=&quot;EP012124070120&quot;,CONTENT_LEN=2572,CONTENT_GENRE=&quot;Reality&quot;,CONTENT_RATING=&quot;TV-PG&quot;,CONTENT_LANGUAGE=&quot;en&quot;,CONTENT_TITLE=&quot;Sicilian%20Standoff&quot;,CONTENT_SERIESTITLE=&quot;American%20Pickers&quot;,CONTENT_STUDIO=&quot;Cineflix%20International%20Media%20Lim&quot;,CONTENT_LICENSOR=&quot;AETN&quot;,CONTENT_EPISODENUMBER=3,CONTENT_SEASONNUMBER=10\" />\n      <ns2:Tag value=\"#EXT-X-CUE-IN\" />\n      </ns2:FirstSegment>\n    </ns2:SegmentModify>\n  </ns2:ManifestResponse>\n<ns2:ManifestResponse acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"6\" dataPassThrough=\"false\" />\n<!--MID-ROLL 3-->\n<ns2:ManifestResponse acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"7\" duration=\"PT0S\" dataPassThrough=\"false\">\n    <ns2:SegmentModify>\n      <ns2:FirstSegment>\n        <ns2:Tag value=\"#EXT-X-CUE-OUT:0\" />\n      <ns2:Tag value=\"#EXT-X-ASSET:CONTENT_EXTID=&quot;AETN_AmericanPickers_S10_E03_en&quot;,CONTENT_ENTID=&quot;6924e66eaa1f72a6ec77760a&quot;,CONTENT_TMSID=&quot;EP012124070120&quot;,CONTENT_LEN=2572,CONTENT_GENRE=&quot;Reality&quot;,CONTENT_RATING=&quot;TV-PG&quot;,CONTENT_LANGUAGE=&quot;en&quot;,CONTENT_TITLE=&quot;Sicilian%20Standoff&quot;,CONTENT_SERIESTITLE=&quot;American%20Pickers&quot;,CONTENT_STUDIO=&quot;Cineflix%20International%20Media%20Lim&quot;,CONTENT_LICENSOR=&quot;AETN&quot;,CONTENT_EPISODENUMBER=3,CONTENT_SEASONNUMBER=10\" />\n      <ns2:Tag value=\"#EXT-X-CUE-IN\" />\n      </ns2:FirstSegment>\n    </ns2:SegmentModify>\n  </ns2:ManifestResponse>\n<ns2:ManifestResponse acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"8\" dataPassThrough=\"false\" />\n<!--POST-ROLL-->\n<ns2:ManifestResponse acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"9\" duration=\"PT0S\" dataPassThrough=\"false\">\n    <ns2:SegmentModify>\n      <ns2:FirstSegment>\n        <ns2:Tag value=\"#EXT-X-CUE-OUT:0\" />\n      <ns2:Tag value=\"#EXT-X-ASSET:CONTENT_EXTID=&quot;AETN_AmericanPickers_S10_E03_en&quot;,CONTENT_ENTID=&quot;6924e66eaa1f72a6ec77760a&quot;,CONTENT_TMSID=&quot;EP012124070120&quot;,CONTENT_LEN=2572,CONTENT_GENRE=&quot;Reality&quot;,CONTENT_RATING=&quot;TV-PG&quot;,CONTENT_LANGUAGE=&quot;en&quot;,CONTENT_TITLE=&quot;Sicilian%20Standoff&quot;,CONTENT_SERIESTITLE=&quot;American%20Pickers&quot;,CONTENT_STUDIO=&quot;Cineflix%20International%20Media%20Lim&quot;,CONTENT_LICENSOR=&quot;AETN&quot;,CONTENT_EPISODENUMBER=3,CONTENT_SEASONNUMBER=10\" />\n      <ns2:Tag value=\"#EXT-X-CUE-IN\" />\n      </ns2:FirstSegment>\n    </ns2:SegmentModify>\n  </ns2:ManifestResponse>\n<ns2:ManifestResponse acquisitionPointIdentity=\"ExampleESAM\" acquisitionSignalID=\"10\" dataPassThrough=\"false\" />\n</ns2:ManifestConfirmConditionNotification>\n"
+    },
+    "ResponseSignalPreroll": 0
+  },
+  "thumbnail_generation": {
+    "enabled": true,
+    "interval_seconds": 10,
+    "width": 320,
+    "height": 180,
+    "quality": 80,
+    "output_format": "jpg",
+    "output_dir": "thumbnails",
+    "s3_subfolder_name": "thumbnails"
   }
 }
