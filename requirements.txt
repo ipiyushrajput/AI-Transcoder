@@ -1,6 +1,17 @@
-# The toolkit runs on the Python standard library only.
-# External dependencies are binaries, not Python packages:
-#   * ffmpeg / ffprobe built with the in-house libwz264 / libwz265 encoders
-#   * awscli v2 (only needed for --upload / --import / --upload-only / --import-only)
-#
-# Nothing to pip install. Python 3.8+ is required (3.11 recommended).
+# The transcoding toolkit itself is standard library only.
+# These are for S3 I/O, the HTTP API and the PostgreSQL job store.
+
+boto3==1.35.36            # S3 input fetch and output publish
+botocore==1.35.36
+
+Flask==3.0.3              # HTTP API
+flask-cors==4.0.1
+gunicorn==22.0.0          # production WSGI server (see deploy/ai-transcoder.service)
+
+SQLAlchemy==2.0.35        # job persistence
+psycopg2-binary==2.9.9    # PostgreSQL driver
+
+python-dotenv==1.0.1      # optional: load a .env in development
+
+# Requires Python 3.8+ (3.11 recommended) and an FFmpeg build providing the
+# in-house libwz264 / libwz265 encoders at paths.ffmpeg_executable.

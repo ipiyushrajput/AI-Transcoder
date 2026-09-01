@@ -3,6 +3,8 @@ import re
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
 
+from hls_toolkit.job_context import log
+
 
 def is_master_playlist(lines: List[str]) -> bool:
     return any(ln.strip().startswith("#EXT-X-STREAM-INF") for ln in lines)
@@ -39,7 +41,7 @@ def parse_variant_segments(m3u8_path: Path) -> Tuple[List[str], List[Tuple[float
             try:
                 dur = float(ln.split(":", 1)[1].split(",", 1)[0])
             except ValueError as e:
-                logging.error(f"Error parsing EXTINF duration from line '{ln.strip()}': {e}")
+                log().error(f"Error parsing EXTINF duration from line '{ln.strip()}': {e}")
                 dur = 0.0
             if i + 1 < len(lines):
                 segfile = lines[i + 1].strip()
@@ -117,7 +119,7 @@ def create_master_playlist(master_playlist_path: str,
                     bandwidth = int(match.group(1)) * 1000
             if bandwidth == 0:
                 bandwidth = 2500000
-                logging.warning(f"Could not determine bandwidth for resolution {res_name}. "
+                log().warning(f"Could not determine bandwidth for resolution {res_name}. "
                                 f"Defaulting to {bandwidth} bps.")
             avg_bandwidth = bandwidth
             frame_rate_val = stream_details.get("avg_frame_rate") if stream_details else video_fps
@@ -130,7 +132,7 @@ def create_master_playlist(master_playlist_path: str,
                 full_codec_string = f'"{video_codec_str},{audio_codec_str}"'
                 stream_inf_parts.append(f"CODECS={full_codec_string}")
             else:
-                logging.warning(f"Could not determine video codec for {res_name}. "
+                log().warning(f"Could not determine video codec for {res_name}. "
                                 "Omitting CODECS attribute.")
             stream_inf_parts.extend([
                 f'RESOLUTION={res_data["width"]}x{res_data["height"]}',

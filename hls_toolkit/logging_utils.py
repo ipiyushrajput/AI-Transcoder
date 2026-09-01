@@ -4,7 +4,7 @@ from pathlib import Path
 
 def setup_logging(args, config):
     logger = logging.getLogger()
-    if args.debug:
+    if getattr(args, "debug", False):
         logger.setLevel(logging.DEBUG)
     else:
         logger.setLevel(logging.INFO)
@@ -15,7 +15,8 @@ def setup_logging(args, config):
     class ConsoleFilter(logging.Filter):
 
         def filter(self, record):
-            if args.debug or not (args.log_file or config.get("defaults", {}).get("log_file")):
+            if args.debug or not (getattr(args, "log_file", None)
+                                  or config.get("defaults", {}).get("log_file")):
                 return True
             msg = record.getMessage()
             if msg.startswith("AWS:"):
@@ -28,7 +29,8 @@ def setup_logging(args, config):
     if logger.hasHandlers():
         logger.handlers.clear()
     logger.addHandler(ch)
-    log_file_path = args.log_file or config.get("defaults", {}).get("log_file")
+    log_file_path = (getattr(args, "log_file", None)
+                     or config.get("defaults", {}).get("log_file"))
     if log_file_path:
         try:
             Path(log_file_path).parent.mkdir(parents=True, exist_ok=True)

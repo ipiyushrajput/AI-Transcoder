@@ -2,7 +2,9 @@ import fractions
 import json
 import logging
 import os
+import re
 import shlex
+import signal
 import subprocess
 import tempfile
 import math
@@ -11,6 +13,8 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, Tuple
 
+from hls_toolkit.job_context import (JobCancelled, TranscodeError, bind_context,
+                                     current_context, log)
 from hls_toolkit.time_utils import timecode_to_seconds
 from hls_toolkit.esam_parser import remap_esam_events_for_merged_clips
 
@@ -58,12 +62,12 @@ def run_loudnorm_analysis(ffmpeg_executable: str,
                 if line.endswith("}"):
                     break
         if not json_lines:
-            logging.error("Could not find JSON output from loudnorm analysis.")
+            log().error("Could not find JSON output from loudnorm analysis.")
             return None
         json_str = "".join(json_lines)
         return json.loads(json_str)
     except (FileNotFoundError, subprocess.CalledProcessError, json.JSONDecodeError) as e:
-        logging.error(f"Loudnorm analysis failed: {e}", exc_info=False)
+        log().error(f"Loudnorm analysis failed: {e}", exc_info=False)
         return None
 
 
@@ -100,7 +104,7 @@ def get_video_info(ffprobe_executable: str,
         return {'duration': duration, 'frame_rate': frame_rate}
     except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError,
             IndexError, TypeError) as e:
-        logging.warning(f"Could not get video info: {e}. Defaulting duration to 0 and FPS to 25/1.")
+        log().warning(f"Could not get video info: {e}. Defaulting duration to 0 and FPS to 25/1.")
         return {'duration': 0.0, 'frame_rate': fractions.Fraction(25, 1)}
 
 
@@ -120,10 +124,10 @@ def _run_ffprobe_command(cmd_list: List[str],
             raise subprocess.CalledProcessError(process.returncode, cmd_list, output=output)
         return output.strip()
     except FileNotFoundError:
-        logging.error(f"Error: FFprobe executable not found for {log_prefix}.")
+        log().error(f"Error: FFprobe executable not found for {log_prefix}.")
         raise
     except subprocess.CalledProcessError as e:
-        logging.error(f'{log_prefix} failed with exit code {e.returncode}. '
+        log().error(f'{log_prefix} failed with exit code {e.returncode}. '
                       f'Command: {" ".join(shlex.quote(arg) for arg in cmd_list)}\n'
                       f'Output:\n{e.output}')
         raise
@@ -149,26 +153,85 @@ def get_ffprobe_first_pts(ffprobe_path: str, filepath: Union[str, Path]) -> Opti
             return float(output.splitlines()[0].strip().replace("N", ""))
         return None
     except (subprocess.CalledProcessError, ValueError, IndexError) as e:
-        logging.error(f"Error getting first PTS for {filepath}: {e}")
+        log().error(f"Error getting first PTS for {filepath}: {e}")
         return None
+
+
+_PROGRESS_TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+# Per-clip encode fractions, so overall transcode progress moves smoothly while
+# long clips are still in flight rather than jumping only as tasks finish.
+_CLIP_PROGRESS: Dict[str, float] = {}
+_CLIP_PROGRESS_LOCK = threading.Lock()
+
+
+def _clip_progress_cb(clip_index: int, stream_type: str):
+    """Callback that folds one clip's encode fraction into the job's progress."""
+    ctx = current_context()
+    if ctx is None or stream_type != "video":
+        return None
+    key = f"{clip_index}:{stream_type}"
+
+    def _report(fraction: float):
+        with _CLIP_PROGRESS_LOCK:
+            _CLIP_PROGRESS[key] = fraction
+            total = ctx.metadata.get("video_clip_count") or len(_CLIP_PROGRESS)
+            done = sum(_CLIP_PROGRESS.values())
+        if total:
+            ctx.advance_within_stage(min(1.0, done / total))
+
+    return _report
+
+
+def _parse_progress_seconds(line: str) -> Optional[float]:
+    """Seconds encoded in an FFmpeg `time=HH:MM:SS.ms` progress line."""
+    match = _PROGRESS_TIME_RE.search(line)
+    if not match:
+        return None
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
 def _run_ffmpeg_command_with_logging(cmd_list: List[str],
                                      log_prefix: str,
                                      cwd: Optional[Union[str, Path]] = None,
-                                     check_returncode: bool = True) -> Tuple[str, str]:
-    """Runs an FFmpeg command, logging stdout/stderr line by line, and returns combined output."""
+                                     check_returncode: bool = True,
+                                     expected_seconds: Optional[float] = None,
+                                     progress_cb=None) -> Tuple[str, str]:
+    """Run an FFmpeg command, mirroring its output into the job's ffmpeg.log.
+
+    Every raw stdout/stderr line is written verbatim to ``ffmpeg.log`` for the
+    active job (see :mod:`hls_toolkit.job_context`), while a filtered view goes
+    to ``job.log``. When ``expected_seconds`` is given, ``time=`` lines drive
+    ``progress_cb(fraction)`` so the status API can report a percentage.
+
+    Raises :class:`JobCancelled` if the job is cancelled mid-encode — the whole
+    process group is terminated first.
+    """
+    ctx = current_context()
     full_cmd_str = " ".join(shlex.quote(str(arg)) for arg in cmd_list)
-    logging.info(f"Executing {log_prefix}. Command: {full_cmd_str}")
-    process = subprocess.Popen(cmd_list,
-                               stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE,
-                               universal_newlines=True,
-                               cwd=cwd,
-                               encoding="utf-8",
-                               errors="ignore",
-                               start_new_session=True)
+    log().info(f"Executing {log_prefix}. Command: {full_cmd_str}")
+    if ctx is not None:
+        ctx.ffmpeg_command(log_prefix, full_cmd_str)
+
+    try:
+        process = subprocess.Popen(cmd_list,
+                                   stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE,
+                                   universal_newlines=True,
+                                   cwd=cwd,
+                                   encoding="utf-8",
+                                   errors="ignore",
+                                   start_new_session=True)
+    except FileNotFoundError as e:
+        raise TranscodeError(
+            f"FFmpeg executable not found while running {log_prefix}: {cmd_list[0]}",
+            stage="TRANSCODING") from e
+    except OSError as e:
+        raise TranscodeError(f"Could not start {log_prefix}: {e}",
+                             stage="TRANSCODING") from e
+
     with PROCESS_LOCK:
         ACTIVE_PROCESSES.append(process)
     try:
@@ -179,50 +242,98 @@ def _run_ffmpeg_command_with_logging(cmd_list: List[str],
             for line in stream:
                 buffer.append(line)
                 line_stripped = line.strip()
+                if ctx is not None and line_stripped:
+                    ctx.ffmpeg_line(line_stripped)
                 if not line_stripped:
-                    pass
-                elif stream_name == "stderr":
+                    continue
+                if stream_name == "stderr":
                     if all(k in line_stripped for k in progress_keys):
-                        logging.info(f"FFmpeg {log_prefix} progress: {line_stripped}")
+                        log().debug(f"FFmpeg {log_prefix} progress: {line_stripped}")
+                        if progress_cb and expected_seconds:
+                            elapsed = _parse_progress_seconds(line_stripped)
+                            if elapsed is not None:
+                                progress_cb(max(0.0, min(1.0, elapsed / expected_seconds)))
                     elif "warning" in line_stripped.lower():
-                        logging.warning(f"FFmpeg {log_prefix} stderr: {line_stripped}")
+                        log().warning(f"FFmpeg {log_prefix} stderr: {line_stripped}")
                     else:
-                        logging.debug(f"FFmpeg {log_prefix} stderr: {line_stripped}")
+                        log().debug(f"FFmpeg {log_prefix} stderr: {line_stripped}")
                 else:
-                    logging.info(f"FFmpeg {log_prefix} {stream_name}: {line_stripped}")
+                    log().info(f"FFmpeg {log_prefix} {stream_name}: {line_stripped}")
 
         stdout_thread = threading.Thread(target=read_stream,
-                                         args=(process.stdout, stdout_buffer, "stdout"))
+                                         args=(process.stdout, stdout_buffer, "stdout"),
+                                         daemon=True)
         stderr_thread = threading.Thread(target=read_stream,
-                                         args=(process.stderr, stderr_buffer, "stderr"))
+                                         args=(process.stderr, stderr_buffer, "stderr"),
+                                         daemon=True)
         stdout_thread.start()
         stderr_thread.start()
+        cancelled = False
         try:
-            stdout_thread.join()
-            stderr_thread.join()
+            while process.poll() is None:
+                if ctx is not None and ctx.cancelled:
+                    cancelled = True
+                    log().warning(f"Cancellation requested — terminating {log_prefix}")
+                    _terminate_process(process)
+                    break
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    continue
+            stdout_thread.join(timeout=10)
+            stderr_thread.join(timeout=10)
             process.wait()
         except BaseException:
-            process.kill()
-            process.wait()
+            _terminate_process(process)
             raise
 
         stdout_output = "".join(stdout_buffer)
         stderr_output = "".join(stderr_buffer)
-        if check_returncode and process.returncode != 0:
-            logging.error(f"{log_prefix} failed with exit code {process.returncode}. "
-                          f"Command: {full_cmd_str}\nSTDOUT:\n{stdout_output}\n"
-                          f"STDERR:\n{stderr_output}")
-            raise subprocess.CalledProcessError(process.returncode, cmd_list,
-                                                output=stdout_output, stderr=stderr_output)
+        if cancelled:
+            raise JobCancelled(f"{log_prefix} cancelled")
+
         if process.returncode != 0:
-            logging.warning(f"{log_prefix} completed with non-zero exit code "
-                            f"{process.returncode}. Command: {full_cmd_str}\n"
-                            f"STDOUT:\n{stdout_output}\nSTDERR:\n{stderr_output}")
+            tail = _tail_text(stderr_output or stdout_output, 40)
+            message = (f"{log_prefix} failed with exit code {process.returncode}.\n"
+                       f"Command: {full_cmd_str}\n"
+                       f"Last FFmpeg output:\n{tail}")
+            if check_returncode:
+                log().error(message)
+                raise subprocess.CalledProcessError(process.returncode, cmd_list,
+                                                    output=stdout_output,
+                                                    stderr=stderr_output)
+            log().warning(message)
         return (stdout_output, stderr_output)
     finally:
         with PROCESS_LOCK:
             if process in ACTIVE_PROCESSES:
                 ACTIVE_PROCESSES.remove(process)
+
+
+def _terminate_process(process) -> None:
+    """Terminate an FFmpeg process group, escalating to SIGKILL if needed."""
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+    except Exception:
+        try:
+            process.terminate()
+        except Exception:
+            return
+    try:
+        process.wait(timeout=10)
+    except Exception:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+
+def _tail_text(text: str, lines: int) -> str:
+    rows = [r for r in (text or "").splitlines() if r.strip()]
+    return "\n".join(rows[-lines:]) or "(no output captured)"
 
 
 def _merge_transcoded_clips(ffmpeg_executable: str,
@@ -396,7 +507,7 @@ def _transcode_clip_with_single_command(clip_index,
             scte35_times = sorted([t for t in scte35_times_unfiltered if t > 0.1])
             for t in scte35_times_unfiltered:
                 if t <= 0.1:
-                    logging.info(f"Ignoring cue point at {t:.3f}s as it is effectively zero.")
+                    log().info(f"Ignoring cue point at {t:.3f}s as it is effectively zero.")
             if scte35_times:
                 ffmpeg_cmd.extend([
                     "-scte35_cue_points", ",".join([f"{t:.3f}" for t in scte35_times])])
@@ -406,13 +517,13 @@ def _transcode_clip_with_single_command(clip_index,
                 fps_fraction = fractions.Fraction(video_fps)
                 gop_size_frames = int(round(gop_size_seconds_target * fps_fraction))
                 precise_gop_duration = float(gop_size_frames / fps_fraction)
-                logging.info(f'Precise GOP for {res_data["name"]}: '
+                log().info(f'Precise GOP for {res_data["name"]}: '
                              f'target={gop_size_seconds_target}s, fps={fps_fraction}, '
                              f'frames={gop_size_frames}, '
                              f'precise_duration={precise_gop_duration:.3f}s')
             except (ValueError, ZeroDivisionError):
                 precise_gop_duration = gop_size_seconds_target
-                logging.warning(f"Could not parse video_fps '{video_fps}'. Falling back to "
+                log().warning(f"Could not parse video_fps '{video_fps}'. Falling back to "
                                 f"target GOP duration {precise_gop_duration}s.")
 
             force_key_frames_expr = f"expr:gte(t,n_forced*{precise_gop_duration:.3f})"
@@ -440,7 +551,10 @@ def _transcode_clip_with_single_command(clip_index,
         raise ValueError(f"Unsupported stream_type: {stream_type}")
 
     _run_ffmpeg_command_with_logging(
-        ffmpeg_cmd, log_prefix=f"Transcode clip {clip_index:03d} ({stream_type})")
+        ffmpeg_cmd,
+        log_prefix=f"Transcode clip {clip_index:03d} ({stream_type})",
+        expected_seconds=float(clip_duration) if clip_duration else None,
+        progress_cb=_clip_progress_cb(clip_index, stream_type))
     if stream_type == "video":
         return {'type': "video",
                 'outputs': {k: str(v) for k, v in results_this_clip.items()}}
@@ -504,8 +618,12 @@ def generate_clipped_transcoded_merged_mp4s(
         - temp_clipping_dir (Optional[Path]): Path to the temporary directory created.
         - remapped_esam_events (List[Dict[str, Any]]): ESAM events adjusted for the merged timeline.
     """
+    ctx0 = current_context()
+    if ctx0 is not None:
+        ctx0.metadata["video_clip_count"] = len(clippings)
+        ctx0.set_stage("TRANSCODING", 0.0)
     temp_clipping_dir = Path(tempfile.mkdtemp(prefix="hls_clips_transcoded_", dir=temp_dir))
-    logging.info(f"Created temporary directory for transcoded clips: {temp_clipping_dir}")
+    log().info(f"Created temporary directory for transcoded clips: {temp_clipping_dir}")
     abs_input_video = Path(os.path.abspath(str(input_video)))
     remapped_esam_events = remap_esam_events_for_merged_clips(esam_events, clippings,
                                                               float(video_fps))
@@ -555,21 +673,60 @@ def generate_clipped_transcoded_merged_mp4s(
 
     video_clips_per_res = {res["name"]: [] for res in video_templates}
     audio_clips = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=transcode_workers) as executor:
+    ctx = current_context()
+    completed = 0
+    total_tasks = len(tasks)
+    log().info(f"Transcoding {total_tasks} task(s) across {len(clippings)} clip(s) "
+               f"with {transcode_workers} worker(s)")
+
+    # The pool's threads need the job bound too, so their FFmpeg output lands in
+    # this job's ffmpeg.log rather than the root logger.
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=transcode_workers,
+            initializer=bind_context, initargs=(ctx,)) as executor:
         futures = {executor.submit(task[0], *task[1:]): task for task in tasks}
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                result = future.result()
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    result = future.result()
+                except JobCancelled:
+                    log().warning("Transcode cancelled — stopping remaining tasks")
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
+                except subprocess.CalledProcessError as exc:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise TranscodeError(
+                        f"FFmpeg failed during transcode (exit {exc.returncode}). "
+                        f"See ffmpeg.log for the full output.",
+                        stage="TRANSCODING") from exc
+                except Exception as exc:
+                    log().error(f"A transcoding task generated an exception: {exc}",
+                                exc_info=True)
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise TranscodeError(f"Transcode task failed: {exc}",
+                                         stage="TRANSCODING") from exc
+
                 if result["type"] == "video":
                     for res_name, path in result["outputs"].items():
                         video_clips_per_res[res_name].append(Path(path))
                 elif result["type"] == "audio":
                     audio_clips.append(Path(result["output"]))
-            except Exception as exc:
-                logging.error(f"A transcoding task generated an exception: {exc}")
-                executor.shutdown(wait=False, cancel_futures=True)
-                raise
 
+                completed += 1
+                if ctx is not None:
+                    ctx.set_stage("TRANSCODING", completed / total_tasks)
+                log().info(f"Transcode progress: {completed}/{total_tasks} task(s) done")
+        finally:
+            _CLIP_PROGRESS.clear()
+
+    missing = [name for name, clips in video_clips_per_res.items() if not clips]
+    if missing:
+        raise TranscodeError(
+            f"No transcoded clips were produced for: {', '.join(missing)}",
+            stage="TRANSCODING")
+
+    if ctx is not None:
+        ctx.set_stage("MERGING", 0.0)
     merged_video_paths = _merge_transcoded_clips(ffmpeg_executable, video_clips_per_res,
                                                  temp_clipping_dir)
     audio_clips_for_merge = {"audio": audio_clips}
@@ -658,7 +815,7 @@ def _get_video_stream_details(ffprobe_path: str, file_path: Union[str, Path]) ->
                 stream_data["avg_frame_rate"] = 25.0
         return stream_data
     except (subprocess.CalledProcessError, json.JSONDecodeError, IndexError) as e:
-        logging.warning(f"Could not get video stream details for {file_path}: {e}")
+        log().warning(f"Could not get video stream details for {file_path}: {e}")
         return {}
 
 
@@ -711,7 +868,7 @@ def _generate_hls_for_resolution(res_data: Dict[str, Any],
             cmd, log_prefix=f'HLS generation for {res_data["name"]}')
         return True
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        logging.error(f'HLS generation failed for {res_data["name"]}: {e}')
+        log().error(f'HLS generation failed for {res_data["name"]}: {e}')
         return False
 
 

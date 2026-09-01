@@ -1,15 +1,18 @@
 # AI-Transcoder
 
-VOD HLS packaging pipeline built on a custom FFmpeg build whose H.264 / H.265 encoders
-were fine-tuned in house and shipped as **`libwz264`** and **`libwz265`**.
+VOD HLS transcoding service built on a custom FFmpeg build whose H.264 / H.265
+encoders were fine-tuned in house and ship as **`libwz264`** and **`libwz265`**.
 
-The pipeline takes a source video (plus an optional WebVTT subtitle track and an ESAM
-signalling document), clips it, transcodes it into an ABR ladder, packages it as HLS,
-injects SCTE-35 ad markers, and can optionally upload the result to S3 and register it
-as an AWS MediaPackage VOD asset.
+It reads a source video (and optional WebVTT subtitles) **from S3 or local
+disk**, clips it, transcodes it into an ABR ladder, packages it as HLS, injects
+SCTE-35 ad markers from ESAM signalling, generates thumbnails, and **publishes
+straight back to S3** — removing the local copy once every object is verified.
 
-This repository is the plain-Python source of the pipeline. It was recovered from the
-`wz_vod_hls` single-file distribution and reorganised into an importable package.
+It runs two ways:
+
+* **CLI** — `python app.py --config config.json`
+* **HTTP service** — submit jobs over an API, poll progress, read per-job logs,
+  and list job history from PostgreSQL
 
 ---
 
@@ -17,186 +20,293 @@ This repository is the plain-Python source of the pipeline. It was recovered fro
 
 ```bash
 git clone <this-repo> && cd AI-Transcoder
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
 
-# 1. Put the custom FFmpeg build in place
+# The custom FFmpeg build (must provide libwz264 / libwz265)
 mkdir -p bin
-cp /path/to/your/ffmpeg  bin/ffmpeg
-cp /path/to/your/ffprobe bin/ffprobe
+cp /path/to/ffmpeg bin/ffmpeg && cp /path/to/ffprobe bin/ffprobe
 chmod +x bin/ffmpeg bin/ffprobe
 
-# 2. Point the config at your input and encoding ladder
-cp config.example.json config.json   # already present; edit in place
+# Edit inputs, ladder and S3 destination
 $EDITOR config.json
-
-# 3. Run
-python app.py --config config.json --input assets/input.mp4 --output hls_output
 ```
 
-`python app.py --help` lists every flag.
-
-There is nothing to `pip install` — the toolkit is standard library only and needs
-**Python 3.8+** (3.11 recommended). `awscli` v2 is required only for the S3 /
-MediaPackage flags.
-
-Verify the pure-Python half of the pipeline without any FFmpeg build:
+**As a CLI:**
 
 ```bash
-python tests/smoke_test.py
+python app.py --config config.json
 ```
+
+**As a service:**
+
+```bash
+cp .env.example .env && $EDITOR .env      # database credentials
+set -a && . ./.env && set +a
+python -m api.app                          # http://localhost:8000
+```
+
+Verify the install without the encoder build or AWS:
+
+```bash
+python tests/smoke_test.py       # pure-logic checks (no dependencies)
+python tests/pipeline_test.py    # full S3 -> transcode -> S3 -> API -> DB run
+```
+
+AWS credentials come from the ambient chain — instance role, `~/.aws`, or the
+standard environment variables. Nothing is read from `config.json`.
 
 ---
 
 ## Repository layout
 
 ```
-app.py                        Entry point — run this
-wz_vod_hls.py                 CLI: argument parsing, config loading, dispatch
-config.example.json           Annotated configuration template
-config.json                   Working config (edit this)
-tests/smoke_test.py           Offline self-check, no FFmpeg needed
+app.py                        CLI entry point
+wz_vod_hls.py                 CLI argument parsing and dispatch
+config.json                   Working configuration
+config.example.json           Reference copy
 
-hls_toolkit/
-├── hls_generator.py          The workflow — orchestrates every stage below
-├── ffmpeg_wrapper.py         All FFmpeg/FFprobe invocation, parallel transcode, HLS packaging
-├── subtitle_processor.py     WebVTT parsing, clipping, merging, HLS VTT segmentation
-├── esam_parser.py            ESAM/MCC XML parsing, SCTE-35 marker injection, cue remapping
-├── playlist_utils.py         m3u8 parsing and master-playlist generation
-├── time_utils.py             SMPTE timecode ↔ seconds ↔ frames (drop-frame aware)
-├── aws_handler.py            AWS CLI wrapper, MediaPackage VOD asset lifecycle
-├── aws_operations.py         --upload-only / --import-only handlers
-├── logging_utils.py          Console + file logging setup
-└── version.py                Build version string
+hls_toolkit/                  The pipeline
+├── runner.py                 One entry point for a run (CLI and API share it)
+├── hls_generator.py          Stage orchestration
+├── ffmpeg_wrapper.py         FFmpeg invocation, parallel transcode, HLS packaging
+├── s3_io.py                  S3 input fetch, output publish, verification
+├── job_context.py            Per-channel logging, progress, cancellation
+├── subtitle_processor.py     WebVTT parse, clip, merge, HLS segmentation
+├── esam_parser.py            ESAM/MCC XML, SCTE-35 marker injection
+├── playlist_utils.py         m3u8 parsing, master playlist
+├── time_utils.py             SMPTE timecode maths (drop-frame aware)
+├── aws_operations.py         --upload-only handler
+└── logging_utils.py          Console logging setup
+
+api/                          HTTP service
+├── app.py                    Flask app factory
+├── routes.py                 Endpoints
+├── job_manager.py            Worker pool, progress sync, job queries
+└── database.py               PostgreSQL models
+
+docs/
+├── API.md                    Endpoint reference with examples
+├── POSTGRES_SETUP.md         Ubuntu database setup, start to finish
+└── schema.sql                Explicit DDL (the API also creates it on boot)
+
+deploy/ai-transcoder.service  systemd unit
+tests/                        Offline verification
 ```
 
 ---
 
-## How a run flows
+## Inputs: S3 or local
 
-1. **Probe** — `ffprobe` reports duration and frame rate of the input.
-2. **Clip plan** — `defaults.InputClippings` defines the segments to keep. With no
-   clippings the whole file is used as a single clip. `--duration N` overrides this
-   with a single clip of the first N seconds, quantised to a frame boundary.
-3. **GOP alignment** — for each clip, an offset is computed so IDR frames land on a
-   consistent cadence across clip boundaries after stitching.
-4. **ESAM (optional, `--esam`)** — the SCC XML is parsed into cue points, de-duplicated,
-   snapped to nearby clip boundaries (10-frame tolerance), debounced, and remapped onto
-   the compacted output timeline.
-5. **Transcode** — every clip is encoded to every ladder rung in parallel
-   (`--transcode-workers`, auto-sized from CPU count and per-rung thread counts). One
-   FFmpeg process per clip emits all resolutions via a `split` filter graph. Audio is
-   extracted in a separate pass, with `loudnorm` applied when `--audio-norm` is set.
-6. **Merge** — per-resolution clips are stitched with the concat demuxer, no re-encode.
-7. **Package** — each merged rung is segmented into HLS, forcing segment boundaries at
-   the ESAM cue points so ad breaks land exactly on a segment edge.
-8. **Subtitles** — the source VTT is clipped to match, merged onto the output timeline,
-   then split into per-segment VTT files aligned to the video segments, each carrying an
-   `X-TIMESTAMP-MAP` derived from the first video segment's PTS.
-9. **Master playlist** — `channel.m3u8` with CODECS, RESOLUTION, FRAME-RATE and the
-   subtitle rendition group.
-10. **Marker injection** — `#EXT-X-CUE-OUT` / `-CONT` / `-IN` (plus `#EXT-X-ASSET` tags
-    from the MCC XML) are written into every variant playlist.
-11. **Thumbnails (optional)** — one JPEG every 10 seconds into `thumbnails/`.
-12. **Publish (optional)** — `--upload` syncs to S3; `--import` registers the asset with
-    MediaPackage VOD and polls until it is `PLAYABLE`, then prints the playback URLs.
+`input_video` and `subtitle_file` accept either form. An `s3://` value is
+downloaded to a scratch directory before transcoding; a local path is used as-is.
 
-Temporary work lives in `--temp-dir` (default `.wz_temp/`) and is deleted on exit
-unless `--debug` is passed. `SIGINT`/`SIGTERM` terminate the whole FFmpeg process group.
+```jsonc
+"defaults": {
+  "input_video":   "s3://dev-us-west-2-transcoder-bucket/Visionular/AETN_AmericanPickers_S10_E03_en.mp4",
+  "subtitle_file": "s3://dev-us-west-2-transcoder-bucket/Visionular/AETN_AmericanPickers_S10_E03_en.vtt"
+}
+```
+
+A missing object fails the job at `FETCHING_INPUT` with the URI named, rather
+than surfacing later as a confusing FFmpeg error.
+
+## Output: straight to S3
+
+The package is staged in a scratch directory, uploaded to
+`s3://<bucket>/<key_prefix>/<output_dir>/`, and **verified object by object**
+(every key HEADed and its size compared) before the local directory is deleted.
+A partial upload fails the job and leaves the local copy in place, so output is
+never lost silently.
+
+Correct content types are set on the way up (`application/vnd.apple.mpegurl`
+for `.m3u8`, `video/mp2t` for `.ts`, `text/vtt` for `.vtt`) so players can read
+the package directly from S3 or CloudFront.
+
+```
+s3://dev-us-west-2-transcoder-bucket/Visionular/V3/AETN_AmericanPickers_S10_E03_en/
+├── channel.m3u8                  master playlist
+├── channel_1080p.m3u8            variant playlists
+├── channel_1080p_00001.ts        segments
+├── channel_en-vtt-1.m3u8         subtitle playlist
+├── channel_en-vtt-1_00001.vtt    subtitle segments
+└── thumbnails/thumb_0001.jpg
+```
+
+Pass `--keep-local` (or `"delete_local_output": false`) to retain the local copy.
+
+---
+
+## Per-channel logging
+
+Every run logs under a folder named after the source file — for
+`AETN_AmericanPickers_S10_E03_en.mp4` that is:
+
+```
+logs/AETN_AmericanPickers_S10_E03_en/<job_id>/
+├── job.log      every step: stages, decisions, FFmpeg commands, S3 transfers
+├── error.log    warnings and errors only — read this first when a job fails
+├── ffmpeg.log   raw FFmpeg/FFprobe output, verbatim, every command
+└── job.json     live status, stage, progress, timings, output location
+```
+
+Under the CLI without `--job-id` the files sit directly in
+`logs/<channel>/`. The API always uses a per-job subdirectory so concurrent runs
+on the same channel never interleave.
+
+The service's own log is separate, at `logs/_server/api.log`.
+
+---
+
+## Error handling
+
+Failures are typed and carry the stage that broke, so a caller never has to
+guess. Every stage boundary is a checkpoint:
+
+* **Input** — missing object, access denied, wrong bucket, short download
+* **Validation** — unknown template or resolution, bad timecodes, missing FFmpeg
+* **Probing** — unreadable or zero-duration source
+* **Transcode** — FFmpeg exit code, with the last 40 lines of its output in the
+  message and the full stream in `ffmpeg.log`; the pool cancels remaining work
+  on the first failure
+* **Upload** — per-file retries, then verification; a mismatch fails the job and
+  keeps the local output
+
+A failed job's `GET /status` includes `error_stage`, `error_message` and the
+tail of `error.log` inline. Cancellation terminates the FFmpeg process group and
+cleans up scratch space.
 
 ---
 
 ## Configuration
 
-`config.json` drives everything; CLI flags override it.
-
-### `paths`
-
-| Key | Meaning |
-| --- | --- |
-| `ffmpeg_executable` | Path to the custom FFmpeg (must expose `libwz264` / `libwz265`) |
-| `ffprobe_executable` | Path to the matching FFprobe |
+`config.json` drives everything; CLI flags and API payload fields override it.
 
 ### `defaults`
 
 | Key | Meaning |
 | --- | --- |
-| `input_video`, `output_dir` | Defaults for `--input` / `--output` |
-| `subtitle_file`, `subtitle_language` | Defaults for `--subtitle` / `--sub-lang` |
-| `template` | Which entry of `video_templates` to use |
-| `resolutions` | Comma-separated rung names to render from that template |
-| `esam`, `audio_norm`, `upload`, `import` | Booleans matching the corresponding flags |
-| `log_file` | Also write logs to this file |
+| `input_video`, `subtitle_file` | Local paths or `s3://` URIs |
+| `output_dir` | S3 folder name under `s3.key_prefix` |
+| `template` | Which `video_templates` ladder to use |
+| `resolutions` | Comma-separated rung names from that ladder |
+| `esam`, `audio_norm`, `generate_thumbnails`, `upload` | Feature switches |
+| `InputClippings` | `[{"StartTimecode": "HH:MM:SS:FF", "EndTimecode": "..."}]` |
 | `hls_settings` | `hls_time`, `hls_playlist_type`, `hls_flags`, `hls_segment_type` |
-| `InputClippings` | `[{ "StartTimecode": "HH:MM:SS:FF", "EndTimecode": "..." }, ...]` |
-| `mediapackage` | `packaging_group_id`, `vod_role_name`, `vod_role_arn`, `region`, `package_type`, `debug_aws` |
 
-`vod_role_arn` supports a `{{RoleArn}}` placeholder, substituted at runtime with the
-AWS account ID resolved from `sts get-caller-identity`.
-
-### `video_templates`
-
-A map of template name to an ABR ladder. Each rung:
+### `s3`
 
 | Key | Meaning |
 | --- | --- |
-| `name` | Rung name — must match entries in `defaults.resolutions` |
-| `width`, `height` | Output dimensions |
-| `codec` | `H_264` → `libwz264`, `H_265` → `libwz265` (with `hvc1` tag) |
-| `codec_params` | Passed as `-wz264-params` / `-wz265-params` |
-| `bitrate` / `crf` | Rate control — `crf` wins if both are set |
-| `preset`, `caeopts`, `threads` | Encoder tuning |
-| `video_format` | `yuv420p`, `yuvj420p`, `yuv420p10`, `yuvj420p10` |
-| `interlace_mode` | `PROGRESSIVE` inserts a `yadif` deinterlace filter |
-| `frame_rate` | Output fps; empty means inherit from the source |
-| `GopSize` | GOP length in seconds, quantised to whole frames |
+| `bucket_name` | Destination bucket |
+| `key_prefix` | Prefix under which `output_dir` is created |
+| `region` | Optional; defaults to the instance's region |
+
+### `video_templates`
+
+A map of template name to ABR ladder. Per rung: `name`, `width`, `height`,
+`codec` (`H_264` → `libwz264`, `H_265` → `libwz265`), `codec_params` (passed as
+`-wz264-params` / `-wz265-params`), `bitrate` or `crf`, `preset`, `caeopts`,
+`threads`, `GopSize`, `interlace_mode`, `video_format`, `frame_rate`.
 
 ### Other sections
 
-- **`s3`** — `bucket_name`, `key_prefix`.
-- **`thumbnail_generation`** — `enabled`.
-- **`audio_normalization.loudnorm_settings`** — `i`, `lra`, `tp` targets.
-- **`Esam`** — `SignalProcessingNotification.SccXml` and
-  `ManifestConfirmConditionNotification.MccXml` as inline XML strings.
+`paths` (FFmpeg locations), `thumbnail_generation`, `audio_normalization`,
+`Esam` (`SccXml` and `MccXml` as inline strings).
 
 ---
 
-## Common invocations
+## CLI
 
 ```bash
-# Straight HLS package
-python app.py --input in.mp4 --output hls_out
+# Full run from the config
+python app.py --config config.json
 
-# First 60 seconds only, H.265 ladder, two rungs, keep temp files
-python app.py --input in.mp4 --output hls_out \
-              --duration 60 --template h265_standard \
-              --resolution 1080p,720p --debug
+# Override input and output for one run
+python app.py --input s3://bucket/in.mp4 --output my_asset
 
-# With subtitles, audio normalisation, ad markers and thumbnails
-python app.py --input in.mp4 --subtitle in.vtt --sub-lang en \
-              --audio-norm --esam --generate-thumbnails
+# First 60 seconds, H.265 ladder, keep local output and scratch
+python app.py --duration 60 --template h265_standard --keep-local --debug
 
-# Package, upload to S3 and register with MediaPackage
-python app.py --input in.mp4 --output my_asset --upload --import
+# Package locally without uploading
+python app.py --no-upload --output ./local_out
 
 # Upload an already-packaged directory
 python app.py --upload-only --s3-upload-source-dir ./hls_out --output my_asset
-
-# Register something already in S3 with MediaPackage
-python app.py --import-only --s3-import-folder-name my_asset --output my_asset_id
 ```
+
+`python app.py --help` lists every flag.
 
 ---
 
-## Output
+## HTTP API
 
+Full reference with examples: [`docs/API.md`](docs/API.md).
+
+```bash
+curl -sX POST localhost:8000/api/v1/jobs -H 'Content-Type: application/json' -d '{
+  "input_video": "s3://dev-us-west-2-transcoder-bucket/Visionular/AETN_AmericanPickers_S10_E03_en.mp4",
+  "output_dir": "AETN_AmericanPickers_S10_E03_en",
+  "resolutions": "1080p,720p,540p,360p",
+  "esam": true, "audio_norm": true, "generate_thumbnails": true
+}'
+
+curl -s localhost:8000/api/v1/jobs/<job_id>/status
+curl -s "localhost:8000/api/v1/jobs/<job_id>/logs?type=error"
+curl -s "localhost:8000/api/v1/jobs?status=RUNNING"
 ```
-hls_output/
-├── channel.m3u8                    master playlist
-├── channel_1080p.m3u8              variant playlists (one per rung)
-├── channel_1080p_00001.ts          MPEG-TS segments
-├── channel_en-vtt-1.m3u8           subtitle playlist
-├── channel_en-vtt-1_00001.vtt      subtitle segments
-└── thumbnails/thumb_0001.jpg       when --generate-thumbnails is set
+
+| Method | Path |
+| --- | --- |
+| `POST` | `/api/v1/jobs` — queue a job (`202` + `job_id`) |
+| `GET` | `/api/v1/jobs` — list, paginated and filterable |
+| `GET` | `/api/v1/jobs/<id>` — full record, ladder, clips, config snapshot |
+| `GET` | `/api/v1/jobs/<id>/status` — status + progress percentage |
+| `GET` | `/api/v1/jobs/<id>/logs?type=job\|error\|ffmpeg` |
+| `POST` | `/api/v1/jobs/<id>/cancel` |
+| `DELETE` | `/api/v1/jobs/<id>` |
+| `GET` | `/api/v1/templates`, `/api/v1/config`, `/health` |
+
+---
+
+## Database
+
+PostgreSQL stores every job with the exact configuration it ran under, its
+rendition ladder and its clip list. Setup for Ubuntu, start to finish:
+[`docs/POSTGRES_SETUP.md`](docs/POSTGRES_SETUP.md).
+
+```bash
+sudo apt install -y postgresql postgresql-contrib
+sudo -u postgres psql -c "CREATE ROLE transcoder LOGIN PASSWORD 'secret' CREATEDB;" \
+                    -c "CREATE DATABASE ai_transcoder OWNER transcoder;"
+cp .env.example .env && $EDITOR .env
+python -m api.app          # tables are created on first start
 ```
+
+Tables: `jobs`, `job_variants`, `job_clips`. The API also runs without a
+database — transcodes still work, only history and listings are unavailable, and
+`/health` reports `"database": "unavailable"`.
+
+---
+
+## Deployment
+
+```bash
+sudo cp deploy/ai-transcoder.service /etc/systemd/system/
+sudo cp .env.example /etc/ai-transcoder.env && sudo chmod 600 /etc/ai-transcoder.env
+sudo $EDITOR /etc/ai-transcoder.env
+sudo systemctl daemon-reload && sudo systemctl enable --now ai-transcoder
+curl -s localhost:8000/health
+```
+
+The unit runs gunicorn with **one worker and multiple threads**. That is
+deliberate: the in-process job registry that serves live progress is per-process,
+so multiple gunicorn workers would answer status requests for jobs they are not
+running. Scale by raising `MAX_CONCURRENT_JOBS` (and the thread count), not the
+worker count.
+
+`WORK_ROOT` needs free space of roughly three times the source file per
+concurrent job.
 
 ---
 
@@ -204,13 +314,16 @@ hls_output/
 
 | Symptom | Cause |
 | --- | --- |
-| `FFmpeg executable not found at ...` | `paths.ffmpeg_executable` is wrong, or `bin/ffmpeg` is missing / not executable |
-| `Unknown encoder 'libwz264'` | The FFmpeg build in `bin/` is a stock build without the in-house encoders |
-| `Template '<name>' not found` | `defaults.template` does not match any key in `video_templates` |
-| `... resolutions were not found in template` | A name in `defaults.resolutions` has no matching rung |
-| `Invalid video duration detected: 0.0s` | Input is unreadable or has no video stream |
-| `AWS CLI not found` | Install awscli v2 — only needed for the S3 / MediaPackage flags |
-| `Timeout waiting for Asset ...` | MediaPackage packaging is slow or failing; re-run with `--debug-aws` |
+| `FFmpeg executable not found at ...` | `paths.ffmpeg_executable` is wrong, or `bin/ffmpeg` is not executable |
+| `Unknown encoder 'libwz264'` | The binary in `bin/` is a stock FFmpeg without the in-house encoders |
+| `S3 object not found: s3://...` | Wrong key, or the instance role cannot see that bucket |
+| `Access denied reading s3://...` | The instance role lacks `s3:GetObject` on that prefix |
+| `upload is enabled but s3.bucket_name is not configured` | Set `s3.bucket_name`, or pass `"upload": false` |
+| `Upload verification failed for N object(s)` | Object size mismatch in S3 — the local output is kept; check the bucket and retry |
+| Job stuck at `FETCHING_INPUT` | Large source download; watch `job.log` for percentage lines |
+| `/health` shows `"database": "unavailable"` | See [`docs/POSTGRES_SETUP.md`](docs/POSTGRES_SETUP.md) |
+| `Running without persistence` in the log | Same — jobs still run, history does not persist |
 
-`--debug` turns on verbose logging and keeps `.wz_temp/` so intermediate clips can be
-inspected.
+Start with `logs/<channel>/<job_id>/error.log`, then `ffmpeg.log` for encoder
+failures. `--debug` raises verbosity and keeps the scratch directory so
+intermediate clips can be inspected.

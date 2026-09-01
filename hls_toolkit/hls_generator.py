@@ -7,9 +7,9 @@ import math
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
-from hls_toolkit import time_utils
-from hls_toolkit.aws_handler import (run_aws_cli, get_aws_account_id,
-                                     manage_mediapackage_vod_asset)
+from hls_toolkit import s3_io, time_utils
+from hls_toolkit.job_context import (JobCancelled, JobContext, TranscodeError,
+                                     current_context, log)
 from hls_toolkit.esam_parser import (parse_esam_xml_string, parse_mcc_xml_asset_tags,
                                      process_playlist)
 from hls_toolkit.ffmpeg_wrapper import (get_video_info, run_loudnorm_analysis,
@@ -28,15 +28,10 @@ def generate_hls_workflow(config: Dict[str, Any],
                           paths: Dict[str, Any],
                           s3_config: Dict[str, Any],
                           esam_config: Dict[str, Any],
-                          mediapackage_config: Dict[str, Any],
                           default_input_video: str,
                           default_output_dir: str,
                           default_subtitle_file: Optional[str],
                           default_subtitle_language: str,
-                          default_mp_packaging_group_id: str,
-                          default_mp_vod_role_name: str,
-                          default_region: str,
-                          default_package_type: str,
                           input_video: str,
                           output_dir: Path,
                           output_dir_name: str,
@@ -53,14 +48,16 @@ def generate_hls_workflow(config: Dict[str, Any],
                           audio_norm: bool = False,
                           esam: bool = False,
                           upload: bool = False,
-                          import_to_mediapackage: bool = False,
-                          debug_aws: bool = False,
+                          delete_local_output: bool = True,
                           resolution: Optional[str] = None) -> int:
     """Executes the main HLS VOD generation workflow.
 
-    This function encapsulates the entire process of clipping, transcoding,
-    HLS packaging, subtitle processing, ESAM ad-insertion, thumbnail generation,
-    and optional S3 upload/MediaPackage import.
+    Clips, transcodes, packages as HLS, processes subtitles, injects ESAM ad
+    markers, generates thumbnails, then publishes the result to S3 and (unless
+    ``delete_local_output`` is False) removes the local copy.
+
+    Progress, per-channel logging and cancellation come from the job context
+    bound to the calling thread — see :mod:`hls_toolkit.job_context`.
 
     Args:
         config: The full configuration dictionary loaded from config.json.
@@ -68,63 +65,74 @@ def generate_hls_workflow(config: Dict[str, Any],
         paths: The 'paths' section from the config.
         s3_config: The 's3' section from the config.
         esam_config: The 'Esam' section from the config.
-        mediapackage_config: The 'mediapackage' section from the config defaults.
         default_input_video: Default path to the input video.
         default_output_dir: Default output directory name.
         default_subtitle_file: Default path to the subtitle file.
         default_subtitle_language: Default subtitle language.
-        default_mp_packaging_group_id: Default MediaPackage Packaging Group ID.
-        default_mp_vod_role_name: Default MediaPackage VOD IAM role name.
-        default_region: Default AWS region.
-        default_package_type: Default MediaPackage package type.
-        input_video: Actual input video path after argument parsing.
-        output_dir: Absolute path to the output directory.
-        output_dir_name: Name of the output directory.
-        subtitle_file: Actual subtitle file path after argument parsing.
+        input_video: Local path to the input video (S3 inputs are fetched first).
+        output_dir: Absolute path to the staging output directory.
+        output_dir_name: Name of the output directory — also the S3 folder name.
+        subtitle_file: Local path to the subtitle file, or None.
         ffmpeg_executable: Path to the FFmpeg executable.
         ffprobe_executable: Path to the FFprobe executable.
         video_templates: A dictionary of video templates, defining resolutions and encoding settings.
+        upload: Publish the finished package to S3.
+        delete_local_output: Remove the local output directory once every object
+            is verified in S3.
 
     Returns:
-        0 on successful completion of the workflow, 1 on failure.
+        0 on success.
+
+    Raises:
+        TranscodeError: a stage failed; ``.stage`` names which one.
+        JobCancelled: cancellation was requested through the job context.
     """
+    ctx = current_context()
     if not Path(ffmpeg_executable).exists():
-        logging.critical(f"FFmpeg executable not found at {ffmpeg_executable}. "
-                         "Cannot proceed without FFmpeg.")
-        return 1
+        raise TranscodeError(
+            f"FFmpeg executable not found at {ffmpeg_executable}. This build must "
+            f"provide the libwz264/libwz265 encoders.", stage="VALIDATION")
     if not Path(ffprobe_executable).exists():
-        logging.critical(f"FFprobe executable not found at {ffprobe_executable}. "
-                         "Cannot proceed without FFprobe.")
-        return 1
+        raise TranscodeError(f"FFprobe executable not found at {ffprobe_executable}.",
+                             stage="VALIDATION")
     if temp_dir is None:
         temp_dir = str(Path.cwd() / ".wz_temp")
 
+    if ctx is not None:
+        ctx.set_stage("PROBING", 0.0)
     try:
         video_info = get_video_info(ffprobe_executable, input_video)
         video_fps = video_info["frame_rate"]
         original_video_duration = video_info["duration"]
         if original_video_duration <= 0:
-            logging.critical(f"Invalid video duration detected: {original_video_duration}s. "
-                             f"The input file '{input_video}' may be corrupted or empty.")
-            return 1
-        logging.info(f"Detected video properties: FPS={video_fps}, "
-                     f"Duration={original_video_duration}s")
+            raise TranscodeError(
+                f"Invalid video duration detected: {original_video_duration}s. The "
+                f"input file '{input_video}' may be corrupt, empty or not a video.",
+                stage="PROBING")
+        log().info(f"Detected video properties: FPS={video_fps}, "
+                   f"Duration={original_video_duration}s")
+        if ctx is not None:
+            ctx.metadata["source_duration_seconds"] = round(original_video_duration, 3)
+            ctx.metadata["source_fps"] = str(video_fps)
+            ctx.set_stage("PROBING", 1.0)
+    except TranscodeError:
+        raise
     except Exception as e:
-        logging.error(f"Could not determine video properties: {e}", exc_info=True)
-        return 1
+        raise TranscodeError(f"Could not determine video properties: {e}",
+                             stage="PROBING") from e
 
     clippings = defaults.get("InputClippings", [])
     if not clippings:
-        logging.info("InputClippings not provided in config. "
+        log().info("InputClippings not provided in config. "
                      "Using full input video as a single clip.")
         duration_seconds = get_video_info(ffprobe_executable, input_video).get("duration", 0.0)
         if duration_seconds > 0:
             clippings = [{'StartTimecode': "00:00:00:00",
                           'EndTimecode': seconds_to_timecode(duration_seconds, str(video_fps))}]
         else:
-            logging.error("Could not determine video duration. "
-                          "Cannot proceed without InputClippings.")
-            return 1
+            raise TranscodeError(
+                "Could not determine the video duration and no InputClippings were "
+                "supplied, so there is nothing to transcode.", stage="PROBING")
 
     hls_settings = defaults.get("hls_settings", {})
     temp_clipping_dir = None
@@ -147,7 +155,7 @@ def generate_hls_workflow(config: Dict[str, Any],
                 effective_end_duration = min(float(duration), original_video_duration)
                 frame_number = round(effective_end_duration * float(video_fps))
                 quantized_effective_end_duration = float(frame_number / float(video_fps))
-                logging.info(f"Quantized effective --duration: {effective_end_duration}s -> "
+                log().info(f"Quantized effective --duration: {effective_end_duration}s -> "
                              f"Frame {frame_number} -> "
                              f"{quantized_effective_end_duration:.6f}s")
                 effective_clippings = [{
@@ -156,23 +164,24 @@ def generate_hls_workflow(config: Dict[str, Any],
                                                        str(video_fps)),
                     'Name': "FullDurationClip"}]
             except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as e:
-                logging.error(f"Failed to get video duration: {e}")
+                log().error(f"Failed to get video duration: {e}")
                 if isinstance(e, subprocess.CalledProcessError):
                     try:
                         ffprobe_output_formatted = e.stdout.strip().replace("\n", "\n        ")
-                        logging.error(
+                        log().error(
                             f'FFprobe command failed: '
                             f'{" ".join(shlex.quote(arg) for arg in e.cmd)}\n'
                             f'    FFprobe output:\n        {ffprobe_output_formatted}')
                     except Exception:
                         pass
-                return 1
+                raise TranscodeError(f"Failed to apply --duration: {e}",
+                                     stage="VALIDATION") from e
 
         try:
             validate_clippings(effective_clippings, video_fps)
         except ValueError as e:
-            logging.error(f"Configuration Error: {e}")
-            return 1
+            raise TranscodeError(f"Invalid InputClippings: {e}",
+                                 stage="VALIDATION") from e
 
         clip_gop_offsets = []
         gop_size_seconds = hls_settings.get("hls_time", 6.0)
@@ -184,7 +193,7 @@ def generate_hls_workflow(config: Dict[str, Any],
             offset_seconds = float(offset_frames) / float(video_fps)
             clip_gop_offsets.append(offset_seconds)
 
-        logging.debug(f"Clip GOP offsets (seconds): {clip_gop_offsets}")
+        log().debug(f"Clip GOP offsets (seconds): {clip_gop_offsets}")
 
         if esam:
             scc_xml = esam_config.get("SignalProcessingNotification", {}).get("SccXml")
@@ -199,12 +208,12 @@ def generate_hls_workflow(config: Dict[str, Any],
                         seen_npts.add(event["npt"])
 
                 if len(events) != len(unique_events):
-                    logging.info(f"De-duplicated ESAM events from {len(events)} to "
+                    log().info(f"De-duplicated ESAM events from {len(events)} to "
                                  f"{len(unique_events)} based on unique timestamps.")
                 events = unique_events
 
                 tolerance_frames = 10
-                logging.info(f"Applying ad snapping logic with a tolerance of "
+                log().info(f"Applying ad snapping logic with a tolerance of "
                              f"{tolerance_frames} frames.")
                 clip_end_frames = [
                     math.floor(timecode_to_seconds(c.get("EndTimecode"), str(video_fps))
@@ -223,7 +232,7 @@ def generate_hls_workflow(config: Dict[str, Any],
                     if abs(original_frame - nearest_clip_end_frame) <= tolerance_frames:
                         snapped_frame = nearest_clip_end_frame
                         snapped_npt = float(snapped_frame / float(video_fps))
-                        logging.info(f"Snapping ESAM event at {original_npt:.3f}s to clip "
+                        log().info(f"Snapping ESAM event at {original_npt:.3f}s to clip "
                                      f"boundary. New NPT: {snapped_npt:.3f}s.")
                         event["npt"] = snapped_npt
                     else:
@@ -252,12 +261,12 @@ def generate_hls_workflow(config: Dict[str, Any],
                             final_hls_force_times.append(t)
                             prev_t = t
                         else:
-                            logging.info(f"Debouncing/Skipping force time {t:.6f}s as it is "
+                            log().info(f"Debouncing/Skipping force time {t:.6f}s as it is "
                                          f"too close to {prev_t:.6f}s")
 
                 merged_timeline_cue_points_str = ",".join(
                     [f"{t:.6f}" for t in final_hls_force_times])
-                logging.info("Final HLS force times after snapping and debouncing: "
+                log().info("Final HLS force times after snapping and debouncing: "
                              f"{merged_timeline_cue_points_str}")
 
             if mcc_xml:
@@ -266,16 +275,18 @@ def generate_hls_workflow(config: Dict[str, Any],
         if not esam:
             events = []
             asset_tags_map = {}
-            logging.info("ESAM is disabled. Ensuring ESAM events and asset tags are cleared.")
+            log().info("ESAM is disabled. Ensuring ESAM events and asset tags are cleared.")
 
         all_resolutions_data = video_templates.get(template_name)
         if not all_resolutions_data:
-            logging.error(f"Template '{template_name}' not found.")
-            return 1
+            available = ", ".join(sorted(video_templates)) or "(none configured)"
+            raise TranscodeError(
+                f"Template '{template_name}' not found in video_templates. "
+                f"Available: {available}", stage="VALIDATION")
 
         if resolution:
             selected_resolution_names = [r.strip() for r in resolution.split(",")]
-            logging.info("Overriding resolutions from config, will process: "
+            log().info("Overriding resolutions from config, will process: "
                          f"{selected_resolution_names}")
         else:
             selected_resolution_names = [
@@ -289,21 +300,21 @@ def generate_hls_workflow(config: Dict[str, Any],
         missing_resolutions = [name for name in selected_resolution_names
                                if name not in found_resolution_names]
         if missing_resolutions:
-            logging.critical("Configuration Error: The following configured resolutions were "
-                             f"not found in template '{template_name}': "
-                             f'{", ".join(missing_resolutions)}. Exiting.')
-            return 1
+            available = ", ".join(r["name"] for r in all_resolutions_data)
+            raise TranscodeError(
+                f"These resolutions are not defined in template '{template_name}': "
+                f'{", ".join(missing_resolutions)}. Available: {available}',
+                stage="VALIDATION")
         if not selected_resolutions_data:
-            logging.critical("Configuration Error: None of the specified resolutions "
-                             f"({selected_resolution_names}) were found in the template "
-                             f"'{template_name}'. Exiting.")
-            return 1
+            raise TranscodeError(
+                f"None of the requested resolutions {selected_resolution_names} exist "
+                f"in template '{template_name}'.", stage="VALIDATION")
 
-        logging.info('Processing for the following resolutions: '
+        log().info('Processing for the following resolutions: '
                      f'{[res["name"] for res in selected_resolutions_data]}')
         for res_data in selected_resolutions_data:
             if "frame_rate" not in res_data or not res_data["frame_rate"]:
-                logging.info(f'Frame rate not configured for resolution {res_data["name"]}. '
+                log().info(f'Frame rate not configured for resolution {res_data["name"]}. '
                              f'Applying detected input video frame rate: {video_fps}')
                 res_data["frame_rate"] = video_fps
 
@@ -312,7 +323,9 @@ def generate_hls_workflow(config: Dict[str, Any],
         loudnorm_settings = config.get("audio_normalization", {}).get("loudnorm_settings", {})
 
         if audio_norm:
-            logging.info("Running loudnorm analysis...")
+            if ctx is not None:
+                ctx.set_stage("ANALYZING_AUDIO", 0.0)
+            log().info("Running loudnorm analysis...")
             audio_analysis_input = os.path.abspath(input_video)
             loudnorm_analysis_duration = None
             if effective_clippings:
@@ -322,26 +335,26 @@ def generate_hls_workflow(config: Dict[str, Any],
                 end_seconds = timecode_to_seconds(first_clip.get("EndTimecode"),
                                                   str(video_fps))
                 loudnorm_analysis_duration = end_seconds - start_seconds
-                logging.info("Performing loudnorm analysis on the first clipping for "
+                log().info("Performing loudnorm analysis on the first clipping for "
                              f"{float(loudnorm_analysis_duration):.3f} seconds.")
             else:
                 if total_merged_duration == 0:
                     total_merged_duration = original_video_duration
                 loudnorm_analysis_duration = total_merged_duration
-                logging.info("Performing loudnorm analysis on the full video for "
+                log().info("Performing loudnorm analysis on the full video for "
                              f"{loudnorm_analysis_duration:.3f} seconds.")
 
             loudnorm_analysis_results = run_loudnorm_analysis(
                 ffmpeg_executable, audio_analysis_input, cwd=temp_dir,
                 duration=loudnorm_analysis_duration)
             if not loudnorm_analysis_results:
-                logging.warning("Warning: Loudnorm analysis failed. "
+                log().warning("Warning: Loudnorm analysis failed. "
                                 "Audio normalization will be skipped.")
                 audio_norm = False
             else:
-                logging.info("Loudnorm analysis results:")
+                log().info("Loudnorm analysis results:")
                 for k, v in loudnorm_analysis_results.items():
-                    logging.info(f"  {k}: {v}")
+                    log().info(f"  {k}: {v}")
 
         merged_video_paths_by_resolution = {}
         merged_audio_path = None
@@ -358,7 +371,7 @@ def generate_hls_workflow(config: Dict[str, Any],
 
             if esam and remapped_esam_events_for_video:
                 events = remapped_esam_events_for_video
-                logging.info("Updated ESAM events to remapped versions for merged timeline. "
+                log().info("Updated ESAM events to remapped versions for merged timeline. "
                              f"Count: {len(events)}")
 
             if subtitle_file:
@@ -370,18 +383,24 @@ def generate_hls_workflow(config: Dict[str, Any],
                     subtitle_input_path = Path(merged_vtt_path_temp)
                     temp_subtitle_dir = Path(temp_subtitle_dir_local)
                 else:
-                    logging.warning("No merged VTT file generated during initial processing.")
+                    log().warning("No merged VTT file generated during initial processing.")
         else:
             for res_data in selected_resolutions_data:
                 merged_video_paths_by_resolution[res_data["name"]] = os.path.abspath(input_video)
             total_merged_duration = original_video_duration
 
         if esam and events:
-            logging.info("Using remapped ESAM cue points for merged timeline "
+            log().info("Using remapped ESAM cue points for merged timeline "
                          f"(for HLS segmentation): {merged_timeline_cue_points_str}")
 
+        if ctx is not None:
+            ctx.set_stage("PACKAGING_HLS", 0.0)
+
         if merged_video_paths_by_resolution:
-            for res_data in selected_resolutions_data:
+            for packaged, res_data in enumerate(selected_resolutions_data):
+                if ctx is not None:
+                    ctx.set_stage("PACKAGING_HLS",
+                                  packaged / max(1, len(selected_resolutions_data)))
                 res_name = res_data["name"]
                 merged_mp4_path = merged_video_paths_by_resolution.get(res_name)
                 if merged_mp4_path:
@@ -432,14 +451,16 @@ def generate_hls_workflow(config: Dict[str, Any],
                                                             first_segment_path)
                         if pts_seconds is not None:
                             global_mpegts_start_val = int(pts_seconds * 90000)
-                            logging.info(f"Detected start PTS from {first_segment_filename}: "
+                            log().info(f"Detected start PTS from {first_segment_filename}: "
                                          f"{pts_seconds}s. Setting global VTT MPEGTS start to "
                                          f"{global_mpegts_start_val}.")
             else:
-                logging.warning("Could not find any video HLS playlist to extract segment "
+                log().warning("Could not find any video HLS playlist to extract segment "
                                 "times. VTT segmentation might not be perfectly aligned.")
 
         hls_sub_playlist_path = None
+        if ctx is not None:
+            ctx.set_stage("SUBTITLES", 0.0)
         if subtitle_file and subtitle_input_path and subtitle_input_path.exists():
             success = False
             hls_sub_playlist_path_local = None
@@ -451,14 +472,17 @@ def generate_hls_workflow(config: Dict[str, Any],
                 video_segments=video_segments,
                 global_stream_mpegts_start=global_mpegts_start_val)
             if not success:
-                logging.error("Failed to segment VTT for HLS.")
-                return 1
+                raise TranscodeError(
+                    "Failed to segment the subtitle track into HLS VTT segments.",
+                    stage="SUBTITLES")
             if hls_sub_playlist_path_local:
                 hls_sub_playlist_path = hls_sub_playlist_path_local
                 hls_output_paths.append(hls_sub_playlist_path)
             if temp_subtitle_dir and temp_subtitle_dir.exists():
                 shutil.rmtree(temp_subtitle_dir, ignore_errors=True)
 
+        if ctx is not None:
+            ctx.set_stage("MANIFEST", 0.0)
         create_master_playlist(str(master_playlist_path), selected_resolutions_data,
                                merged_video_paths_by_resolution, ffprobe_executable,
                                float(video_fps), subtitle_file, hls_sub_playlist_path,
@@ -466,83 +490,91 @@ def generate_hls_workflow(config: Dict[str, Any],
                                _get_h264_profile_idc)
 
         if thumbnails_enabled:
+            if ctx is not None:
+                ctx.set_stage("THUMBNAILS", 0.0)
             first_mp4_for_thumbnails = next(iter(merged_video_paths_by_resolution.values()),
                                             None)
             if first_mp4_for_thumbnails:
                 generate_thumbnails(ffmpeg_executable, first_mp4_for_thumbnails, output_dir)
             else:
-                logging.warning("No mp4 source found for thumbnail generation.")
+                log().warning("No mp4 source found for thumbnail generation.")
 
         if esam and events:
+            if ctx is not None:
+                ctx.set_stage("AD_MARKERS", 0.0)
             for playlist_path in hls_output_paths:
                 if playlist_path.is_file():
-                    logging.info(f"Injecting ESAM markers into {playlist_path.name}")
+                    log().info(f"Injecting ESAM markers into {playlist_path.name}")
                     process_playlist(str(playlist_path), events, asset_tags_map,
                                      video_segments=video_segments)
 
+        # --- publish to S3 -------------------------------------------------
         s3_bucket_name_local = s3_config.get("bucket_name")
         s3_key_prefix_local = s3_config.get("key_prefix", "").strip("/")
-        if not s3_bucket_name_local and (upload or import_to_mediapackage):
-            logging.error("S3 bucket_name not specified in config. "
-                          "Cannot perform S3 operations.")
-            return 1
+        s3_region = s3_config.get("region")
 
         if upload:
-            s3_destination_key = (f"{s3_key_prefix_local}/{output_dir_name}"
-                                  if s3_key_prefix_local else output_dir_name)
-            s3_destination_path = f"s3://{s3_bucket_name_local}/{s3_destination_key}"
-            run_aws_cli(['aws', 's3', 'rm', '--recursive', s3_destination_path],
-                        check=True, log_output=True)
-            run_aws_cli(["aws", "s3", "cp", "--recursive", str(output_dir),
-                         s3_destination_path], check=True, log_output=True)
+            if not s3_bucket_name_local:
+                raise TranscodeError(
+                    "s3.bucket_name is not set in the configuration, but upload is "
+                    "enabled. Set it or disable upload.", stage="UPLOADING")
+            if ctx is not None:
+                ctx.set_stage("UPLOADING", 0.0)
+            destination_prefix = s3_io.build_output_prefix(s3_key_prefix_local,
+                                                           output_dir_name)
+            log().info(f"Publishing output to s3://{s3_bucket_name_local}/"
+                       f"{destination_prefix}")
+            s3_io.delete_prefix(s3_bucket_name_local, destination_prefix,
+                                ctx=ctx, region=s3_region)
+            upload_result = s3_io.upload_directory(
+                output_dir, s3_bucket_name_local, destination_prefix,
+                ctx=ctx, region=s3_region, delete_local=delete_local_output)
+            playback_url = (f"{upload_result['prefix']}/"
+                            f"{master_playlist_path.name}")
+            log().info(f"Output published: {upload_result['uploaded']} object(s), "
+                       f"master playlist at {playback_url}")
+            if ctx is not None:
+                ctx.output_prefix = upload_result["prefix"]
+                ctx.uploaded_files = upload_result["uploaded"]
+                ctx.metadata["playback_url"] = playback_url
+                ctx.metadata["s3_bucket"] = s3_bucket_name_local
+                ctx.metadata["s3_prefix"] = destination_prefix
+        else:
+            log().info(f"Upload disabled — output kept locally at {output_dir}")
+            if ctx is not None:
+                ctx.output_prefix = str(output_dir)
+                ctx.metadata["playback_url"] = str(master_playlist_path)
 
-        if import_to_mediapackage:
-            aws_account_id = get_aws_account_id(default_region, debug_aws)
-            if not aws_account_id:
-                logging.error("Could not retrieve AWS account ID. "
-                              "Cannot perform MediaPackage import.")
-                return 1
-            vod_role_arn_to_use = (f"arn:aws:iam::{aws_account_id}:role/"
-                                   f"{default_mp_vod_role_name}")
-            s3_source_arn = (f'arn:aws:s3:::{s3_bucket_name_local}/{s3_key_prefix_local}'
-                             f'{"/" if s3_key_prefix_local else ""}'
-                             f'{output_dir_name}/channel.m3u8')
-            mediapackage_results = manage_mediapackage_vod_asset(
-                region=default_region,
-                packaging_group_id=default_mp_packaging_group_id,
-                vod_role_arn=vod_role_arn_to_use,
-                s3_source_arn=s3_source_arn,
-                package_type=default_package_type,
-                asset_id=None,
-                debug=debug_aws)
-            if mediapackage_results and "error" in mediapackage_results:
-                logging.error(f'MediaPackage integration failed: '
-                              f'{mediapackage_results.get("error")} - '
-                              f'{mediapackage_results.get("details")}')
-                return 1
-            logging.info("MediaPackage integration completed successfully.")
-            if mediapackage_results and mediapackage_results.get("playback_urls"):
-                logging.info("Detected MediaPackage Playback URLs:")
-                for url in mediapackage_results["playback_urls"]:
-                    logging.info(f"- {url}")
-            else:
-                logging.info("No specific MediaPackage Playback URLs detected in the output.")
+        if ctx is not None:
+            ctx.set_stage("CLEANUP", 1.0)
 
+    except JobCancelled:
+        log().warning("Job cancelled — aborting workflow.")
+        raise
     except KeyboardInterrupt:
-        logging.warning("Keyboard interrupt. Exiting.")
+        log().warning("Keyboard interrupt. Exiting.")
         return 1
+    except TranscodeError as e:
+        log().error(f"{e.stage} failed: {e}", exc_info=True)
+        raise
     except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}", exc_info=True)
-        return 1
+        log().error(f"An unexpected error occurred: {e}", exc_info=True)
+        raise TranscodeError(str(e), stage=(ctx.stage if ctx else "UNKNOWN")) from e
     finally:
-        try:
-            if temp_clipping_dir and temp_clipping_dir.exists():
-                if not debug:
-                    shutil.rmtree(temp_clipping_dir, ignore_errors=True)
-                else:
-                    logging.info("Debug enabled: Keeping temporary directory "
-                                 f"{temp_clipping_dir}")
-        except Exception as e:
-            logging.warning(f"Error while cleaning temporary dirs: {e}")
+        _cleanup_temp_dirs(temp_clipping_dir, debug)
 
     return 0
+
+
+def _cleanup_temp_dirs(temp_clipping_dir, debug: bool) -> None:
+    """Remove the transcode scratch directory unless --debug asked to keep it."""
+    try:
+        if temp_clipping_dir and Path(temp_clipping_dir).exists():
+            if debug:
+                log().info("Debug enabled: keeping temporary directory "
+                           f"{temp_clipping_dir}")
+            else:
+                shutil.rmtree(temp_clipping_dir, ignore_errors=True)
+                log().debug(f"Removed temporary directory {temp_clipping_dir}")
+    except Exception as e:
+        log().warning(f"Error while cleaning temporary dirs: {e}")
