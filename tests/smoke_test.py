@@ -25,6 +25,7 @@ from hls_toolkit.subtitle_processor import (generate_merged_subtitle_file, parse
                                             segment_vtt_for_hls)
 from hls_toolkit.time_utils import (parse_fps, seconds_to_timecode, timecode_to_frame,
                                     timecode_to_seconds)
+from hls_toolkit import s3_io
 
 FAILURES = []
 
@@ -175,6 +176,34 @@ def test_ffmpeg_command():
     check("outputs mapped", sorted(result["outputs"]), ["1080p", "720p"])
 
 
+def test_environment_diagnostics():
+    """A broken TLS stack must be named as such, not blamed on S3."""
+    print("environment diagnostics")
+
+    # pyOpenSSL too old for the installed cryptography: OpenSSL/crypto.py reads
+    # X509_V_FLAG_NOTIFY_POLICY at import time and cryptography >= 42 removed it.
+    broken = AttributeError("module 'lib' has no attribute 'X509_V_FLAG_NOTIFY_POLICY'")
+    hint = s3_io.environment_problem(broken)
+    check("TLS mismatch is recognised", hint is not None, True)
+    check("hint says it is not an S3 problem",
+          bool(hint) and "not an S3 or permissions problem" in hint, True)
+    check("hint gives the botocore remedy",
+          bool(hint) and "boto3>=1.38.46" in hint, True)
+    check("hint gives the pyOpenSSL remedy",
+          bool(hint) and "pyOpenSSL>=24.0.0" in hint, True)
+
+    # A missing pyOpenSSL is normal — botocore falls back to the stdlib context.
+    absent = ModuleNotFoundError("No module named 'OpenSSL'")
+    absent.name = "OpenSSL"
+    check("absent pyOpenSSL is not an error", s3_io.environment_problem(absent), None)
+
+    # Ordinary AWS errors must not be misread as environment problems.
+    class _Denied(Exception):
+        response = {"Error": {"Code": "AccessDenied"}}
+    check("AWS errors stay AWS errors", s3_io.environment_problem(_Denied()), None)
+    check("error code extraction", s3_io._error_code(_Denied()), "AccessDenied")
+
+
 def main():
     work = Path(tempfile.mkdtemp(prefix="aitranscoder_smoke_"))
     try:
@@ -183,6 +212,7 @@ def main():
         variant, segments = test_playlists(work)
         test_esam(work, variant, segments)
         test_ffmpeg_command()
+        test_environment_diagnostics()
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

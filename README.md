@@ -46,6 +46,17 @@ set -a && . ./.env && set +a
 python -m api.app                          # http://localhost:8000
 ```
 
+**Check the setup before running anything:**
+
+```bash
+python app.py --check
+```
+
+That validates the Python packages, the FFmpeg build (including that
+`libwz264`/`libwz265` are actually present), AWS credentials, that the input
+objects are readable, that the output bucket is *writable*, and the database —
+reporting each one with a specific remedy. Run it first on any new server.
+
 Verify the install without the encoder build or AWS:
 
 ```bash
@@ -312,8 +323,12 @@ concurrent job.
 
 ## Troubleshooting
 
+Run `python app.py --check` first — it identifies most of the table below
+directly, with the fix for each.
+
 | Symptom | Cause |
 | --- | --- |
+| `module 'lib' has no attribute 'X509_V_FLAG_NOTIFY_POLICY'` | Installed `pyOpenSSL` is older than the installed `cryptography` (which dropped those constants). botocore imports pyOpenSSL optionally and versions before 1.38.46 did not catch this. Fix with `pip install --upgrade 'boto3>=1.38.46' 'botocore>=1.38.46'`, or repair the pair: `pip install --upgrade 'pyOpenSSL>=24.0.0' 'cryptography>=42'`. Installing into a virtualenv avoids the apt/pip mix that causes it. |
 | `FFmpeg executable not found at ...` | `paths.ffmpeg_executable` is wrong, or `bin/ffmpeg` is not executable |
 | `Unknown encoder 'libwz264'` | The binary in `bin/` is a stock FFmpeg without the in-house encoders |
 | `S3 object not found: s3://...` | Wrong key, or the instance role cannot see that bucket |

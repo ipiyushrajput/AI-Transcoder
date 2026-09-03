@@ -20,6 +20,7 @@ from hls_toolkit.ffmpeg_wrapper import get_active_processes
 from hls_toolkit.job_context import TranscodeError
 from hls_toolkit.logging_utils import setup_logging
 from hls_toolkit.runner import run_transcode_job
+from hls_toolkit import preflight
 
 try:
     from hls_toolkit.version import GIT_VERSION
@@ -197,6 +198,10 @@ def build_parser(config: Dict[str, Any], config_path: str) -> argparse.ArgumentP
     parser.add_argument("--log-file",
                         help="Additional log file for the console-level stream.")
 
+    parser.add_argument("--check", action="store_true",
+                        help="Validate the environment (packages, FFmpeg, AWS "
+                             "credentials, inputs, bucket write access, database) "
+                             "and exit without transcoding.")
     parser.add_argument("--upload-only", action="store_true",
                         help="Skip transcoding and only upload a local directory to S3. "
                              "Requires --s3-upload-source-dir.")
@@ -229,6 +234,12 @@ def main() -> int:
 
     setup_logging(args, config)
     logging.info(f'Command: {" ".join(shlex.quote(arg) for arg in sys.argv)}')
+
+    if args.check:
+        results = preflight.run_all(config, log_root=args.log_dir,
+                                    work_root=args.work_dir)
+        print(preflight.format_report(results))
+        return 1 if any(r.failed for r in results) else 0
 
     s3_config = config.get("s3", {})
     if args.upload_only:
