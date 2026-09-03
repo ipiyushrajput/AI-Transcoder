@@ -52,24 +52,80 @@ def parse_s3_uri(uri: str) -> Tuple[str, str]:
     return bucket, key
 
 
+def environment_problem(exc: BaseException) -> Optional[str]:
+    """Describe `exc` if it is a broken-Python-install problem, else None.
+
+    A misconfigured TLS stack surfaces from deep inside boto3 as an
+    ``AttributeError`` that reads like nothing in particular. Reporting that
+    verbatim against an S3 URI sends people hunting through bucket policies for
+    a problem that is entirely local, so these are named explicitly.
+    """
+    text = f"{type(exc).__name__}: {exc}"
+
+    # pyOpenSSL is imported optionally by botocore via urllib3.contrib.pyopenssl.
+    # cryptography >= 42 dropped the X509_V_FLAG_* constants that older
+    # pyOpenSSL reads at import time, so `import OpenSSL` raises AttributeError
+    # while the module body runs. botocore only began catching that in 1.38.46.
+    if "X509_V_FLAG" in text or ("module 'lib' has no attribute" in text):
+        return (
+            "Your Python TLS packages are mismatched: the installed 'pyOpenSSL' "
+            "is too old for the installed 'cryptography' "
+            f"(reported as {text}).\n"
+            "        This is a local environment problem, not an S3 or "
+            "permissions problem.\n"
+            "        Fix it with either of:\n"
+            "          pip install --upgrade 'boto3>=1.38.46' 'botocore>=1.38.46'\n"
+            "            (newer botocore ignores the broken optional import)\n"
+            "          pip install --upgrade 'pyOpenSSL>=24.0.0' 'cryptography>=42'\n"
+            "            (repairs the pair itself)\n"
+            "        Running inside a virtualenv avoids the apt/pip mix that "
+            "usually causes this.")
+
+    # pyOpenSSL being absent is not a problem — botocore then uses the stdlib
+    # SSL context. Only a present-but-unimportable pyOpenSSL is worth reporting.
+    if isinstance(exc, ModuleNotFoundError) and getattr(exc, "name", None) == "OpenSSL":
+        return None
+    if isinstance(exc, ImportError) and "OpenSSL" in text:
+        return (f"A TLS dependency failed to import ({text}).\n"
+                "        Try: pip install --upgrade 'pyOpenSSL>=24.0.0' "
+                "'cryptography>=42'")
+    return None
+
+
+def _raise_environment_error(exc: BaseException, stage: str) -> None:
+    """Re-raise `exc` as a TranscodeError if it is an environment problem."""
+    hint = environment_problem(exc)
+    if hint:
+        raise TranscodeError(hint, stage=stage) from exc
+
+
 def get_s3_client(region: Optional[str] = None):
-    """Cached boto3 S3 client. Raises TranscodeError when boto3 is missing."""
+    """Cached boto3 S3 client. Raises TranscodeError when boto3 is unusable."""
     try:
         import boto3
         from botocore.config import Config
     except ImportError as e:
+        _raise_environment_error(e, "S3")
         raise TranscodeError(
             "boto3 is required for S3 input/output. Install it with "
             "`pip install -r requirements.txt`.", stage="S3") from e
+    except Exception as e:
+        _raise_environment_error(e, "S3")
+        raise TranscodeError(f"Could not load boto3: {e}", stage="S3") from e
 
     with _client_lock:
         client = _client_cache.get(region)
         if client is None:
-            client = boto3.client(
-                "s3",
-                region_name=region,
-                config=Config(retries={"max_attempts": 5, "mode": "standard"},
-                              max_pool_connections=32))
+            try:
+                client = boto3.client(
+                    "s3",
+                    region_name=region,
+                    config=Config(retries={"max_attempts": 5, "mode": "standard"},
+                                  max_pool_connections=32))
+            except Exception as e:
+                _raise_environment_error(e, "S3")
+                raise TranscodeError(f"Could not create an S3 client: {e}",
+                                     stage="S3") from e
             _client_cache[region] = client
         return client
 
@@ -101,6 +157,7 @@ def head_object(uri: str, region: Optional[str] = None) -> Dict:
     except TranscodeError:
         raise
     except Exception as e:
+        _raise_environment_error(e, "FETCHING_INPUT")
         code = _error_code(e)
         if code in ("404", "NoSuchKey", "NotFound"):
             raise TranscodeError(f"S3 object not found: {uri}",
@@ -158,7 +215,9 @@ def download_file(uri: str, dest_dir: Path, ctx: Optional[JobContext] = None,
     except TranscodeError:
         raise
     except Exception as e:
-        raise TranscodeError(f"Failed to download {uri}: {e}", stage="FETCHING_INPUT") from e
+        _raise_environment_error(e, "FETCHING_INPUT")
+        raise TranscodeError(f"Failed to download {uri}: {e}",
+                             stage="FETCHING_INPUT") from e
 
     size = local_path.stat().st_size
     if total and size != total:
@@ -247,6 +306,7 @@ def upload_directory(local_dir, bucket: str, prefix: str,
             client.upload_file(str(path), bucket, key, ExtraArgs=extra, Config=config)
             keys.append(key)
         except Exception as e:
+            _raise_environment_error(e, "UPLOADING")
             log.error(f"Upload failed for {rel}: {e}")
             failures.append(rel)
             continue

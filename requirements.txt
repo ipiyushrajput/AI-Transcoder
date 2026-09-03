@@ -1,17 +1,30 @@
 # The transcoding toolkit itself is standard library only.
 # These are for S3 I/O, the HTTP API and the PostgreSQL job store.
 
-boto3==1.35.36            # S3 input fetch and output publish
-botocore==1.35.36
+# boto3/botocore are floors, not pins, and 1.38.46 is the meaningful minimum:
+# botocore optionally imports urllib3.contrib.pyopenssl, and before 1.38.46 it
+# guarded that import with `except ImportError` only. On a host where pyOpenSSL
+# is older than the installed cryptography (cryptography >= 42 removed the
+# X509_V_FLAG_* constants), `import OpenSSL` raises AttributeError while the
+# module body runs, which slipped past that guard and killed every S3 call with
+# "module 'lib' has no attribute 'X509_V_FLAG_NOTIFY_POLICY'".
+# 1.38.46 catches AttributeError too and falls back to the stdlib SSL context.
+boto3>=1.38.46,<2
+botocore>=1.38.46,<2
 
-Flask==3.0.3              # HTTP API
-flask-cors==4.0.1
-gunicorn==22.0.0          # production WSGI server (see deploy/ai-transcoder.service)
+Flask>=3.0,<4               # HTTP API
+flask-cors>=4.0,<7
+gunicorn>=22.0,<24          # production WSGI server (deploy/ai-transcoder.service)
 
-SQLAlchemy==2.0.35        # job persistence
-psycopg2-binary==2.9.9    # PostgreSQL driver
+SQLAlchemy>=2.0,<3          # job persistence
+psycopg2-binary>=2.9,<3     # PostgreSQL driver
 
-python-dotenv==1.0.1      # optional: load a .env in development
+python-dotenv>=1.0,<2       # optional: load a .env in development
 
 # Requires Python 3.8+ (3.11 recommended) and an FFmpeg build providing the
 # in-house libwz264 / libwz265 encoders at paths.ffmpeg_executable.
+#
+# Install into a virtualenv. Mixing apt-installed python3-openssl with
+# pip-installed cryptography is the usual source of the TLS mismatch above:
+#     python3 -m venv .venv && . .venv/bin/activate
+#     pip install -r requirements.txt
