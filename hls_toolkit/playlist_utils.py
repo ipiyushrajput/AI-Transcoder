@@ -76,6 +76,39 @@ def has_marker_near(lines: List[str], insert_index: int, prefixes: List[str], wi
     return False
 
 
+# RFC 6381 profile_idc values, keyed by the profile name ffprobe reports.
+_HEVC_PROFILE_IDC = {"main": 1, "main 10": 2, "main10": 2,
+                     "main still picture": 3, "rext": 4, "main 4:2:2 10": 4}
+
+# Level 3.1 (general_level_idc 93), used when ffprobe reports no usable level.
+_HEVC_DEFAULT_LEVEL_IDC = 93
+
+
+def hevc_codec_string(profile_raw: Any, level_raw: Any) -> str:
+    """Build an RFC 6381 HEVC codec string from the probed profile and level.
+
+    The shape is ``hvc1.<profile_idc>.<compat>.L<general_level_idc>.<constraints>``.
+    ffprobe reports the HEVC level already as general_level_idc (30x the level
+    number, so 4.0 is 120), which is exactly what the codec string wants.
+
+    A fixed string used to be emitted for every HEVC rendition, which misdeclares
+    anything that is not Main / Level 3.1 — a 1080p Main 10 rung would advertise
+    itself as 8-bit Level 3.1 — and players may then reject the stream or pick
+    the wrong variant.
+    """
+    profile_text = str(profile_raw or "main").strip().lower()
+    profile_idc = _HEVC_PROFILE_IDC.get(profile_text, 1)
+    try:
+        level_idc = int(level_raw)
+    except (TypeError, ValueError):
+        level_idc = _HEVC_DEFAULT_LEVEL_IDC
+    if level_idc <= 0:
+        level_idc = _HEVC_DEFAULT_LEVEL_IDC
+    # 'L' is the Main tier; 'B0' is the usual progressive, non-packed constraint
+    # indication. ffprobe does not report tier or the constraint flags.
+    return f"hvc1.{profile_idc}.6.L{level_idc}.B0"
+
+
 def create_master_playlist(master_playlist_path: str,
                            selected_resolutions_data: List[Dict[str, Any]],
                            merged_mp4_paths_by_resolution: Dict[str, str],
@@ -102,7 +135,8 @@ def create_master_playlist(master_playlist_path: str,
             if stream_details:
                 codec_name = stream_details.get("codec_name")
                 if codec_name == "hevc":
-                    video_codec_str = "hvc1.1.6.L93.B0"
+                    video_codec_str = hevc_codec_string(
+                        stream_details.get("profile"), stream_details.get("level"))
                 elif codec_name == "h264":
                     profile_raw = str(stream_details.get("profile", "Main"))
                     level = stream_details.get("level", 31)

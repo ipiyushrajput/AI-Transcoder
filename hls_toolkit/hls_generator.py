@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import shlex
 import math
+from collections import Counter
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -21,6 +22,33 @@ from hls_toolkit.playlist_utils import create_master_playlist, parse_variant_seg
 from hls_toolkit.subtitle_processor import (generate_merged_subtitle_file,
                                             segment_vtt_for_hls)
 from hls_toolkit.time_utils import timecode_to_seconds, seconds_to_timecode
+
+
+def validate_unique_rung_names(template_name: str,
+                               selected_rungs: List[Dict[str, Any]]) -> None:
+    """Refuse a selection in which two renditions share a name.
+
+    Every output name is derived from the rung name — the merged MP4 lookup,
+    ``channel_<name>.m3u8``, ``channel_<name>_%05d.ts`` and the master playlist
+    entry. Two selected rungs sharing a name therefore write over each other's
+    segments and collapse into one master playlist entry, while the run still
+    reports success: silent data loss.
+
+    This happens when a template lists the same resolution twice, most
+    plausibly to encode it under both codecs. Doing that needs codec-qualified
+    output names, which this pipeline does not have, so the fix is to give each
+    rung a distinct name.
+    """
+    duplicated = sorted(name for name, count
+                        in Counter(rung["name"] for rung in selected_rungs).items()
+                        if count > 1)
+    if duplicated:
+        raise TranscodeError(
+            f"Template '{template_name}' declares these renditions more than "
+            f"once: {', '.join(duplicated)}. Each rendition name becomes an "
+            f"output filename, so duplicates would overwrite each other. Give "
+            f"each rung a distinct 'name' (for example 'h264_720p' and "
+            f"'h265_720p').", stage="VALIDATION")
 
 
 def generate_hls_workflow(config: Dict[str, Any],
@@ -309,6 +337,8 @@ def generate_hls_workflow(config: Dict[str, Any],
             raise TranscodeError(
                 f"None of the requested resolutions {selected_resolution_names} exist "
                 f"in template '{template_name}'.", stage="VALIDATION")
+
+        validate_unique_rung_names(template_name, selected_resolutions_data)
 
         log().info('Processing for the following resolutions: '
                      f'{[res["name"] for res in selected_resolutions_data]}')
