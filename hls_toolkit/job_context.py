@@ -13,6 +13,10 @@ A "channel" is the base name of the source video, e.g. an input of
 Without a ``job_id`` (plain CLI use) the per-job directory is skipped and the
 files sit directly under ``logs/<channel>/``.
 
+A log folder is never reused. If ``logs/<channel>/`` already exists the run logs
+to ``logs/<channel>_2/``, then ``_3`` and so on; with a ``job_id``, a repeated id
+becomes ``<job_id>_2``. Parallel runs on the same source each get their own.
+
 A :class:`JobContext` is threaded explicitly through the pipeline. It is safe to
 pass ``None`` anywhere a context is accepted — every helper degrades to plain
 ``logging`` calls so the toolkit keeps working outside the API server.
@@ -66,6 +70,35 @@ def channel_name_for(input_uri: str) -> str:
     return safe or "unknown_channel"
 
 
+def claim_unique_dir(parent: Path, name: str) -> Path:
+    """Create and return ``parent/name``, or ``name_2``, ``name_3``... if taken.
+
+    A suffix is one more than the highest suffix already present, so suffixed
+    folders number in the order their runs started, even after an older one is
+    deleted.
+
+    Creation is atomic: ``mkdir`` fails when the directory exists, and on that
+    failure the next number is tried. Jobs started at the same instant — in one
+    process or several — therefore each get their own folder; none can pick a
+    name another has just claimed.
+    """
+    parent = Path(parent)
+    parent.mkdir(parents=True, exist_ok=True)
+    suffixed = re.compile(rf"^{re.escape(name)}_(\d+)$")
+    candidate = parent / name
+    while True:
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            highest = 1
+            for entry in parent.iterdir():
+                match = suffixed.match(entry.name)
+                if match:
+                    highest = max(highest, int(match.group(1)))
+            candidate = parent / f"{name}_{highest + 1}"
+
+
 class _MaxLevelFilter(logging.Filter):
     """Drop records at or above `level` (used to keep error.log terse)."""
 
@@ -92,9 +125,13 @@ class JobContext:
         self.debug = debug
         self.metadata = dict(metadata or {})
 
-        base = Path(log_root) / self.channel
-        self.log_dir = base / job_id if job_id else base
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        # Never reuse a log folder: a second run on the same source used to
+        # append to the first run's job.log and overwrite its job.json, and
+        # parallel runs interleaved their logs line by line.
+        if job_id:
+            self.log_dir = claim_unique_dir(Path(log_root) / self.channel, job_id)
+        else:
+            self.log_dir = claim_unique_dir(Path(log_root), self.channel)
 
         self.job_log_path = self.log_dir / "job.log"
         self.error_log_path = self.log_dir / "error.log"
@@ -121,12 +158,19 @@ class JobContext:
         self.logger.info(f"Job id  : {job_id or '(cli)'}")
         self.logger.info(f"Input   : {input_uri}")
         self.logger.info(f"Logs    : {self.log_dir}")
+        requested = job_id or self.channel
+        if self.log_dir.name != requested:
+            self.logger.info(f"          ('{requested}' already existed, so this run "
+                             f"logs to '{self.log_dir.name}')")
         self.logger.info("=" * 78)
         self._write_meta()
 
     # -- logging ----------------------------------------------------------
     def _build_logger(self) -> logging.Logger:
-        name = f"aitranscoder.{self.channel}" + (f".{self.job_id}" if self.job_id else "")
+        # Named after the claimed folder, which is unique: two runs on the same
+        # source in one process (the API) would otherwise share a logger and the
+        # second would take over the first one's file handlers.
+        name = f"aitranscoder.{self.channel}.{self.log_dir.name}"
         logger = logging.getLogger(name)
         logger.setLevel(logging.DEBUG)
         logger.propagate = True          # still reaches the root/console handler

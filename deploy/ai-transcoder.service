@@ -1,6 +1,6 @@
 [Unit]
 Description=AI-Transcoder API
-After=network-online.target postgresql.service
+After=network-online.target mysql.service
 Wants=network-online.target
 
 [Service]

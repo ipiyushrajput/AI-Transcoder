@@ -12,7 +12,11 @@ It runs two ways:
 
 * **CLI** — `python app.py --config config.json`
 * **HTTP service** — submit jobs over an API, poll progress, read per-job logs,
-  and list job history from PostgreSQL
+  and list job history from MySQL
+
+Several jobs can run at once — separate `app.py` runs, API jobs, or both — and
+they share the server's cores through one CPU budget instead of each assuming it
+owns the machine. See [Parallel jobs](#parallel-jobs).
 
 ---
 
@@ -41,10 +45,11 @@ python app.py --config config.json
 **As a service:**
 
 ```bash
-cp .env.example .env && $EDITOR .env      # database credentials
-set -a && . ./.env && set +a
-python -m api.app                          # http://localhost:8000
+cp .env.example .env && chmod 600 .env && $EDITOR .env   # set DB_PASSWORD
+python -m api.app                                        # http://localhost:8000
 ```
+
+`.env` is read automatically; nothing needs exporting.
 
 **Check the setup before running anything:**
 
@@ -54,14 +59,14 @@ python app.py --check
 
 That validates the Python packages, the FFmpeg build (including that
 `libwz264`/`libwz265` are actually present), AWS credentials, that the input
-objects are readable, that the output bucket is *writable*, and the database —
+objects are readable, that the output bucket is *writable*, and MySQL —
 reporting each one with a specific remedy. Run it first on any new server.
 
 Verify the install without the encoder build or AWS:
 
 ```bash
 python tests/smoke_test.py       # pure-logic checks (no dependencies)
-python tests/pipeline_test.py    # full S3 -> transcode -> S3 -> API -> DB run
+python tests/pipeline_test.py    # S3 -> transcode -> S3, parallel jobs, API, MySQL
 ```
 
 AWS credentials come from the ambient chain — instance role, `~/.aws`, or the
@@ -81,6 +86,7 @@ hls_toolkit/                  The pipeline
 ├── runner.py                 One entry point for a run (CLI and API share it)
 ├── hls_generator.py          Stage orchestration
 ├── ffmpeg_wrapper.py         FFmpeg invocation, parallel transcode, HLS packaging
+├── cpu_budget.py             One CPU budget shared by every job on the server
 ├── s3_io.py                  S3 input fetch, output publish, verification
 ├── job_context.py            Per-channel logging, progress, cancellation
 ├── subtitle_processor.py     WebVTT parse, clip, merge, HLS segmentation
@@ -94,12 +100,12 @@ api/                          HTTP service
 ├── app.py                    Flask app factory
 ├── routes.py                 Endpoints
 ├── job_manager.py            Worker pool, progress sync, job queries
-└── database.py               PostgreSQL models
+└── database.py               MySQL models
 
 docs/
 ├── API.md                    Endpoint reference with examples
-├── POSTGRES_SETUP.md         Ubuntu database setup, start to finish
-└── schema.sql                Explicit DDL (the API also creates it on boot)
+├── MYSQL_SETUP.md            Ubuntu database setup, start to finish
+└── schema.sql                MySQL DDL (the API also creates it on boot)
 
 deploy/ai-transcoder.service  systemd unit
 tests/                        Offline verification
@@ -162,10 +168,90 @@ logs/AETN_AmericanPickers_S10_E03_en/<job_id>/
 ```
 
 Under the CLI without `--job-id` the files sit directly in
-`logs/<channel>/`. The API always uses a per-job subdirectory so concurrent runs
-on the same channel never interleave.
+`logs/<channel>/`. The API always uses a per-job subdirectory.
+
+**A log folder is never reused.** If `logs/AETN_AmericanPickers_S10_E03_en/`
+already exists, the next run on that source logs to
+`logs/AETN_AmericanPickers_S10_E03_en_2/`, then `_3`, and so on — so parallel or
+repeated runs never append to each other's `job.log` or overwrite each other's
+`job.json`. The first lines of `job.log` say which folder was used and why. With
+`--job-id`, a repeated id becomes `<job_id>_2` in the same way. The folder is
+claimed atomically, so jobs started at the same instant still each get their
+own.
 
 The service's own log is separate, at `logs/_server/api.log`.
+
+---
+
+## Parallel jobs
+
+### How a job runs today
+
+**The variants within a clip encode in parallel.** One FFmpeg process per clip
+decodes the source once, splits it, and runs every selected rung's encoder at the
+same time, each with its configured `threads`. This was already the case and is
+unchanged.
+
+**The clips within a job encode in parallel, as many as the server fits.** Each
+clip's video encode reserves cores from the machine-wide CPU budget before it
+starts — half its rungs' `threads`, added up; four rungs at `threads: 4` reserve 8.
+On a 32-core server a lone four-rung job therefore encodes 4 clips at once.
+Longer clips start first, so the job does not end with one long clip running
+alone. Audio encodes reserve one core and fill in around the video.
+
+**Separate jobs run in parallel and share the server.** Every `python app.py`
+run, and every job the API runs, draws from the same budget. A job alone gets
+the whole machine; three jobs split it. When jobs are waiting for cores they take
+turns clip by clip, so they progress together instead of queueing whole job
+behind whole job. A job that crashes or is killed — even with `kill -9` — gives
+its cores back immediately.
+
+### What changed, and why it was slow
+
+The worker count used to be worked out from **every rung in the template**, not
+just the ones being encoded. In `h265_standard` the unselected `2160p` rung has
+`threads: 12`, which made a four-rung H.265 job size itself as needing 36 cores
+per clip — so on any server under 96 cores it got **one worker and encoded its
+clips one after another**. Separately, each job sized its pool as if it owned the
+whole machine, so jobs started side by side asked for several machines' worth of
+CPU and competed for it rather than sharing it.
+
+None of this touched FFmpeg. The encoder settings — preset, CRF, `threads`,
+`codec_params`, GOP — and the FFmpeg command lines themselves are byte-for-byte
+the same as before; only *when* each encode starts is different.
+
+### Sizing
+
+The budget defaults to the server's CPU count. To set it:
+
+```bash
+python app.py --config config1.json --cpu-budget 32     # one run
+export WZ_CPU_BUDGET=32                                  # every run in this shell
+```
+
+or `"parallelism": {"cpu_budget": 32}` in the config. Precedence is the flag,
+then `WZ_CPU_BUDGET`, then the config, then the CPU count. **Use the same value
+for every job on a server** — they share it.
+
+`--transcode-workers N` still exists and caps how many clips one job encodes at
+once; without it there is no per-job cap.
+
+Each job's log states its plan, for example:
+
+```
+Transcoding 10 task(s) across 5 clip(s). CPU budget 32 core(s), shared with every
+job on this server; each clip's video encode reserves 8 core(s), so up to 4 clip(s)
+encode at once when this job runs alone.
+```
+
+The budget is a directory of lock files, `/tmp/ai-transcoder-cpu-slots` by
+default (`WZ_CPU_SLOT_DIR` to move it). Every job on the server must be able to
+write to it; if one cannot, it logs a warning and falls back to a budget for its
+own process only.
+
+Parallelism cannot create CPU. If one job alone already keeps every core busy,
+three jobs take about three times as long in total — the budget makes them share
+the machine evenly and stops them thrashing it, but the work is the same.
 
 ---
 
@@ -223,7 +309,8 @@ A map of template name to ABR ladder. Per rung: `name`, `width`, `height`,
 ### Other sections
 
 `paths` (FFmpeg locations), `thumbnail_generation`, `audio_normalization`,
-`Esam` (`SccXml` and `MccXml` as inline strings).
+`Esam` (`SccXml` and `MccXml` as inline strings), and the optional
+`parallelism` (`cpu_budget`; see [Parallel jobs](#parallel-jobs)).
 
 ---
 
@@ -244,6 +331,12 @@ python app.py --no-upload --output ./local_out
 
 # Upload an already-packaged directory
 python app.py --upload-only --s3-upload-source-dir ./hls_out --output my_asset
+
+# Several jobs at once: they share the server's cores (see Parallel jobs)
+python app.py --config config1.json &
+python app.py --config config2.json &
+python app.py --config config3.json &
+wait
 ```
 
 `python app.py --help` lists every flag.
@@ -282,21 +375,38 @@ curl -s "localhost:8000/api/v1/jobs?status=RUNNING"
 
 ## Database
 
-PostgreSQL stores every job with the exact configuration it ran under, its
-rendition ladder and its clip list. Setup for Ubuntu, start to finish:
-[`docs/POSTGRES_SETUP.md`](docs/POSTGRES_SETUP.md).
+MySQL stores every job with the exact configuration it ran under, its rendition
+ladder and its clip list. Setup for Ubuntu, start to finish:
+[`docs/MYSQL_SETUP.md`](docs/MYSQL_SETUP.md).
+
+The connection comes from `.env` (copy `.env.example`):
+
+| Setting | Default |
+| --- | --- |
+| `DB_HOST` | `localhost` |
+| `DB_PORT` | `3306` |
+| `DB_USER` | `root` |
+| `DB_PASSWORD` | *(none — must be set)* |
+| `DB_NAME` | `Visionular-Transcoder` |
 
 ```bash
-sudo apt install -y postgresql postgresql-contrib
-sudo -u postgres psql -c "CREATE ROLE transcoder LOGIN PASSWORD 'secret' CREATEDB;" \
-                    -c "CREATE DATABASE ai_transcoder OWNER transcoder;"
-cp .env.example .env && $EDITOR .env
-python -m api.app          # tables are created on first start
+cp .env.example .env && chmod 600 .env && $EDITOR .env    # set DB_PASSWORD
+python app.py --check                                     # MySQL line should say ok
+python -m api.app        # creates the database and tables on first start
 ```
 
-Tables: `jobs`, `job_variants`, `job_clips`. The API also runs without a
-database — transcodes still work, only history and listings are unavailable, and
-`/health` reports `"database": "unavailable"`.
+Write the password as-is in `.env`; characters such as `@` need no escaping. The
+database name contains a hyphen, so quote it with backticks in your own SQL:
+``USE `Visionular-Transcoder`;``.
+
+Tables: `jobs`, `job_variants`, `job_clips` (InnoDB, utf8mb4, native `JSON` for
+the config snapshot). The API also runs without a database — transcodes still
+work, only history and listings are unavailable, and `/health` reports
+`"database": "unavailable"`.
+
+The most common setup problem: Ubuntu creates MySQL's `root` with
+`auth_socket`, which refuses every password. `--check` detects it and prints the
+one-line fix; see step 2 of the setup guide.
 
 ---
 
@@ -314,7 +424,9 @@ The unit runs gunicorn with **one worker and multiple threads**. That is
 deliberate: the in-process job registry that serves live progress is per-process,
 so multiple gunicorn workers would answer status requests for jobs they are not
 running. Scale by raising `MAX_CONCURRENT_JOBS` (and the thread count), not the
-worker count.
+worker count. Raising it is safe for CPU: jobs beyond what the CPU budget fits
+wait for cores rather than oversubscribing them. Each running job still needs
+its own scratch space.
 
 `WORK_ROOT` needs free space of roughly three times the source file per
 concurrent job.
@@ -336,7 +448,10 @@ directly, with the fix for each.
 | `upload is enabled but s3.bucket_name is not configured` | Set `s3.bucket_name`, or pass `"upload": false` |
 | `Upload verification failed for N object(s)` | Object size mismatch in S3 — the local output is kept; check the bucket and retry |
 | Job stuck at `FETCHING_INPUT` | Large source download; watch `job.log` for percentage lines |
-| `/health` shows `"database": "unavailable"` | See [`docs/POSTGRES_SETUP.md`](docs/POSTGRES_SETUP.md) |
+| `/health` shows `"database": "unavailable"` | Run `python app.py --check`; the MySQL line names the cause. See [`docs/MYSQL_SETUP.md`](docs/MYSQL_SETUP.md) |
+| `Access denied for user 'root'@'localhost'` (1698) | MySQL's root uses `auth_socket`, which ignores passwords. Step 2 of [`docs/MYSQL_SETUP.md`](docs/MYSQL_SETUP.md) |
+| Parallel jobs finish at very different times | Each job's log states its CPU budget and how many clips fit at once. Check every job uses the same `--cpu-budget` / `WZ_CPU_BUDGET` and can write to `/tmp/ai-transcoder-cpu-slots` (a job that cannot logs a warning) |
+| `Falling back to a budget of N core(s) for this process only` | This job cannot write the shared budget directory, so it does not see other jobs' usage. Fix its permissions, or point every job at one writable directory with `WZ_CPU_SLOT_DIR` |
 | `Running without persistence` in the log | Same — jobs still run, history does not persist |
 
 Start with `logs/<channel>/<job_id>/error.log`, then `ffmpeg.log` for encoder

@@ -1,5 +1,5 @@
 # The transcoding toolkit itself is standard library only.
-# These are for S3 I/O, the HTTP API and the PostgreSQL job store.
+# These are for S3 I/O, the HTTP API and the MySQL job store.
 
 # boto3/botocore are floors, not pins, and 1.38.46 is the meaningful minimum:
 # botocore optionally imports urllib3.contrib.pyopenssl, and before 1.38.46 it
@@ -17,7 +17,10 @@ flask-cors>=4.0,<7
 gunicorn>=22.0,<24          # production WSGI server (deploy/ai-transcoder.service)
 
 SQLAlchemy>=2.0,<3          # job persistence
-psycopg2-binary>=2.9,<3     # PostgreSQL driver
+PyMySQL>=1.1,<3             # MySQL driver (pure Python, nothing to compile)
+# PyMySQL encrypts the password with TLS, which MySQL 8 enables by default. Only
+# a server with TLS switched off also needs `cryptography` (for RSA instead);
+# `python app.py --check` says so if that is the case.
 
 python-dotenv>=1.0,<2       # optional: load a .env in development
 

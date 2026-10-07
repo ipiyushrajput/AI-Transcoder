@@ -7,6 +7,7 @@ from logging.handlers import RotatingFileHandler
 from flask import Flask, jsonify
 
 from api import database as db
+from hls_toolkit.cpu_budget import get_shared_budget
 from api.routes import api_bp, health_bp
 
 CONFIG_PATH = os.getenv("TRANSCODER_CONFIG", "config.json")
@@ -81,6 +82,12 @@ def create_app(config_path: str = None) -> Flask:
     app.config["JSON_SORT_KEYS"] = False
     app.config["TRANSCODER_CONFIG"] = load_config(config_path or CONFIG_PATH)
 
+    # The same machine-wide CPU budget the CLI uses, so API jobs and any
+    # `python app.py` runs on this server share the cores instead of each
+    # assuming it owns them.
+    get_shared_budget(None, app.config["TRANSCODER_CONFIG"]
+                      .get("parallelism", {}).get("cpu_budget"))
+
     try:
         from flask_cors import CORS
         CORS(app, resources={r"/api/*": {"origins": os.getenv("CORS_ORIGINS", "*")}})
@@ -89,7 +96,7 @@ def create_app(config_path: str = None) -> Flask:
 
     if not db.init_db():
         logging.warning("Running without persistence: job history and listings are "
-                        "unavailable until PostgreSQL is reachable.")
+                        "unavailable until MySQL is reachable (see docs/MYSQL_SETUP.md).")
 
     app.register_blueprint(api_bp)
     app.register_blueprint(health_bp)

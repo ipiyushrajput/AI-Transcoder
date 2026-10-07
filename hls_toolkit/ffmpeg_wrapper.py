@@ -13,6 +13,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, Tuple
 
+from hls_toolkit.cpu_budget import BudgetAcquireAborted, get_shared_budget
 from hls_toolkit.job_context import (JobCancelled, TranscodeError, bind_context,
                                      current_context, log)
 from hls_toolkit.time_utils import timecode_to_seconds
@@ -165,18 +166,34 @@ _CLIP_PROGRESS: Dict[str, float] = {}
 _CLIP_PROGRESS_LOCK = threading.Lock()
 
 
+def _clip_progress_key(ctx, clip_index: int, stream_type: str) -> str:
+    # Keyed per job: the API runs several jobs in one process, and every job has
+    # a clip 0, so a bare clip number would mix their progress figures.
+    return f"{id(ctx)}:{clip_index}:{stream_type}"
+
+
+def _clear_clip_progress(ctx) -> None:
+    """Drop one job's clip progress, leaving other jobs' entries alone."""
+    prefix = f"{id(ctx)}:"
+    with _CLIP_PROGRESS_LOCK:
+        for key in [k for k in _CLIP_PROGRESS if k.startswith(prefix)]:
+            del _CLIP_PROGRESS[key]
+
+
 def _clip_progress_cb(clip_index: int, stream_type: str):
     """Callback that folds one clip's encode fraction into the job's progress."""
     ctx = current_context()
     if ctx is None or stream_type != "video":
         return None
-    key = f"{clip_index}:{stream_type}"
+    key = _clip_progress_key(ctx, clip_index, stream_type)
+    prefix = f"{id(ctx)}:"
 
     def _report(fraction: float):
         with _CLIP_PROGRESS_LOCK:
             _CLIP_PROGRESS[key] = fraction
-            total = ctx.metadata.get("video_clip_count") or len(_CLIP_PROGRESS)
-            done = sum(_CLIP_PROGRESS.values())
+            mine = [v for k, v in _CLIP_PROGRESS.items() if k.startswith(prefix)]
+            total = ctx.metadata.get("video_clip_count") or len(mine)
+            done = sum(mine)
         if total:
             ctx.advance_within_stage(min(1.0, done / total))
 
@@ -562,6 +579,103 @@ def _transcode_clip_with_single_command(clip_index,
         return {'type': "audio", 'output': str(output_clip_path)}
 
 
+# What an audio-only clip encode reserves from the CPU budget. AAC is cheap next
+# to the video encoders and should not hold a whole video encode's share.
+AUDIO_TASK_CORES = 1
+
+
+def estimate_video_task_cores(rungs: List[Dict[str, Any]]) -> int:
+    """Cores one clip's video encode is expected to keep busy.
+
+    One FFmpeg process encodes every rung of a clip at once, each encoder with
+    its configured ``threads``. Encoders rarely keep all their threads busy, so
+    this follows the vendor's sizing rule of half the configured threads: the
+    sum of ``threads / 2`` over the rungs being encoded. A rung without a
+    ``threads`` value counts as one thread, as the vendor rule did.
+
+    Only the rungs actually selected for the job count. The previous sizing
+    looked at every rung in the template, so an unselected 2160p rung with
+    ``threads: 12`` made a four-rung H.265 job reserve 36 cores per clip — on
+    any server under 96 cores that left room for one clip at a time.
+    """
+    if not rungs:
+        return 1
+    threads = sum(max(1, int(rung.get("threads") or 0)) for rung in rungs)
+    return max(1, math.ceil(threads / 2))
+
+
+def _schedule_transcode_tasks(tasks: List[tuple], video_cost: int) -> List[Dict[str, Any]]:
+    """Order clip tasks for release into the CPU budget.
+
+    Longest clip first: when clips differ in length, starting the long ones
+    early keeps the last minutes of the job from being one long clip running
+    alone on an otherwise idle machine. Video before audio, because the audio
+    encodes are short and fill whatever cores the video leaves free.
+    """
+    plan = []
+    for order, task in enumerate(tasks):
+        stream_type = task[-1]
+        duration = float(task[7]) - float(task[6])
+        plan.append({"task": task, "order": order, "stream_type": stream_type,
+                     "duration": duration,
+                     "cost": video_cost if stream_type == "video" else AUDIO_TASK_CORES})
+    plan.sort(key=lambda item: (item["stream_type"] != "video", -item["duration"],
+                                item["order"]))
+    return plan
+
+
+def _dispatch_within_budget(executor, plan: List[Dict[str, Any]], budget, ctx,
+                            transcode_workers: Optional[int]) -> Dict[Any, tuple]:
+    """Start each task as soon as the shared CPU budget has room for it.
+
+    Returns the futures, keyed to their task, for the caller to collect. Waiting
+    stops early if the job is cancelled or a task already started has failed;
+    the caller then sees that failure (or the cancellation) when collecting.
+    """
+    local_cap = (threading.BoundedSemaphore(transcode_workers)
+                 if transcode_workers else None)
+    failed = threading.Event()
+    futures: Dict[Any, tuple] = {}
+
+    def should_stop() -> bool:
+        return failed.is_set() or (ctx is not None and ctx.cancelled)
+
+    def run(item, lease):
+        try:
+            task = item["task"]
+            return task[0](*task[1:])
+        finally:
+            lease.release()
+            if local_cap is not None:
+                local_cap.release()
+
+    def on_done(future):
+        if future.cancelled() or future.exception() is not None:
+            failed.set()
+
+    for item in plan:
+        try:
+            if local_cap is not None:
+                while not local_cap.acquire(timeout=0.25):
+                    if should_stop():
+                        raise BudgetAcquireAborted("stopped waiting for a worker")
+            try:
+                lease = budget.acquire(item["cost"], should_abort=should_stop)
+            except BudgetAcquireAborted:
+                if local_cap is not None:
+                    local_cap.release()
+                raise
+        except BudgetAcquireAborted:
+            break
+        future = executor.submit(run, item, lease)
+        future.add_done_callback(on_done)
+        futures[future] = item["task"]
+
+    if ctx is not None and ctx.cancelled:
+        raise JobCancelled("Transcode cancelled while waiting for CPU budget")
+    return futures
+
+
 def generate_clipped_transcoded_merged_mp4s(
         input_video: Union[str, Path],
         ffmpeg_executable: str,
@@ -571,7 +685,7 @@ def generate_clipped_transcoded_merged_mp4s(
         video_templates: List[Dict[str, Any]],
         output_dir_base: Path,
         args_duration: Optional[int],
-        transcode_workers: int,
+        transcode_workers: Optional[int],
         temp_dir: Path,
         audio_norm: bool,
         loudnorm_analysis_results: Dict[str, Any],
@@ -587,7 +701,8 @@ def generate_clipped_transcoded_merged_mp4s(
     and then merges the transcoded segments back into continuous tracks.
 
     Key features:
-    - Parallel Processing: Uses `transcode_workers` threads to process clips concurrently.
+    - Parallel Processing: Clips encode concurrently, as many at once as the
+      machine-wide CPU budget allows (see :mod:`hls_toolkit.cpu_budget`).
     - Multi-Resolution: Generates video streams for all resolutions defined in `video_templates`.
     - Audio Handling: Extracts and optionally normalizes audio (loudnorm) in a separate pass.
     - ESAM Remapping: Adjusts ESAM SCTE-35 cue points to align with the new compacted timeline.
@@ -602,7 +717,8 @@ def generate_clipped_transcoded_merged_mp4s(
         video_templates: List of dicts defining output resolutions and encoding parameters.
         output_dir_base: Base directory for outputs (used for reference, not direct writing here).
         args_duration: Optional limit on the total duration (not directly used here but passed for context).
-        transcode_workers: Number of parallel threads for transcoding.
+        transcode_workers: Optional cap on how many clip encodes this job runs at
+            once. ``None`` leaves concurrency entirely to the CPU budget.
         temp_dir: Directory for temporary files (transcoded clips).
         audio_norm: Boolean indicating if audio normalization should be applied.
         loudnorm_analysis_results: Results from a prior loudnorm analysis pass.
@@ -676,15 +792,28 @@ def generate_clipped_transcoded_merged_mp4s(
     ctx = current_context()
     completed = 0
     total_tasks = len(tasks)
-    log().info(f"Transcoding {total_tasks} task(s) across {len(clippings)} clip(s) "
-               f"with {transcode_workers} worker(s)")
 
+    budget = get_shared_budget()
+    video_cost = budget.clamp(estimate_video_task_cores(video_templates))
+    plan = _schedule_transcode_tasks(tasks, video_cost)
+    clips_at_once = max(1, budget.budget // video_cost)
+    log().info(
+        f"Transcoding {total_tasks} task(s) across {len(clippings)} clip(s). "
+        f"CPU budget {budget.budget} core(s), shared with every job on this "
+        f"server; each clip's video encode reserves {video_cost} core(s), so up "
+        f"to {clips_at_once} clip(s) encode at once when this job runs alone"
+        + (f", capped at {transcode_workers} by --transcode-workers"
+           if transcode_workers else "") + ".")
+
+    # Every task gets its own thread so the pool never limits concurrency — the
+    # CPU budget does. Tasks are released into it longest clip first.
     # The pool's threads need the job bound too, so their FFmpeg output lands in
     # this job's ffmpeg.log rather than the root logger.
     with concurrent.futures.ThreadPoolExecutor(
-            max_workers=transcode_workers,
+            max_workers=max(1, total_tasks),
             initializer=bind_context, initargs=(ctx,)) as executor:
-        futures = {executor.submit(task[0], *task[1:]): task for task in tasks}
+        futures = _dispatch_within_budget(executor, plan, budget, ctx,
+                                          transcode_workers)
         try:
             for future in concurrent.futures.as_completed(futures):
                 try:
@@ -717,7 +846,7 @@ def generate_clipped_transcoded_merged_mp4s(
                     ctx.set_stage("TRANSCODING", completed / total_tasks)
                 log().info(f"Transcode progress: {completed}/{total_tasks} task(s) done")
         finally:
-            _CLIP_PROGRESS.clear()
+            _clear_clip_progress(ctx)
 
     missing = [name for name, clips in video_clips_per_res.items() if not clips]
     if missing:
