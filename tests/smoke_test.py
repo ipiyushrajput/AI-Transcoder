@@ -107,7 +107,67 @@ def test_playlists(work):
     check("master lists both rungs", text.count("#EXT-X-STREAM-INF"), 2)
     check("bitrate rung bandwidth", "BANDWIDTH=6000000" in text, True)
     check("codec_params rung bandwidth", "BANDWIDTH=3500000" in text, True)
+
+    # An HEVC rung must declare the profile and level it was actually encoded
+    # at, not a fixed string.
+    hevc_master = work / "channel_hevc.m3u8"
+    create_master_playlist(
+        str(hevc_master), [{"name": "1080p", "width": 1920, "height": 1080,
+                            "bitrate": "6M", "codec": "H_265"}],
+        {"1080p": "a.mp4"}, "ffprobe", 25.0, None, None, "en",
+        lambda p, f: {"codec_name": "hevc", "profile": "Main 10", "level": 120,
+                      "avg_frame_rate": 25.0},
+        fw._get_h264_profile_idc)
+    check("hevc codec string follows the probed stream",
+          "hvc1.2.6.L120.B0" in hevc_master.read_text(), True)
     return variant, segments
+
+
+def test_hevc_codec_string():
+    """RFC 6381 HEVC codec strings, derived rather than hardcoded."""
+    print("hevc codec strings")
+    from hls_toolkit.playlist_utils import hevc_codec_string
+    # ffprobe reports the HEVC level as general_level_idc: 4.0 -> 120, 3.1 -> 93.
+    check("main at level 4.0", hevc_codec_string("Main", 120), "hvc1.1.6.L120.B0")
+    check("main 10 at level 5.0", hevc_codec_string("Main 10", 150),
+          "hvc1.2.6.L150.B0")
+    check("main still picture", hevc_codec_string("Main Still Picture", 93),
+          "hvc1.3.6.L93.B0")
+    check("unknown profile falls back to main",
+          hevc_codec_string("Something Else", 120), "hvc1.1.6.L120.B0")
+    check("missing level falls back to 3.1", hevc_codec_string("Main", None),
+          "hvc1.1.6.L93.B0")
+    check("nonsense level falls back to 3.1", hevc_codec_string("Main", "n/a"),
+          "hvc1.1.6.L93.B0")
+
+
+def test_duplicate_rung_guard():
+    """Two selected rungs sharing a name would overwrite each other's output."""
+    print("duplicate rendition guard")
+    from hls_toolkit.hls_generator import validate_unique_rung_names
+    from hls_toolkit.job_context import TranscodeError
+
+    single_codec = [{"name": "1080p", "codec": "H_264"},
+                    {"name": "720p", "codec": "H_264"}]
+    try:
+        validate_unique_rung_names("h264_standard", single_codec)
+        check("a normal ladder is accepted", "accepted", "accepted")
+    except TranscodeError as e:
+        check("a normal ladder is accepted", f"refused: {e}", "accepted")
+
+    # 720p listed under both codecs: the shape that silently collapsed two
+    # renditions into one set of files.
+    mixed = [{"name": "720p", "codec": "H_264"},
+             {"name": "360p", "codec": "H_264"},
+             {"name": "720p", "codec": "H_265"}]
+    try:
+        validate_unique_rung_names("mixed", mixed)
+        check("duplicate rungs refused", "accepted", "TranscodeError")
+    except TranscodeError as e:
+        check("duplicate rungs refused at validation", e.stage, "VALIDATION")
+        check("error names only the duplicated rung",
+              "720p" in str(e) and "360p" not in str(e), True)
+        check("error explains the overwrite", "overwrite" in str(e).lower(), True)
 
 
 def test_esam(work, variant, segments):
@@ -212,6 +272,8 @@ def main():
         variant, segments = test_playlists(work)
         test_esam(work, variant, segments)
         test_ffmpeg_command()
+        test_hevc_codec_string()
+        test_duplicate_rung_guard()
         test_environment_diagnostics()
     finally:
         shutil.rmtree(work, ignore_errors=True)
