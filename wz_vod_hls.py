@@ -2,18 +2,21 @@
 
 Inputs may be local paths or ``s3://bucket/key`` URIs. Output is packaged into a
 scratch directory, published to S3, and the local copy removed once every object
-is verified. All logging for a run lands under ``logs/<channel>/``.
+is verified. All logging for a run lands under ``logs/<channel>/`` — or
+``logs/<channel>_2/`` and so on when that folder is already taken.
+
+Several runs can go at once; they share the server's cores through one CPU
+budget (see :mod:`hls_toolkit.cpu_budget`).
 """
 import argparse
 import json
 import logging
-import math
 import os
 import shlex
 import signal
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from hls_toolkit.aws_operations import handle_s3_upload_only
 from hls_toolkit.ffmpeg_wrapper import get_active_processes
@@ -21,6 +24,7 @@ from hls_toolkit.job_context import TranscodeError
 from hls_toolkit.logging_utils import setup_logging
 from hls_toolkit.runner import run_transcode_job
 from hls_toolkit import preflight
+from hls_toolkit.cpu_budget import get_shared_budget
 
 try:
     from hls_toolkit.version import GIT_VERSION
@@ -53,41 +57,6 @@ def signal_handler(sig, frame):
             logging.error(f"An unexpected error occurred during process termination: {e}")
 
     sys.exit(1)
-
-
-def calculate_default_workers(video_templates_for_run: List[Dict[str, Any]]) -> int:
-    """
-    Calculates a sensible default for transcode_workers based on the number of
-    CPU cores and the demands of the selected video template.
-
-    Args:
-        video_templates_for_run: The list of video resolution templates being used.
-
-    Returns:
-        The recommended number of parallel workers.
-    """
-    try:
-        total_cores = os.cpu_count()
-        if not total_cores:
-            return 4
-        if not video_templates_for_run:
-            return total_cores
-        num_resolutions = len(video_templates_for_run)
-        max_threads_per_res = 0
-        for t in video_templates_for_run:
-            threads = t.get("threads", 0)
-            if threads > max_threads_per_res:
-                max_threads_per_res = threads
-
-        if max_threads_per_res == 0:
-            max_threads_per_res = 1
-        estimated_cores_per_process = num_resolutions * (max_threads_per_res / 2)
-        if estimated_cores_per_process <= 0:
-            estimated_cores_per_process = total_cores
-        recommended_workers = math.floor(total_cores / estimated_cores_per_process)
-        return max(1, recommended_workers)
-    except Exception:
-        return 4
 
 
 def load_config(path: str) -> Dict[str, Any]:
@@ -184,7 +153,14 @@ def build_parser(config: Dict[str, Any], config_path: str) -> argparse.ArgumentP
     parser.add_argument("--duration", type=int,
                         help="Process only the first N seconds.")
     parser.add_argument("--transcode-workers", type=int, default=None,
-                        help="Parallel transcode workers (default: derived from CPU count).")
+                        help="Cap on how many clips this job encodes at once. By "
+                             "default there is no per-job cap: clips start as soon "
+                             "as the machine-wide CPU budget has room.")
+    parser.add_argument("--cpu-budget", type=int, default=None,
+                        help="Cores shared by every transcode on this server "
+                             "(default: $WZ_CPU_BUDGET, then parallelism.cpu_budget "
+                             "in the config, then the CPU count). Use the same "
+                             "value for every job on the machine.")
     parser.add_argument("--work-dir", default=None,
                         help="Parent directory for the scratch tree "
                              "(default: the system temp directory).")
@@ -252,10 +228,10 @@ def main() -> int:
                          "defaults.input_video in the config.")
         return 1
 
-    if args.transcode_workers is None:
-        templates_for_run = config.get("video_templates", {}).get(args.template, [])
-        args.transcode_workers = calculate_default_workers(templates_for_run)
-        logging.info(f"Using {args.transcode_workers} transcode worker(s)")
+    # One CPU budget for the whole server, shared with any other app.py run and
+    # the API. Concurrency follows from it; see hls_toolkit/cpu_budget.py.
+    get_shared_budget(args.cpu_budget,
+                      config.get("parallelism", {}).get("cpu_budget"))
 
     overrides = {
         "input_video": args.input,

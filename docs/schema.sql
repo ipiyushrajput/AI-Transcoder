@@ -1,92 +1,93 @@
--- AI-Transcoder schema (PostgreSQL).
--- The API creates these tables automatically on start; this file is for
--- provisioning them explicitly, or for reviewing the shape of the data.
+-- AI-Transcoder schema (MySQL 8).
 --
---   psql -h 127.0.0.1 -U transcoder -d ai_transcoder -f docs/schema.sql
+-- You do not need to run this: the API creates the database and these tables
+-- on first start. It is here for reference, and for setting the schema up by
+-- hand where the application user may not create tables.
+--
+-- Taken from SHOW CREATE TABLE on MySQL 8.0 after the API created the tables,
+-- so it matches what the application builds.
+--
+--     mysql -u root -p < docs/schema.sql
 
-CREATE TABLE IF NOT EXISTS jobs (
-    id                      SERIAL PRIMARY KEY,
-    job_id                  VARCHAR(36) UNIQUE NOT NULL,
-    name                    VARCHAR(255),
-    channel                 VARCHAR(255),
+CREATE DATABASE IF NOT EXISTS `Visionular-Transcoder`
+  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE `Visionular-Transcoder`;
 
-    status                  VARCHAR(16)  NOT NULL DEFAULT 'PENDING',
-    stage                   VARCHAR(32)  DEFAULT 'QUEUED',
-    progress_pct            INTEGER      DEFAULT 0,
+CREATE TABLE IF NOT EXISTS `jobs` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `job_id` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `name` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `channel` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `status` varchar(16) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `stage` varchar(32) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `progress_pct` int DEFAULT NULL,
+  `input_video` text COLLATE utf8mb4_unicode_ci,
+  `input_is_s3` int DEFAULT NULL,
+  `subtitle_file` text COLLATE utf8mb4_unicode_ci,
+  `subtitle_language` varchar(10) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `template` varchar(100) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `resolutions` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `esam_enabled` int DEFAULT NULL,
+  `audio_norm_enabled` int DEFAULT NULL,
+  `thumbnails_enabled` int DEFAULT NULL,
+  `upload_enabled` int DEFAULT NULL,
+  `output_dir_name` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `s3_bucket` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `s3_key_prefix` varchar(500) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `output_prefix` text COLLATE utf8mb4_unicode_ci,
+  `playback_url` text COLLATE utf8mb4_unicode_ci,
+  `uploaded_files` int DEFAULT NULL,
+  `source_duration_seconds` float DEFAULT NULL,
+  `source_fps` varchar(32) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `log_dir` text COLLATE utf8mb4_unicode_ci,
+  `error_stage` varchar(32) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `error_message` text COLLATE utf8mb4_unicode_ci,
+  `config_snapshot` json DEFAULT NULL,
+  `request_payload` json DEFAULT NULL,
+  `submitted_at` datetime DEFAULT NULL,
+  `started_at` datetime DEFAULT NULL,
+  `completed_at` datetime DEFAULT NULL,
+  `duration_seconds` float DEFAULT NULL,
+  `created_at` datetime DEFAULT NULL,
+  `updated_at` datetime DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `ix_jobs_job_id` (`job_id`),
+  KEY `ix_jobs_channel` (`channel`),
+  KEY `ix_jobs_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+;
 
-    input_video             TEXT,
-    input_is_s3             INTEGER      DEFAULT 0,
-    subtitle_file           TEXT,
-    subtitle_language       VARCHAR(10)  DEFAULT 'en',
+CREATE TABLE IF NOT EXISTS `job_variants` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `job_id` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `name` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `width` int DEFAULT NULL,
+  `height` int DEFAULT NULL,
+  `codec` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `bitrate` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `crf` varchar(20) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `preset` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `gop_size` float DEFAULT NULL,
+  `threads` int DEFAULT NULL,
+  `codec_params` text COLLATE utf8mb4_unicode_ci,
+  `variant_order` int DEFAULT NULL,
+  `created_at` datetime DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `ix_job_variants_job_id` (`job_id`),
+  CONSTRAINT `job_variants_ibfk_1` FOREIGN KEY (`job_id`) REFERENCES `jobs` (`job_id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+;
 
-    template                VARCHAR(100),
-    resolutions             VARCHAR(255),
-    esam_enabled            INTEGER      DEFAULT 0,
-    audio_norm_enabled      INTEGER      DEFAULT 0,
-    thumbnails_enabled      INTEGER      DEFAULT 0,
-    upload_enabled          INTEGER      DEFAULT 1,
+CREATE TABLE IF NOT EXISTS `job_clips` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `job_id` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `start_timecode` varchar(20) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `end_timecode` varchar(20) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `clip_order` int DEFAULT NULL,
+  `created_at` datetime DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `ix_job_clips_job_id` (`job_id`),
+  CONSTRAINT `job_clips_ibfk_1` FOREIGN KEY (`job_id`) REFERENCES `jobs` (`job_id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+;
 
-    output_dir_name         VARCHAR(255),
-    s3_bucket               VARCHAR(255),
-    s3_key_prefix           VARCHAR(500),
-    output_prefix           TEXT,
-    playback_url            TEXT,
-    uploaded_files          INTEGER      DEFAULT 0,
-
-    source_duration_seconds DOUBLE PRECISION,
-    source_fps              VARCHAR(32),
-
-    log_dir                 TEXT,
-    error_stage             VARCHAR(32),
-    error_message           TEXT,
-
-    config_snapshot         JSONB,
-    request_payload         JSONB,
-
-    submitted_at            TIMESTAMP DEFAULT (now() AT TIME ZONE 'utc'),
-    started_at              TIMESTAMP,
-    completed_at            TIMESTAMP,
-    duration_seconds        DOUBLE PRECISION,
-    created_at              TIMESTAMP DEFAULT (now() AT TIME ZONE 'utc'),
-    updated_at              TIMESTAMP DEFAULT (now() AT TIME ZONE 'utc'),
-
-    CONSTRAINT jobs_status_check
-        CHECK (status IN ('PENDING','RUNNING','COMPLETED','FAILED','CANCELLED'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_jobs_job_id       ON jobs (job_id);
-CREATE INDEX IF NOT EXISTS idx_jobs_status       ON jobs (status);
-CREATE INDEX IF NOT EXISTS idx_jobs_channel      ON jobs (channel);
-CREATE INDEX IF NOT EXISTS idx_jobs_submitted_at ON jobs (submitted_at DESC);
-
--- One row per rendition of the ABR ladder the job ran.
-CREATE TABLE IF NOT EXISTS job_variants (
-    id            SERIAL PRIMARY KEY,
-    job_id        VARCHAR(36) NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
-    name          VARCHAR(50),
-    width         INTEGER,
-    height        INTEGER,
-    codec         VARCHAR(50),
-    bitrate       VARCHAR(50),
-    crf           VARCHAR(20),
-    preset        VARCHAR(50),
-    gop_size      DOUBLE PRECISION,
-    threads       INTEGER,
-    codec_params  TEXT,
-    variant_order INTEGER DEFAULT 0,
-    created_at    TIMESTAMP DEFAULT (now() AT TIME ZONE 'utc')
-);
-
-CREATE INDEX IF NOT EXISTS idx_job_variants_job_id ON job_variants (job_id);
-
--- One row per InputClippings entry.
-CREATE TABLE IF NOT EXISTS job_clips (
-    id             SERIAL PRIMARY KEY,
-    job_id         VARCHAR(36) NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
-    start_timecode VARCHAR(20),
-    end_timecode   VARCHAR(20),
-    clip_order     INTEGER DEFAULT 0,
-    created_at     TIMESTAMP DEFAULT (now() AT TIME ZONE 'utc')
-);
-
-CREATE INDEX IF NOT EXISTS idx_job_clips_job_id ON job_clips (job_id);

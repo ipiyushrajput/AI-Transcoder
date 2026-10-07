@@ -38,6 +38,10 @@ def check(label, got, want):
         FAILURES.append(label)
 
 
+def check_true(label, value, detail=""):
+    check(label + (f" ({detail})" if detail and not value else ""), bool(value), True)
+
+
 def test_time_utils():
     print("time_utils")
     check("parse_fps('30000/1001')", parse_fps("30000/1001"), (Fraction(30000, 1001), False))
@@ -264,6 +268,193 @@ def test_environment_diagnostics():
     check("error code extraction", s3_io._error_code(_Denied()), "AccessDenied")
 
 
+def test_cpu_budget(work):
+    """The machine-wide budget: never over-committed, never leaked."""
+    print("cpu budget")
+    import subprocess
+    import threading
+    import time
+    from hls_toolkit.cpu_budget import BudgetAcquireAborted, CpuBudget
+
+    budget = CpuBudget(8, str(work / "slots_basic"))
+    check("a request larger than the budget is clamped", budget.clamp(20), 8)
+    check("a zero request still takes one core", budget.clamp(0), 1)
+    lease = budget.acquire(5)
+    check("cores in use after taking 5", budget.in_use(), 5)
+    lease.release()
+    lease.release()                                    # idempotent
+    check("released cores return to the pool", budget.in_use(), 0)
+
+    # Many threads competing: the total held must never exceed the budget.
+    peak = [0]
+    held = [0]
+    guard = threading.Lock()
+
+    def worker(cost):
+        lease = budget.acquire(cost)
+        with guard:
+            held[0] += cost
+            peak[0] = max(peak[0], held[0])
+        time.sleep(0.05)
+        with guard:
+            held[0] -= cost
+        lease.release()
+
+    threads = [threading.Thread(target=worker, args=(c,)) for c in (3, 5, 2, 4, 1, 6, 3, 2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check_true("threads never held more than the budget", peak[0] <= 8, f"peak {peak[0]}")
+    check("every thread got its cores and gave them back", budget.in_use(), 0)
+
+    # Waiting stops as soon as the job is cancelled.
+    hog = budget.acquire(8)
+    stop = threading.Event()
+    threading.Timer(0.3, stop.set).start()
+    started = time.time()
+    try:
+        budget.acquire(1, should_abort=stop.is_set)
+        check("a cancelled wait is abandoned", "acquired", "aborted")
+    except BudgetAcquireAborted:
+        check("a cancelled wait is abandoned", "aborted", "aborted")
+    check_true("…promptly", time.time() - started < 2.0)
+    hog.release()
+
+    # A job killed while holding cores must not leak them: the kernel drops a
+    # dead process's flocks.
+    slots = work / "slots_crash"
+    holder = subprocess.Popen([sys.executable, "-c", (
+        "import sys, time; sys.path.insert(0, %r)\n"
+        "from hls_toolkit.cpu_budget import CpuBudget\n"
+        "lease = CpuBudget(8, %r).acquire(6)\n"
+        "print('held', flush=True); time.sleep(60)\n")
+        % (os.path.dirname(os.path.dirname(os.path.abspath(__file__))), str(slots))],
+        stdout=subprocess.PIPE, text=True)
+    check("another process holds 6 cores", holder.stdout.readline().strip(), "held")
+    shared = CpuBudget(8, str(slots))
+    check("the hold is visible across processes", shared.in_use(), 6)
+    holder.kill()
+    holder.wait()
+    check("kill -9 releases the dead job's cores", shared.in_use(), 0)
+
+    # A job killed while *waiting in line* leaves its queue entry behind; the
+    # next request must clear it rather than wait behind it forever.
+    hog = shared.acquire(8)
+    waiter = subprocess.Popen([sys.executable, "-c", (
+        "import sys; sys.path.insert(0, %r)\n"
+        "from hls_toolkit.cpu_budget import CpuBudget\n"
+        "CpuBudget(8, %r).acquire(2)\n")
+        % (os.path.dirname(os.path.dirname(os.path.abspath(__file__))), str(slots))])
+    queue = slots / "queue"
+    deadline = time.time() + 10
+    while time.time() < deadline and not [n for n in os.listdir(queue)
+                                          if not n.startswith(".")]:
+        time.sleep(0.05)
+    check_true("the other process is waiting in line",
+               [n for n in os.listdir(queue) if not n.startswith(".")])
+    waiter.kill()
+    waiter.wait()
+    hog.release()
+    started = time.time()
+    lease = shared.acquire(2)
+    check_true("a dead waiter's entry does not block the line",
+               time.time() - started < 2.0)
+    lease.release()
+    check("its stale entry is cleared", [n for n in os.listdir(queue)
+                                         if not n.startswith(".")], [])
+
+
+def test_transcode_scheduling():
+    """Cost estimates and the order clips are released into the budget."""
+    print("transcode scheduling")
+    selected = [{"name": n, "threads": 4} for n in ("1080p", "720p", "540p", "360p")]
+    check("four rungs at threads=4 reserve 8 cores",
+          fw.estimate_video_task_cores(selected), 8)
+    full_hevc = [{"name": "2160p", "threads": 12}] + [
+        {"name": n, "threads": 4} for n in ("1440p", "1080p", "720p", "540p", "360p")]
+    check("the full H.265 ladder reserves 16, not the old 36",
+          fw.estimate_video_task_cores(full_hevc), 16)
+    check("a rung without threads counts as one thread",
+          fw.estimate_video_task_cores([{"name": "720p"}, {"name": "360p"}]), 1)
+
+    def task(index, start, end, kind):
+        return (None, index, [], None, None, None, start, end) + (None,) * 8 + (kind,)
+
+    # Clip lengths as in the 5-clip, 42:50 example: 10:02, 9:09, 7:44, 8:02, 7:49.
+    tasks = []
+    for i, (s, e) in enumerate([(0, 602), (603, 1152), (1153, 1617), (1617, 2100),
+                                (2100, 2570)]):
+        tasks += [task(i, s, e, "video"), task(i, s, e, "audio")]
+    plan = fw._schedule_transcode_tasks(tasks, video_cost=8)
+    check("video before audio", [p["stream_type"] for p in plan],
+          ["video"] * 5 + ["audio"] * 5)
+    check("longest clip first", [p["task"][1] for p in plan[:5]], [0, 1, 3, 4, 2])
+    check("audio reserves one core", {p["cost"] for p in plan[5:]}, {1})
+
+
+def test_unique_log_dirs(work):
+    """A log folder is never reused, even by runs that start at the same time."""
+    print("unique log folders")
+    import threading
+    from hls_toolkit.job_context import claim_unique_dir
+
+    root = work / "logs_unique"
+    names = [claim_unique_dir(root, "AETN_AmericanPickers_S10_E03_en").name for _ in range(3)]
+    check("repeat runs get _2 and _3", names,
+          ["AETN_AmericanPickers_S10_E03_en", "AETN_AmericanPickers_S10_E03_en_2",
+           "AETN_AmericanPickers_S10_E03_en_3"])
+
+    (root / "AETN_AmericanPickers_S10_E03_en_2").rmdir()
+    check("numbering keeps going after an old folder is deleted",
+          claim_unique_dir(root, "AETN_AmericanPickers_S10_E03_en").name,
+          "AETN_AmericanPickers_S10_E03_en_4")
+    claim_unique_dir(root, "Show_S01_E02")
+    check("a name already ending in digits is suffixed, not confused",
+          claim_unique_dir(root, "Show_S01_E02").name, "Show_S01_E02_2")
+
+    claimed = []
+    barrier = threading.Barrier(12)
+
+    def race():
+        barrier.wait()
+        claimed.append(claim_unique_dir(root, "Raced").name)
+
+    threads = [threading.Thread(target=race) for _ in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check("12 simultaneous runs get 12 different folders", len(set(claimed)), 12)
+
+
+def test_job_progress_isolation(work):
+    """Two jobs in one process must not mix their per-clip progress."""
+    print("per-job progress")
+    from hls_toolkit.job_context import JobContext, bind_context
+
+    jobs = [JobContext("s3://b/Same_Source.mp4", job_id=f"p{i}",
+                       log_root=str(work / "logs_progress")) for i in (1, 2)]
+    for ctx in jobs:
+        ctx.metadata["video_clip_count"] = 2
+        ctx.set_stage("TRANSCODING", 0.0)
+    bind_context(jobs[0])
+    fw._clip_progress_cb(0, "video")(1.0)               # job 1: clip 0 finished
+    bind_context(jobs[1])
+    fw._clip_progress_cb(1, "video")(0.5)               # job 2: clip 1 half done
+    bind_context(None)
+    # TRANSCODING spans 12-60%. Job 1: 1 of 2 clips -> 12 + 48*0.5 = 36.
+    check("job 1 shows its own progress", jobs[0].progress_pct, 36)
+    # Job 2: half of 1 of 2 clips -> 12 + 48*0.25 = 24. A shared table would
+    # also count job 1's finished clip and report 48.
+    check("job 2 is not credited with job 1's work", jobs[1].progress_pct, 24)
+    fw._clear_clip_progress(jobs[1])
+    with fw._CLIP_PROGRESS_LOCK:
+        left = [k for k in fw._CLIP_PROGRESS if k.startswith(f"{id(jobs[0])}:")]
+    check("finishing one job keeps the other's progress", len(left), 1)
+    fw._clear_clip_progress(jobs[0])
+
+
 def main():
     work = Path(tempfile.mkdtemp(prefix="aitranscoder_smoke_"))
     try:
@@ -274,6 +465,10 @@ def main():
         test_ffmpeg_command()
         test_hevc_codec_string()
         test_duplicate_rung_guard()
+        test_cpu_budget(work)
+        test_transcode_scheduling()
+        test_unique_log_dirs(work)
+        test_job_progress_isolation(work)
         test_environment_diagnostics()
     finally:
         shutil.rmtree(work, ignore_errors=True)

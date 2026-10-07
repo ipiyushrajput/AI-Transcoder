@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """End-to-end test of the S3 -> transcode -> S3 pipeline and the HTTP API.
 
-Runs the real workflow, per-channel logging, progress tracking, S3 fetch/publish
-and (when PostgreSQL is reachable) the database layer — substituting a stub
-FFmpeg and a filesystem-backed S3 so it needs neither the custom encoder build
-nor AWS credentials.
+Runs the real workflow, per-channel logging, progress tracking, S3 fetch/publish,
+parallel jobs sharing the CPU budget, and (when MySQL is reachable) the database
+layer — substituting a stub FFmpeg and a filesystem-backed S3 so it needs neither
+the custom encoder build nor AWS credentials.
 
     python tests/pipeline_test.py
+
+The database checks need MySQL and the DB_* settings (see .env.example); without
+them those checks fail and the rest still run.
 """
 import json
 import os
@@ -230,8 +233,13 @@ def test_api(work: Path, binaries: dict):
     check_true("status filter works",
                all(j["status"] == "COMPLETED" for j in filtered["jobs"]))
 
-    logs = http.get(f"/api/v1/jobs/{job_id}/logs?type=ffmpeg&tail=50").get_json()
+    # The whole log, so the check does not hinge on where in it the encoder
+    # lines fall — that depends on the order clips happen to be scheduled.
+    logs = http.get(f"/api/v1/jobs/{job_id}/logs?type=ffmpeg&tail=5000").get_json()
     check_true("ffmpeg logs retrievable", "libwz" in logs.get("content", ""))
+    short = http.get(f"/api/v1/jobs/{job_id}/logs?type=ffmpeg&tail=5").get_json()
+    check_true("tail limits the lines returned",
+               0 < len(short.get("content", "").splitlines()) <= 5)
     job_logs = http.get(f"/api/v1/jobs/{job_id}/logs?type=job").get_json()
     check_true("job logs retrievable", "[stage]" in job_logs.get("content", ""))
     bad_log = http.get(f"/api/v1/jobs/{job_id}/logs?type=nope")
@@ -245,6 +253,147 @@ def test_api(work: Path, binaries: dict):
           http.get(f"/api/v1/jobs/{job_id}").status_code, 404)
 
 
+def test_parallel_cli_jobs(work: Path, binaries: dict):
+    """Three `python app.py --config ...` runs started together, on one source.
+
+    They must share one CPU budget (never reserving more cores than it holds),
+    still encode several clips at once each, and log to separate folders.
+    """
+    print("parallel jobs (3 x app.py at once)")
+    import subprocess
+    import time
+
+    budget, video_cost = 16, 8               # 4 H.265 rungs at threads=4 -> 8 cores
+    media = work / "parallel"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    timeline = media / "timeline.jsonl"
+    log_root = media / "logs"
+
+    # Hold every core first, so all three jobs are already waiting when the
+    # first one is let in. Otherwise whichever process starts fastest is alone
+    # in the queue for its first clips, and turn-taking cannot be observed.
+    from hls_toolkit.cpu_budget import CpuBudget
+    gate = CpuBudget(budget, str(media / "slots"))
+    blocker = gate.acquire(budget)
+
+    procs = []
+    for k in (1, 2, 3):
+        config = build_config(work, binaries)
+        config["defaults"].update({
+            "input_video": str(source), "subtitle_file": None, "template": "h265_standard",
+            "resolutions": "1080p,720p,540p,360p", "output_dir": f"job{k}",
+            "InputClippings": [
+                {"StartTimecode": "00:00:00:00", "EndTimecode": "00:00:30:00"},
+                {"StartTimecode": "00:00:30:01", "EndTimecode": "00:01:00:00"},
+                {"StartTimecode": "00:01:00:01", "EndTimecode": "00:01:30:00"}]})
+        for rung in config["video_templates"]["h265_standard"]:
+            rung["threads"] = 4
+        path = media / f"config{k}.json"
+        path.write_text(json.dumps(config))
+        env = dict(os.environ, FAKE_MEDIA_DURATION="100", FAKE_TIMELINE=str(timeline),
+                   FAKE_SECONDS_PER_MEDIA_MINUTE="3", FAKE_JOB_LABEL=f"job{k}",
+                   WZ_CPU_BUDGET=str(budget), WZ_CPU_SLOT_DIR=str(media / "slots"))
+        procs.append(subprocess.Popen(
+            [sys.executable, "app.py", "--config", str(path), "--no-upload",
+             "--no-esam", "--no-audio-norm", "--no-generate-thumbnails",
+             "--work-dir", str(media / "scratch"), "--log-dir", str(log_root)],
+            cwd=str(ROOT), env=env, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL))
+    queue_dir = media / "slots" / "queue"
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        if len([n for n in os.listdir(queue_dir) if not n.startswith(".")]) >= 3:
+            break
+        time.sleep(0.1)
+    check_true("all three jobs queued for cores while they were taken",
+               len([n for n in os.listdir(queue_dir) if not n.startswith(".")]) >= 3)
+    blocker.release()
+
+    codes = [p.wait(timeout=600) for p in procs]
+    check("all three jobs succeed", codes, [0, 0, 0])
+
+    events = [json.loads(line) for line in timeline.read_text().splitlines()]
+    cost = {"video": video_cost, "audio": 1}
+
+    def peak(selected):
+        return max(sum(cost[e["kind"]] for e in selected if e["start"] <= t < e["end"])
+                   for t in {e["start"] for e in selected})
+
+    check_true("the shared budget is never over-committed",
+               peak(events) <= budget, f"peak {peak(events)} of {budget}")
+    by_job = {}
+    for event in events:
+        if event["kind"] == "video":
+            by_job.setdefault(event["job"], []).append(event)
+    check("every job encoded all its clips", sorted(len(v) for v in by_job.values()),
+          [3, 3, 3])
+    # Jobs waiting together must take turns: in the order clips started, every
+    # run of three holds one clip from each job. Serving one job's clips back
+    # to back — what made three parallel jobs finish at very different times —
+    # would put the same job twice in a group.
+    order = [e["job"] for e in sorted(
+        (e for e in events if e["kind"] == "video"), key=lambda e: e["start"])]
+    groups = [order[i:i + 3] for i in range(0, len(order), 3)]
+    check_true("waiting jobs take turns clip by clip",
+               all(len(set(g)) == 3 for g in groups), f"start order {order}")
+
+    folders = sorted(p.parent.name for p in log_root.rglob("job.log"))
+    check("three log folders for three runs of one source", folders,
+          [CHANNEL, f"{CHANNEL}_2", f"{CHANNEL}_3"])
+    outputs = sorted(json.loads((log_root / f / "job.json").read_text())["metadata"]
+                     ["output_dir_name"] for f in folders)
+    check("each folder holds a different job", outputs, ["job1", "job2", "job3"])
+    headers = [(log_root / f / "job.log").read_text().count("Channel :") for f in folders]
+    check("no folder mixes two jobs' logs", headers, [1, 1, 1])
+
+
+def test_single_job_uses_the_budget(work: Path, binaries: dict):
+    """A lone job overlaps its clips when the budget has room (it used to run
+    an H.265 ladder one clip at a time)."""
+    print("single job overlaps its clips")
+    from hls_toolkit import cpu_budget
+    from hls_toolkit.runner import run_transcode_job
+
+    media = work / "single"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    timeline = media / "timeline.jsonl"
+    config = build_config(work, binaries)
+    config["defaults"].update({"subtitle_file": None, "template": "h265_standard",
+                               "resolutions": "1080p,720p,540p,360p"})
+    for rung in config["video_templates"]["h265_standard"]:
+        rung["threads"] = 4                  # 4 rungs x 4 threads / 2 -> 8 cores
+    previous = {k: os.environ.get(k) for k in
+                ("FAKE_TIMELINE", "FAKE_SECONDS_PER_MEDIA_MINUTE", "FAKE_MEDIA_DURATION")}
+    os.environ.update(FAKE_TIMELINE=str(timeline), FAKE_SECONDS_PER_MEDIA_MINUTE="3",
+                      FAKE_MEDIA_DURATION="100")
+    cpu_budget.reset_shared_budget()
+    cpu_budget.get_shared_budget(32, slot_dir=str(media / "slots"))
+    try:
+        result = run_transcode_job(
+            config, overrides={"input_video": str(source), "upload": False,
+                               "esam": False, "audio_norm": False,
+                               "thumbnails_enabled": False},
+            job_id="single", log_root=str(media / "logs"),
+            work_root=str(media / "scratch"))
+    finally:
+        cpu_budget.reset_shared_budget()
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    check("single job completes", result["status"], "COMPLETED")
+    videos = [json.loads(l) for l in timeline.read_text().splitlines()
+              if json.loads(l)["kind"] == "video"]
+    overlap = max(sum(v["start"] <= t < v["end"] for v in videos)
+                  for t in {v["start"] for v in videos})
+    check("both clips encode at once on a 32-core budget", overlap, 2)
+
+
 def main():
     work = Path(tempfile.mkdtemp(prefix="aitx_pipeline_test_"))
     print(f"workspace: {work}\n")
@@ -253,6 +402,10 @@ def main():
         test_pipeline(work, binaries)
         print()
         test_failure_reporting(work, binaries)
+        print()
+        test_single_job_uses_the_budget(work, binaries)
+        print()
+        test_parallel_cli_jobs(work, binaries)
         print()
         test_api(work, binaries)
     finally:

@@ -41,7 +41,8 @@ server's configured defaults.
   "generate_thumbnails": true,
   "upload": true,
   "duration": 120,                              // transcode only the first N seconds
-  "transcode_workers": 4,
+  "transcode_workers": 4,                       // optional cap on clips encoding at once;
+                                                // omit to let the shared CPU budget decide
 
   "clippings": [                                // replaces defaults.InputClippings
     {"StartTimecode": "00:00:00:00", "EndTimecode": "00:10:02:27"}
@@ -86,7 +87,7 @@ Rejected for: missing/unreadable input, unknown template, unknown resolution,
 
 ## GET /api/v1/jobs/&lt;job_id&gt;/status
 
-Served from the live job while it runs, from PostgreSQL afterwards (`source`
+Served from the live job while it runs, from MySQL afterwards (`source`
 tells you which).
 
 ```json

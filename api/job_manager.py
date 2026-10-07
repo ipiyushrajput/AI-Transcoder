@@ -1,7 +1,7 @@
 """Background execution and bookkeeping for API-submitted transcode jobs.
 
 Jobs run on a bounded worker pool. Progress is mirrored from the live
-:class:`~hls_toolkit.job_context.JobContext` into PostgreSQL on a short interval,
+:class:`~hls_toolkit.job_context.JobContext` into MySQL on a short interval,
 so ``GET /jobs/<id>/status`` is accurate whether it is served from the in-memory
 registry (job still running on this process) or from the database (finished, or
 started by another worker process).
@@ -496,8 +496,8 @@ def _persist_new_job(record: Dict[str, Any], config: Dict[str, Any],
         return
     try:
         job = db.Job(**record,
-                     config_snapshot=_jsonable(config, session),
-                     request_payload=_jsonable(payload, session))
+                     config_snapshot=_jsonable(config),
+                     request_payload=_jsonable(payload))
         session.add(job)
 
         ladder = config.get("video_templates", {}).get(settings["template_name"], [])
@@ -572,11 +572,15 @@ def _fetch_job(job_id: str):
         db.close_session(session)
 
 
-def _jsonable(value: Any, session) -> Any:
-    """JSONB takes dicts directly; the SQLite/TEXT variant needs a string."""
-    if session.bind is not None and session.bind.dialect.name == "postgresql":
-        return value
-    return json.dumps(value)
+def _jsonable(value: Any) -> Any:
+    """A JSON-safe copy of `value` for a JSON column.
+
+    The column type serialises it, on MySQL and SQLite alike, so it must not be
+    turned into a string here — that would store a quoted string, not an object.
+    Round-tripping turns anything JSON cannot hold (a Path, say) into its text
+    form up front, so it is stored readably instead of failing in the driver.
+    """
+    return json.loads(json.dumps(value, default=str))
 
 
 def _as_float(value) -> Optional[float]:

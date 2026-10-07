@@ -248,13 +248,62 @@ def check_database() -> Result:
     try:
         from api import database as db
     except Exception as e:
-        return Result("PostgreSQL", WARN, f"API dependencies unavailable: {e}",
+        return Result("MySQL", WARN, f"API dependencies unavailable: {e}",
                       "Only needed for the HTTP service. pip install -r requirements.txt")
     if db.init_db():
-        return Result("PostgreSQL", OK, db._safe_url())
-    return Result("PostgreSQL", WARN, f"cannot connect to {db._safe_url()}",
+        return Result("MySQL", OK, db._safe_url())
+    return Result("MySQL", WARN,
+                  f"cannot use {db._safe_url()}: {db.last_init_error}",
                   "Only needed for the HTTP service — transcodes run without it. "
-                  "See docs/POSTGRES_SETUP.md")
+                  + mysql_remedy(db.last_init_error, db.DB_USER, db.DB_HOST))
+
+
+def mysql_remedy(exc: Optional[BaseException], user: str = "root",
+                 host: str = "localhost") -> str:
+    """The specific fix for the usual MySQL connection failures."""
+    message = str(exc or "")
+    code = _mysql_error_code(exc)
+    if "DB_PASSWORD is not set" in message:
+        return "Set DB_PASSWORD in .env (copy .env.example)."
+    if code == 1698:
+        # auth_socket: Ubuntu's default for root. Password logins are refused
+        # outright, whatever the password.
+        return ("This MySQL user logs in through the OS socket (auth_socket), "
+                "which refuses passwords. Either give it a password: "
+                f"sudo mysql -e \"ALTER USER '{user}'@'{host}' IDENTIFIED WITH "
+                f"caching_sha2_password BY '<password>';\" — or create a dedicated "
+                f"user (docs/MYSQL_SETUP.md).")
+    if code == 1045:
+        return "Wrong DB_USER or DB_PASSWORD in .env."
+    if code == 1044:
+        return ("The user may not create or use this database. "
+                "GRANT ALL ON `<DB_NAME>`.* TO the user (docs/MYSQL_SETUP.md).")
+    if code in (2003, 2002):
+        return ("MySQL is not reachable at DB_HOST:DB_PORT. Is it running? "
+                "sudo systemctl status mysql")
+    if "cryptography" in message:
+        # PyMySQL negotiates TLS on its own, and MySQL 8 enables TLS at install,
+        # so this only appears when the server has TLS switched off: the
+        # password then has to be RSA-encrypted, which needs cryptography.
+        return ("This MySQL server is not offering TLS, so the password must be "
+                "RSA-encrypted, which needs the cryptography package: "
+                "pip install 'cryptography>=42'. Or re-enable TLS on the server.")
+    if isinstance(exc, ModuleNotFoundError) or "pymysql" in message.lower():
+        return "pip install -r requirements.txt  (installs PyMySQL)"
+    return "See docs/MYSQL_SETUP.md"
+
+
+def _mysql_error_code(exc: Optional[BaseException]) -> Optional[int]:
+    """The numeric MySQL error from a driver or SQLAlchemy exception, if any."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        args = getattr(exc, "orig", None)
+        args = getattr(args, "args", None) or getattr(exc, "args", None) or ()
+        if args and isinstance(args[0], int):
+            return args[0]
+        exc = getattr(exc, "orig", None) or exc.__cause__ or exc.__context__
+    return None
 
 
 def run_all(config: Dict[str, Any], log_root: str = "logs",

@@ -11,6 +11,7 @@ import json
 import os
 import random
 import sys
+import time
 from pathlib import Path
 
 DURATION = float(os.getenv("FAKE_MEDIA_DURATION", "60"))
@@ -90,11 +91,54 @@ def run_ffmpeg(argv):
     # Everything else writes one or more output files: clip transcode, concat merge.
     outputs = [Path(a) for a in argv
                if str(a).endswith((".mp4", ".m4s")) and not _is_input_value(argv, a)]
+    started = time.time()
+    _simulate_encode_time(argv)
     for path in outputs:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(os.urandom(4096))
     _emit_progress(float(arg_after(argv, "-t") or DURATION))
+    _record_timeline(argv, started)
     return 0
+
+
+def _encode_kind(argv):
+    """'video' / 'audio' for a clip encode, None for anything else."""
+    if "-ss" not in argv:
+        return None
+    if any(str(a).startswith("libwz") for a in argv):
+        return "video"
+    if "aac" in argv:
+        return "audio"
+    return None
+
+
+def _simulate_encode_time(argv):
+    """Sleep in proportion to the clip length, so scheduling can be observed.
+
+    Off unless FAKE_SECONDS_PER_MEDIA_MINUTE is set; it uses no CPU, so it
+    measures when encodes run, not how fast they would run under contention.
+    """
+    rate = float(os.getenv("FAKE_SECONDS_PER_MEDIA_MINUTE", "0") or 0)
+    kind = _encode_kind(argv)
+    if rate <= 0 or kind is None:
+        return
+    seconds = float(arg_after(argv, "-t") or 0) / 60.0 * rate
+    if kind == "audio":
+        seconds *= 0.1                    # AAC is cheap next to the video encode
+    time.sleep(seconds)
+
+
+def _record_timeline(argv, started):
+    """Append one JSON line per clip encode to FAKE_TIMELINE, when set."""
+    path = os.getenv("FAKE_TIMELINE")
+    kind = _encode_kind(argv)
+    if not path or kind is None:
+        return
+    entry = {"pid": os.getpid(), "job": os.getenv("FAKE_JOB_LABEL", ""),
+             "kind": kind, "start": started, "end": time.time(),
+             "clip_seconds": float(arg_after(argv, "-t") or 0)}
+    with open(path, "a") as fh:
+        fh.write(json.dumps(entry) + "\n")
 
 
 def _is_input_value(argv, value):
