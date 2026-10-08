@@ -27,14 +27,15 @@ git clone <this-repo> && cd AI-Transcoder
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 
-# The custom FFmpeg build (must provide libwz264 / libwz265)
-mkdir -p bin
-cp /path/to/ffmpeg bin/ffmpeg && cp /path/to/ffprobe bin/ffprobe
-chmod +x bin/ffmpeg bin/ffprobe
-
 # Edit inputs, ladder and S3 destination
 $EDITOR config.json
 ```
+
+The custom FFmpeg build ships in `bin/` — `ffmpeg` and `ffprobe` (with the
+in-house `libwz264` / `libwz265` encoders) plus the Visionular license files
+`wz_license.cnf` and `wz_license.key` — so a fresh clone runs as is. To use a
+different build, replace those files or point `paths.ffmpeg_executable` and
+`paths.ffprobe_executable` in the config at it.
 
 **As a CLI:**
 
@@ -106,6 +107,10 @@ docs/
 ├── API.md                    Endpoint reference with examples
 ├── MYSQL_SETUP.md            Ubuntu database setup, start to finish
 └── schema.sql                MySQL DDL (the API also creates it on boot)
+
+bin/                          Custom FFmpeg build and Visionular license
+├── ffmpeg, ffprobe           With the in-house libwz264 / libwz265 encoders
+└── wz_license.cnf, .key      License server address and license key
 
 deploy/ai-transcoder.service  systemd unit
 tests/                        Offline verification
