@@ -10,8 +10,8 @@ logs/
 hls_output*/
 *.log
 
-# Custom ffmpeg build and media assets are not tracked
-bin/
+# Media assets are not tracked. bin/ (the custom FFmpeg build and its license)
+# is tracked on purpose.
 assets/
 
 # Environment and secrets
