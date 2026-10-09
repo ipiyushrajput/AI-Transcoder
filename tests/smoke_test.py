@@ -455,6 +455,25 @@ def test_job_progress_isolation(work):
     fw._clear_clip_progress(jobs[0])
 
 
+def test_output_dir_names():
+    """Output folder names must be names, never paths out of scratch."""
+    print("output folder names")
+    from hls_toolkit.runner import validate_output_dir_name
+    for good in ("AETN_AmericanPickers_S10_E03_en", "shows/AETN_S10_E03",
+                 "Show: Part 1", "  padded  "):
+        try:
+            check(f"accepts {good!r}", validate_output_dir_name(good), good.strip())
+        except ValueError as e:
+            check(f"accepts {good!r}", f"rejected: {e}", "accepted")
+    for bad in ("/home/ubuntu", "../etc", "a/../b", "a//b", "./x", "~/x",
+                "C:\\data", "C:/data", "a\\b", "", "   ", "tab\there", None, 42):
+        try:
+            validate_output_dir_name(bad)
+            check(f"rejects {bad!r}", "accepted", "rejected")
+        except ValueError:
+            check(f"rejects {bad!r}", "rejected", "rejected")
+
+
 def main():
     work = Path(tempfile.mkdtemp(prefix="aitranscoder_smoke_"))
     try:
@@ -465,6 +484,7 @@ def main():
         test_ffmpeg_command()
         test_hevc_codec_string()
         test_duplicate_rung_guard()
+        test_output_dir_names()
         test_cpu_budget(work)
         test_transcode_scheduling()
         test_unique_log_dirs(work)

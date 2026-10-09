@@ -570,7 +570,8 @@ def generate_hls_workflow(config: Dict[str, Any],
                 ctx.metadata["s3_bucket"] = s3_bucket_name_local
                 ctx.metadata["s3_prefix"] = destination_prefix
         else:
-            log().info(f"Upload disabled — output kept locally at {output_dir}")
+            log().info(f"Upload disabled — the package is staged at {output_dir} and "
+                       f"will be saved to the local output folder.")
             if ctx is not None:
                 ctx.output_prefix = str(output_dir)
                 ctx.metadata["playback_url"] = str(master_playlist_path)

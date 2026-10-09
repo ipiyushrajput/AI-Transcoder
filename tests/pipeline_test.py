@@ -191,6 +191,10 @@ def test_api(work: Path, binaries: dict):
     bad_input = http.post("/api/v1/jobs", json={"input_video": "/no/such/file.mp4"})
     check("missing local input rejected", bad_input.status_code, 400)
 
+    bad_output = http.post("/api/v1/jobs", json={"input_video": video_uri,
+                                                 "output_dir": "/home/ubuntu"})
+    check("an output path is rejected with 400", bad_output.status_code, 400)
+
     response = http.post("/api/v1/jobs", json={
         "name": "American Pickers S10E03",
         "input_video": video_uri,
@@ -394,6 +398,108 @@ def test_single_job_uses_the_budget(work: Path, binaries: dict):
     check("both clips encode at once on a 32-core budget", overlap, 2)
 
 
+def _quick_overrides(source, **extra):
+    """Overrides for a fast job: no ESAM, loudnorm or thumbnails."""
+    overrides = {"input_video": str(source), "esam": False, "audio_norm": False,
+                 "thumbnails_enabled": False}
+    overrides.update(extra)
+    return overrides
+
+
+def test_output_folder_safety(work: Path, binaries: dict):
+    """An output name that is a path must never reach outside scratch."""
+    print("output folder safety")
+    from hls_toolkit import s3_io
+    from hls_toolkit.job_context import TranscodeError
+    from hls_toolkit.runner import run_transcode_job
+
+    client = fake_s3.install(s3_io, work / "s3_safety")
+    media = work / "safety"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    victim = media / "unrelated_folder"
+    victim.mkdir()
+    (victim / "contract.pdf").write_text("was here before the job")
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+
+    for label, name in (("absolute path", str(victim)),
+                        ("'..' path", f"../../../{victim.name}"),
+                        ("hidden '..' segment", f"ok/../{victim.name}")):
+        try:
+            run_transcode_job(config, overrides=_quick_overrides(
+                source, upload=True, output_dir=name),
+                log_root=str(media / "logs"), work_root=str(media / "scratch"))
+            check(f"{label} refused", "accepted", "refused")
+        except TranscodeError as e:
+            check(f"{label} refused at validation", e.stage, "VALIDATION")
+    check_true("the unrelated folder is untouched", (victim / "contract.pdf").exists())
+    check_true("nothing was uploaded", not any(
+        k.endswith("contract.pdf") for k in client.keys_under(BUCKET)))
+
+
+def test_local_copies(work: Path, binaries: dict):
+    """--no-upload, --keep-local and a failed upload all leave a usable package."""
+    print("local copies of the package")
+    from hls_toolkit import s3_io
+    from hls_toolkit.runner import run_transcode_job
+
+    client = fake_s3.install(s3_io, work / "s3_local")
+    media = work / "local"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    local_root = media / "hls_output"
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+
+    def run(**extra):
+        return run_transcode_job(
+            config, overrides=_quick_overrides(source, local_output_dir=str(local_root),
+                                               **extra),
+            log_root=str(media / "logs"), work_root=str(media / "scratch"))
+
+    result = run(upload=False, output_dir="show")
+    saved = Path(result["output_prefix"])
+    check("--no-upload completes", result["status"], "COMPLETED")
+    check("saved under the local output folder", saved, local_root / "show")
+    check_true("the package survives the job", (saved / "channel.m3u8").exists())
+    check("playback points at the saved copy", result["metadata"]["playback_url"],
+          str(saved / "channel.m3u8"))
+
+    again = run(upload=False, output_dir="show")
+    check("a second run never overwrites the first", Path(again["output_prefix"]).name,
+          "show_2")
+    check_true("the first copy is still intact", (saved / "channel.m3u8").exists())
+
+    kept = run(upload=True, delete_local_output=False, output_dir="kept")
+    check("--keep-local completes", kept["status"], "COMPLETED")
+    check_true("--keep-local uploads to S3",
+               any(k.endswith("kept/channel.m3u8") for k in client.keys_under(BUCKET)))
+    check_true("--keep-local also keeps a local copy",
+               (local_root / "kept" / "channel.m3u8").exists())
+
+    original_upload = client.upload_file
+
+    def flaky_upload(filename, bucket, key, ExtraArgs=None, Config=None):
+        if key.endswith(".ts"):
+            raise OSError("simulated network failure")
+        return original_upload(filename, bucket, key, ExtraArgs=ExtraArgs, Config=Config)
+
+    client.upload_file = flaky_upload
+    try:
+        failed = run(upload=True, output_dir="retry_me")
+    finally:
+        client.upload_file = original_upload
+    check("a failed upload fails the job", failed["status"], "FAILED")
+    check_true("the finished package is saved for a retry",
+               (local_root / "retry_me" / "channel.m3u8").exists())
+    check_true("the error says where it is and how to retry",
+               "--upload-only" in (failed["error_message"] or "")
+               and str(local_root / "retry_me") in failed["error_message"])
+
+
 def main():
     work = Path(tempfile.mkdtemp(prefix="aitx_pipeline_test_"))
     print(f"workspace: {work}\n")
@@ -402,6 +508,10 @@ def main():
         test_pipeline(work, binaries)
         print()
         test_failure_reporting(work, binaries)
+        print()
+        test_output_folder_safety(work, binaries)
+        print()
+        test_local_copies(work, binaries)
         print()
         test_single_job_uses_the_budget(work, binaries)
         print()

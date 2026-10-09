@@ -19,7 +19,8 @@ from typing import Any, Dict, List, Optional
 from api import database as db
 from hls_toolkit import s3_io
 from hls_toolkit.job_context import JobContext, channel_name_for
-from hls_toolkit.runner import build_run_settings, run_transcode_job
+from hls_toolkit.runner import (build_run_settings, run_transcode_job,
+                                validate_output_dir_name)
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +151,8 @@ def _validate(config: Dict[str, Any], settings: Dict[str, Any]) -> None:
     input_video = settings["input_video"]
     if not input_video:
         raise ValueError("input_video is required (no default is configured).")
+
+    settings["output_dir_name"] = validate_output_dir_name(settings["output_dir_name"])
 
     if s3_io.is_s3_uri(input_video):
         try:
