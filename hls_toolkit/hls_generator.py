@@ -5,10 +5,12 @@ import subprocess
 import shlex
 import math
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
 from hls_toolkit import s3_io, time_utils
+from hls_toolkit.cpu_budget import BudgetAcquireAborted, get_shared_budget
 from hls_toolkit.job_context import (JobCancelled, JobContext, TranscodeError,
                                      current_context, log)
 from hls_toolkit.esam_parser import (parse_esam_xml_string, parse_mcc_xml_asset_tags,
@@ -23,6 +25,30 @@ from hls_toolkit.playlist_utils import create_master_playlist, parse_variant_seg
 from hls_toolkit.subtitle_processor import (generate_merged_subtitle_file,
                                             segment_vtt_for_hls)
 from hls_toolkit.time_utils import timecode_to_seconds, seconds_to_timecode
+
+
+# Cores the non-encode FFmpeg steps reserve from the shared CPU budget. They
+# used to run outside it, so other jobs' encodes could fill every core while
+# these ran on top. Stream-copy packaging and the loudnorm pass use about one
+# core; thumbnail extraction decodes video and uses about two.
+LOUDNORM_CORES = 1
+PACKAGING_CORES = 1
+THUMBNAIL_CORES = 2
+
+
+@contextmanager
+def _cores(count: int, what: str):
+    """Hold `count` cores of the shared budget while `what` runs."""
+    ctx = current_context()
+    budget = get_shared_budget()
+    try:
+        lease = budget.acquire(count, should_abort=lambda: ctx is not None and ctx.cancelled)
+    except BudgetAcquireAborted:
+        raise JobCancelled(f"Cancelled while waiting for CPU to run {what}") from None
+    try:
+        yield
+    finally:
+        lease.release()
 
 
 def validate_unique_rung_names(template_name: str,
@@ -375,9 +401,10 @@ def generate_hls_workflow(config: Dict[str, Any],
                 log().info("Performing loudnorm analysis on the full video for "
                              f"{loudnorm_analysis_duration:.3f} seconds.")
 
-            loudnorm_analysis_results = run_loudnorm_analysis(
-                ffmpeg_executable, audio_analysis_input, cwd=temp_dir,
-                duration=loudnorm_analysis_duration)
+            with _cores(LOUDNORM_CORES, "the loudnorm analysis"):
+                loudnorm_analysis_results = run_loudnorm_analysis(
+                    ffmpeg_executable, audio_analysis_input, cwd=temp_dir,
+                    duration=loudnorm_analysis_duration)
             if not loudnorm_analysis_results:
                 log().warning("Warning: Loudnorm analysis failed. "
                                 "Audio normalization will be skipped.")
@@ -526,7 +553,9 @@ def generate_hls_workflow(config: Dict[str, Any],
             first_mp4_for_thumbnails = next(iter(merged_video_paths_by_resolution.values()),
                                             None)
             if first_mp4_for_thumbnails:
-                generate_thumbnails(ffmpeg_executable, first_mp4_for_thumbnails, output_dir)
+                with _cores(THUMBNAIL_CORES, "thumbnail extraction"):
+                    generate_thumbnails(ffmpeg_executable, first_mp4_for_thumbnails,
+                                        output_dir)
             else:
                 log().warning("No mp4 source found for thumbnail generation.")
 
@@ -626,10 +655,11 @@ def _package_rendition(res_data, merged_mp4_path, merged_audio_path, ffmpeg_exec
     master playlist still listed it, so the job reported success with a
     broken ladder.
     """
-    ok = _generate_hls_for_resolution(
-        res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,
-        total_merged_duration, output_dir, hls_settings,
-        merged_force_times_str=force_times, frame_rate=res_data.get("frame_rate", ""))
+    with _cores(PACKAGING_CORES, f"HLS packaging of {res_data['name']}"):
+        ok = _generate_hls_for_resolution(
+            res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,
+            total_merged_duration, output_dir, hls_settings,
+            merged_force_times_str=force_times, frame_rate=res_data.get("frame_rate", ""))
     if not ok:
         raise TranscodeError(
             f"HLS packaging failed for rendition {res_data['name']}. The FFmpeg error "

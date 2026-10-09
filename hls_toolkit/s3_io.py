@@ -261,7 +261,9 @@ def upload_directory(local_dir, bucket: str, prefix: str,
                      extra_args_for: Optional[Callable[[Path], Dict]] = None) -> Dict:
     """Upload every file under `local_dir` to ``s3://bucket/prefix``.
 
-    Each object is verified with a HEAD (size match) after upload. The local
+    Files go up in parallel (``WZ_S3_UPLOAD_THREADS``, default 16) but phase by
+    phase — media, then playlists, then the master — and each object is
+    verified with a HEAD (size match) before the next phase starts. The local
     directory is removed only when every file has been confirmed present in S3,
     so a partial upload never silently loses the output.
 
@@ -291,57 +293,67 @@ def upload_directory(local_dir, bucket: str, prefix: str,
 
     client = get_s3_client(region)
     config = _transfer_config()
-    sent_bytes = 0
+    threads = upload_threads()
+    progress = {"files": 0, "bytes": 0}
+    progress_lock = threading.Lock()
     keys: List[str] = []
-    failures: List[str] = []
 
-    index = 0
-    for phase_name, group in zip(PUBLISH_PHASES, phases):
-        for path in group:
-            index += 1
+    def upload_one(path: Path):
+        """Upload one file and confirm it landed intact. Returns (key, error)."""
+        if ctx is not None and ctx.cancelled:
+            return None, "cancelled"
+        rel = path.relative_to(local_dir).as_posix()
+        key = f"{prefix}/{rel}" if prefix else rel
+        extra = {"ContentType": _content_type(path)}
+        if extra_args_for:
+            extra.update(extra_args_for(path) or {})
+        try:
+            client.upload_file(str(path), bucket, key, ExtraArgs=extra, Config=config)
+        except Exception as e:
+            _raise_environment_error(e, "UPLOADING")
+            log.error(f"Upload failed for {rel}: {e}")
+            return None, "upload failed"
+        if _verify_uploads(client, bucket, local_dir, [key], prefix, log):
+            return None, "verification failed"
+        size = path.stat().st_size
+        with progress_lock:
+            progress["files"] += 1
+            progress["bytes"] += size
+            done = progress["files"]
+            if ctx is not None:
+                ctx.advance_within_stage(done / len(files))
+            if done % 50 == 0 or done == len(files):
+                log.info(f"  uploaded {done}/{len(files)} "
+                         f"({_human(progress['bytes'])} / {_human(total_bytes)})")
+        return key, None
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="s3-upload") as pool:
+        for phase_name, group in zip(PUBLISH_PHASES, phases):
             if ctx is not None:
                 ctx.raise_if_cancelled()
-            rel = path.relative_to(local_dir).as_posix()
-            key = f"{prefix}/{rel}" if prefix else rel
-            extra = {"ContentType": _content_type(path)}
-            if extra_args_for:
-                extra.update(extra_args_for(path) or {})
-            try:
-                client.upload_file(str(path), bucket, key, ExtraArgs=extra, Config=config)
-                keys.append(key)
-            except Exception as e:
-                _raise_environment_error(e, "UPLOADING")
-                log.error(f"Upload failed for {rel}: {e}")
-                failures.append(rel)
-                continue
-
-            sent_bytes += path.stat().st_size
+            # Files within a phase go up in parallel; phases never overlap.
+            outcomes = list(pool.map(upload_one, group))
             if ctx is not None:
-                ctx.advance_within_stage(index / len(files))
-            if index % 50 == 0 or index == len(files):
-                log.info(f"  uploaded {index}/{len(files)} "
-                         f"({_human(sent_bytes)} / {_human(total_bytes)})")
+                ctx.raise_if_cancelled()
+            failures = [path.relative_to(local_dir).as_posix()
+                        for path, (_, error) in zip(group, outcomes) if error]
+            keys.extend(key for key, _ in outcomes if key)
 
-        # Stop at the phase boundary: publishing playlists (above all the
-        # master) over media that did not arrive would point viewers at
-        # missing files. The previously published playlists stay live instead.
-        if failures:
-            remaining = [name for name in PUBLISH_PHASES[PUBLISH_PHASES.index(phase_name) + 1:]]
-            raise TranscodeError(
-                f"{len(failures)} file(s) failed to upload to s3://{bucket}/{prefix}: "
-                f"{', '.join(failures[:10])}" + (" ..." if len(failures) > 10 else "")
-                + (f". The {' and '.join(remaining)} were not uploaded, so the "
-                   f"previously published package (if any) is still the live one."
-                   if remaining else ""),
-                stage="UPLOADING")
+            # Stop at the phase boundary: publishing playlists (above all the
+            # master) over media that did not arrive intact would point viewers
+            # at missing files. The previously published playlists stay live.
+            if failures:
+                remaining = list(PUBLISH_PHASES[PUBLISH_PHASES.index(phase_name) + 1:])
+                raise TranscodeError(
+                    f"{len(failures)} file(s) failed to upload to s3://{bucket}/{prefix}: "
+                    f"{', '.join(failures[:10])}" + (" ..." if len(failures) > 10 else "")
+                    + (f". The {' and '.join(remaining)} were not uploaded, so the "
+                       f"previously published package (if any) is still the live one."
+                       if remaining else ""),
+                    stage="UPLOADING")
+    sent_bytes = progress["bytes"]
 
-    log.info("Verifying uploaded objects...")
-    missing = _verify_uploads(client, bucket, local_dir, keys, prefix, log)
-    if missing:
-        raise TranscodeError(
-            f"Upload verification failed for {len(missing)} object(s): "
-            f"{', '.join(missing[:10])}" + (" ..." if len(missing) > 10 else ""),
-            stage="UPLOADING")
     log.info(f"All {len(keys)} object(s) verified in s3://{bucket}/{prefix}")
 
     if delete_local:
@@ -355,6 +367,13 @@ def upload_directory(local_dir, bucket: str, prefix: str,
     return {"uploaded": len(keys), "bytes": sent_bytes,
             "prefix": f"s3://{bucket}/{prefix}" if prefix else f"s3://{bucket}",
             "keys": keys}
+
+
+def upload_threads() -> int:
+    try:
+        return max(1, min(64, int(os.getenv("WZ_S3_UPLOAD_THREADS", "16"))))
+    except ValueError:
+        return 16
 
 
 def _is_master_playlist(path: Path) -> bool:

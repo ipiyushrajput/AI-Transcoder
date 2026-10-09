@@ -571,6 +571,55 @@ def test_single_job_uses_the_budget(work: Path, binaries: dict):
     check("both clips encode at once on a 32-core budget", overlap, 2)
 
 
+def test_every_ffmpeg_step_uses_the_budget(work: Path, binaries: dict):
+    """Loudnorm, packaging and thumbnails take cores too, and wait for them."""
+    print("non-encode steps use the CPU budget")
+    import threading
+    from hls_toolkit import cpu_budget
+    from hls_toolkit.runner import run_transcode_job
+
+    media = work / "budget_steps"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+    cpu_budget.reset_shared_budget()
+    budget = cpu_budget.get_shared_budget(8, slot_dir=str(media / "slots"))
+    costs = []
+    original = budget.acquire
+
+    def recording(cost, should_abort=None):
+        costs.append((sys._getframe(1).f_code.co_name, cost))
+        return original(cost, should_abort=should_abort)
+
+    budget.acquire = recording
+    try:
+        # Every core taken by "another job": the loudnorm pass must wait.
+        blocker = original(8)
+        result = {}
+        thread = threading.Thread(target=lambda: result.update(run_transcode_job(
+            config, overrides=_quick_overrides(source, upload=False, output_dir="steps",
+                                               audio_norm=True, thumbnails_enabled=True,
+                                               resolution="1080p,720p",
+                                               local_output_dir=str(media / "out")),
+            log_root=str(media / "logs"), work_root=str(media / "scratch"))))
+        thread.start()
+        time.sleep(2)
+        check_true("the loudnorm pass waits while other jobs hold every core",
+                   thread.is_alive() and costs == [("_cores", 1)], costs)
+        blocker.release()
+        thread.join(120)
+    finally:
+        budget.acquire = original
+        cpu_budget.reset_shared_budget()
+    check("the job then completes", result.get("status"), "COMPLETED")
+    main_thread = [cost for caller, cost in costs if caller == "_cores"]
+    check("loudnorm (1), packaging per rendition (1 each) and thumbnails (2) reserve "
+          "cores", sorted(main_thread), sorted([1, 1, 1, 2]))
+    check("every core is returned", budget.in_use(), 0)
+
+
 def _quick_overrides(source, **extra):
     """Overrides for a fast job: no ESAM, loudnorm or thumbnails."""
     overrides = {"input_video": str(source), "esam": False, "audio_norm": False,
@@ -696,7 +745,11 @@ def test_safe_publish(work: Path, binaries: dict):
     live_during_upload = []
     original_upload = client.upload_file
 
+    upload_threads = set()
+
     def watching_upload(filename, bucket, key, ExtraArgs=None, Config=None):
+        import threading
+        upload_threads.add(threading.current_thread().name)
         live_during_upload.append(
             (client._path(bucket, f"{prefix}/channel.m3u8")).is_file())
         return original_upload(filename, bucket, key, ExtraArgs=ExtraArgs, Config=Config)
@@ -722,6 +775,7 @@ def test_safe_publish(work: Path, binaries: dict):
                all(not k.endswith(".m3u8") for k in order[:first_playlist])
                and all(k.endswith(".m3u8") for k in order[first_playlist:]))
     check("the master playlist is uploaded last", order[-1], "channel.m3u8")
+    check_true("files go up in parallel", len(upload_threads) > 1, upload_threads)
     keys = {k.rsplit("/", 1)[-1] for k in client.keys_under(BUCKET, prefix)}
     check_true("the dropped rendition's playlist is removed afterwards",
                "channel_2160p.m3u8" not in keys)
@@ -1205,6 +1259,8 @@ def main():
         test_dead_jobs_are_cleaned_up(work, binaries)
         print()
         test_single_job_uses_the_budget(work, binaries)
+        print()
+        test_every_ffmpeg_step_uses_the_budget(work, binaries)
         print()
         test_parallel_cli_jobs(work, binaries)
         print()

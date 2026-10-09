@@ -25,7 +25,7 @@ owns the machine. See [Parallel jobs](#parallel-jobs).
 ```bash
 git clone <this-repo> && cd AI-Transcoder
 python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.lock      # the exact, tested versions (ranges: requirements.txt)
 
 # Edit inputs, ladder and S3 destination
 $EDITOR config.json
@@ -151,8 +151,10 @@ published. A rendition that fails to package fails the job at `PACKAGING_HLS`.
 **Republishing never takes the live output down.** Nothing is deleted first.
 The upload goes in three phases — segments, subtitles and thumbnails, then the
 variant playlists, then the master playlist last — so a player or CDN never sees
-a playlist before the files it references. If a file fails to upload the job
-stops at that phase boundary: no playlist is published over missing media, and
+a playlist before the files it references. Files within a phase go up in
+parallel (`WZ_S3_UPLOAD_THREADS`, default 16), and each is HEADed and
+size-checked as it lands, before the next phase starts. If a file fails to
+upload or verify, the job stops at that phase boundary: no playlist is published over missing media, and
 the previously published package stays live. Only after every new object is
 verified are files the new package no longer has (a dropped rendition, surplus
 old segments) removed.
@@ -257,6 +259,11 @@ CPU and competed for it rather than sharing it.
 None of this touched FFmpeg. The encoder settings — preset, CRF, `threads`,
 `codec_params`, GOP — and the FFmpeg command lines themselves are byte-for-byte
 the same as before; only *when* each encode starts is different.
+
+Loudnorm analysis (1 core), HLS packaging (1 core per rendition) and thumbnail
+extraction (2 cores) reserve from the same budget as the clip encodes, so they
+no longer run on top of a budget that other jobs' encodes have already filled.
+The FFmpeg commands themselves are unchanged.
 
 ### Sizing
 
