@@ -480,7 +480,9 @@ def read_logs(job_id: str, which: str = "job", tail: int = 200) -> Dict[str, Any
     if not os.path.exists(path):
         return {"found": True, "log_dir": log_dir, "path": path,
                 "content": "", "type": which,
-                "note": "Log file does not exist yet."}
+                "note": ("Log file does not exist yet." if os.path.isdir(log_dir) else
+                         "The job's log folder no longer exists (it may have been "
+                         "removed under LOG_RETENTION_DAYS).")}
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()

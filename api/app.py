@@ -102,6 +102,10 @@ def create_app(config_path: str = None) -> Flask:
         # Settle what a previous process left behind: interrupted RUNNING jobs
         # are marked FAILED, queued PENDING jobs are queued again.
         job_manager.recover_on_startup()
+    # Remove scratch folders of jobs that died with the previous process, and
+    # job logs past LOG_RETENTION_DAYS.
+    from hls_toolkit import housekeeping
+    housekeeping.run_periodic(job_manager.WORK_ROOT, job_manager.LOG_ROOT, force=True)
 
     app.register_blueprint(api_bp)
     app.register_blueprint(health_bp)

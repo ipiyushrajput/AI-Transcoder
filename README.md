@@ -380,6 +380,18 @@ reservation automatically.
 | `WZ_DISK_MIN_FREE_BYTES` | 1 GiB | Always left free for everything else |
 | `WZ_DISK_WAIT_SECONDS` | `1800` | How long to wait for space before failing |
 
+### Cleanup
+
+A job removes its scratch folder when it ends. A job that is killed
+(`kill -9`, out of memory, power loss) cannot, so each scratch folder carries
+an owner file its job keeps locked while alive; every job, and the API at
+start-up, removes `aitx_*` folders whose owner is gone (at most once every
+10 minutes per machine). Folders kept by `--debug` are never removed.
+
+Set `LOG_RETENTION_DAYS` to remove job log folders (`logs/...`) once nothing in
+them has changed for that many days. It is `0` (keep for ever) by default.
+Database records are kept; their log endpoint then says the folder is gone.
+
 ### Other sections
 
 `paths` (FFmpeg locations), `thumbnail_generation`, `audio_normalization`,

@@ -651,6 +651,63 @@ def test_disk_space_is_reserved(work: Path, binaries: dict):
     check("its reservation is released when it ends", leftovers, [])
 
 
+def test_dead_jobs_are_cleaned_up(work: Path, binaries: dict):
+    """A CLI job killed with -9 leaves scratch behind; the next job removes it."""
+    print("cleanup after killed jobs")
+    import subprocess
+    import time
+    from hls_toolkit import housekeeping
+    from hls_toolkit.runner import run_transcode_job
+
+    media = work / "janitor"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    scratch = media / "scratch"
+    config = build_config(work, binaries)
+    config["defaults"].update({"input_video": str(source), "subtitle_file": None})
+    path = media / "config.json"
+    path.write_text(json.dumps(config))
+    coord = {"WZ_CPU_SLOT_DIR": str(media / "coord")}
+
+    proc = subprocess.Popen(
+        [sys.executable, "app.py", "--config", str(path), "--no-upload", "--no-esam",
+         "--no-audio-norm", "--no-generate-thumbnails", "--work-dir", str(scratch),
+         "--log-dir", str(media / "logs"), "--local-output-dir", str(media / "out")],
+        cwd=str(ROOT), env=dict(os.environ, FAKE_HANG="video", **coord),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.time() + 60
+    while time.time() < deadline and not list(scratch.glob("aitx_*/temp/*")):
+        time.sleep(0.1)
+    proc.kill()
+    proc.wait()
+    left = list(scratch.glob("aitx_*"))
+    check("a killed job leaves its scratch folder behind", len(left), 1)
+    # Pretend it died a while ago: a fresh folder is never judged, and sweeps
+    # run at most every few minutes (the killed job swept when it started).
+    old = time.time() - 3600
+    for folder in left:
+        os.utime(folder / housekeeping.OWNER_FILE, (old, old))
+    os.utime(media / "coord" / "housekeeping.stamp", (old, old))
+
+    def run(debug=False):
+        return run_transcode_job(
+            config, overrides=_quick_overrides(source, upload=False, output_dir="janitor",
+                                               local_output_dir=str(media / "out"),
+                                               debug=debug),
+            log_root=str(media / "logs"), work_root=str(scratch))
+
+    result = _with_env(coord, run)
+    check("the next job runs normally", result["status"], "COMPLETED")
+    check("…and removes the dead job's scratch", list(scratch.glob("aitx_*")), [])
+
+    kept = _with_env(coord, lambda: run(debug=True))
+    check("a --debug job completes", kept["status"], "COMPLETED")
+    _with_env(coord, lambda: housekeeping.run_periodic(scratch, force=True))
+    check("…and its kept scratch survives later sweeps",
+          len(list(scratch.glob("aitx_*"))), 1)
+
+
 def _with_env(env: dict, fn):
     previous = {k: os.environ.get(k) for k in env}
     os.environ.update(env)
@@ -922,6 +979,8 @@ def main():
         test_hung_ffmpeg_is_stopped(work, binaries)
         print()
         test_disk_space_is_reserved(work, binaries)
+        print()
+        test_dead_jobs_are_cleaned_up(work, binaries)
         print()
         test_single_job_uses_the_budget(work, binaries)
         print()

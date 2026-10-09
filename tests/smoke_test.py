@@ -477,6 +477,107 @@ def test_disk_budget(work):
             os.environ["WZ_CPU_SLOT_DIR"] = saved_env
 
 
+def test_housekeeping(work):
+    """Dead jobs' scratch folders and old logs go; anything alive or kept stays."""
+    print("housekeeping")
+    import subprocess
+    import time
+    from hls_toolkit import housekeeping as hk
+
+    root = work / "janitor"
+    root.mkdir()
+    old = time.time() - 3600
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def scratch(name, owner=True, aged=True):
+        folder = root / f"aitx_{name}"
+        (folder / "input").mkdir(parents=True)
+        (folder / "input" / "source.mp4").write_bytes(b"x" * 100)
+        if owner:
+            hk.ScratchOwner(folder).release()
+            if aged:
+                os.utime(folder / hk.OWNER_FILE, (old, old))
+        return folder
+
+    dead = scratch("dead")
+    young = scratch("young", aged=False)
+    foreign = scratch("foreign", owner=False)
+    kept = scratch("kept")
+    (kept / hk.KEEP_FILE).write_text("debug")
+    unrelated = root / "something_else"
+    unrelated.mkdir()
+
+    live_here = root / "aitx_live_here"
+    live_here.mkdir()
+    holder_here = hk.ScratchOwner(live_here)
+    os.utime(live_here / hk.OWNER_FILE, (old, old))
+
+    live_there = root / "aitx_live_there"
+    live_there.mkdir()
+    holder = subprocess.Popen([sys.executable, "-c", (
+        "import os, sys, time; sys.path.insert(0, %r)\n"
+        "from hls_toolkit.housekeeping import ScratchOwner, OWNER_FILE\n"
+        "o = ScratchOwner(%r); t = time.time() - 3600\n"
+        "os.utime(os.path.join(%r, OWNER_FILE), (t, t))\n"
+        "print('held', flush=True); time.sleep(60)\n")
+        % (repo, str(live_there), str(live_there))], stdout=subprocess.PIPE, text=True)
+    check("another process owns a folder", holder.stdout.readline().strip(), "held")
+
+    removed = hk.sweep_scratch(root)
+    check("only the dead job's folder is removed", removed, 1)
+    check_true("…it is gone", not dead.exists())
+    for folder, why in ((young, "a brand-new folder"), (foreign, "a folder not made by a job"),
+                        (kept, "a --debug folder"), (unrelated, "an unrelated folder"),
+                        (live_here, "a folder this process's job owns"),
+                        (live_there, "a folder another live process owns")):
+        check_true(f"{why} is left alone", folder.exists())
+
+    holder.kill()
+    holder.wait()
+    holder_here.release()
+    check("once their jobs die, their folders go too", hk.sweep_scratch(root), 2)
+
+    # Log retention.
+    logs = work / "janitor_logs"
+    stale_cli = logs / "ShowA_2"
+    stale_api = logs / "ShowB" / "job-old"
+    fresh_api = logs / "ShowB" / "job-new"
+    lonely = logs / "ShowC" / "job-only"
+    for folder in (stale_cli, stale_api, fresh_api, lonely):
+        folder.mkdir(parents=True)
+        (folder / "job.json").write_text("{}")
+        (folder / "job.log").write_text("log")
+    ancient = time.time() - 40 * 86400
+    for folder in (stale_cli, stale_api, lonely):
+        for path in [folder, *folder.iterdir()]:
+            os.utime(path, (ancient, ancient))
+    os.utime(fresh_api / "job.log", (ancient, ancient))   # job.json still fresh
+    check("retention is off by default", hk.sweep_logs(logs), 0)
+    check("old job folders are removed after LOG_RETENTION_DAYS",
+          hk.sweep_logs(logs, days=30), 3)
+    check_true("a folder with any recent file is kept", fresh_api.exists())
+    check_true("an emptied channel folder is removed", not (logs / "ShowC").exists())
+    check_true("a channel with jobs left is kept", (logs / "ShowB").exists())
+
+    # The periodic sweep runs once per interval across processes.
+    saved = os.environ.get("WZ_CPU_SLOT_DIR")
+    os.environ["WZ_CPU_SLOT_DIR"] = str(work / "coord_janitor")
+    try:
+        first = scratch("dead_again")
+        hk.run_periodic(root)
+        check_true("the first periodic sweep runs", not first.exists())
+        second = scratch("dead_later")
+        hk.run_periodic(root)
+        check_true("a second sweep within the interval is skipped", second.exists())
+        hk.run_periodic(root, force=True)
+        check_true("…unless forced (API start-up)", not second.exists())
+    finally:
+        if saved is None:
+            os.environ.pop("WZ_CPU_SLOT_DIR", None)
+        else:
+            os.environ["WZ_CPU_SLOT_DIR"] = saved
+
+
 def test_transcode_scheduling():
     """Cost estimates and the order clips are released into the budget."""
     print("transcode scheduling")
@@ -667,6 +768,7 @@ def main():
         test_package_validator(work)
         test_cpu_budget(work)
         test_disk_budget(work)
+        test_housekeeping(work)
         test_transcode_scheduling()
         test_unique_log_dirs(work)
         test_job_progress_isolation(work)

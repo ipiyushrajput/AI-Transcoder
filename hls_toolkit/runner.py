@@ -13,7 +13,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from hls_toolkit import disk_budget, s3_io
+from hls_toolkit import disk_budget, housekeeping, s3_io
 from hls_toolkit.ffmpeg_wrapper import configure_watchdog
 from hls_toolkit.hls_generator import generate_hls_workflow
 from hls_toolkit.job_context import (JobCancelled, JobContext, TranscodeError,
@@ -176,7 +176,11 @@ def run_transcode_job(config: Dict[str, Any],
 
     if work_root:
         Path(work_root).mkdir(parents=True, exist_ok=True)
-    work_dir = Path(tempfile.mkdtemp(prefix=f"aitx_{ctx.channel[:24]}_", dir=work_root))
+    work_dir = Path(tempfile.mkdtemp(prefix=f"{housekeeping.SCRATCH_PREFIX}{ctx.channel[:24]}_",
+                                     dir=work_root))
+    # Held while this job lives, so a later job can tell our folder from one
+    # left behind by a job that was killed.
+    owner = housekeeping.ScratchOwner(work_dir)
     output_dir = work_dir / settings["output_dir_name"]
     temp_dir = work_dir / "temp"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -190,6 +194,7 @@ def run_transcode_job(config: Dict[str, Any],
 
     try:
         _ensure_within(output_dir, work_dir, "output folder")
+        housekeeping.run_periodic(work_root, log_root, ctx=ctx)
         ctx.mark_running()
         ctx.set_stage("FETCHING_INPUT", 0.0)
         reservation = _reserve_scratch(input_uri, settings, defaults,
@@ -266,7 +271,10 @@ def run_transcode_job(config: Dict[str, Any],
         ctx.logger.error("Unhandled error in transcode job\n" + traceback.format_exc())
         ctx.mark_failed(f"{type(e).__name__}: {e}")
     finally:
+        if settings["debug"]:
+            owner.keep()
         _remove_work_dir(work_dir, keep=settings["debug"], ctx=ctx)
+        owner.release()
         if reservation is not None:
             reservation.release()
         bind_context(None)

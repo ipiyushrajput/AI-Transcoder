@@ -315,8 +315,11 @@ class JobContext:
 
     def _write_meta(self) -> None:
         try:
-            self.meta_path.write_text(json.dumps(self.snapshot(), indent=2),
-                                      encoding="utf-8")
+            # Write then rename, so a reader (or a crash) never sees half a file.
+            tmp = self.meta_path.with_name(
+                f".{self.meta_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(self.snapshot(), indent=2), encoding="utf-8")
+            os.replace(tmp, self.meta_path)
         except Exception:
             pass
 
