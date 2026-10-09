@@ -364,6 +364,22 @@ The environment variable wins over the config value; `0` disables a limit.
 Slow encodes keep advancing, so the stall limit only stops a genuine hang — it
 never shortens a long encode.
 
+### Scratch disk
+
+Before downloading, each job reserves about *source size × factor* of space on
+its scratch disk (`--work-dir` / `WORK_ROOT`, or the system temp). Reservations
+are shared by every job on the machine, so parallel jobs cannot fill the disk
+together: a job that fits starts at once, one that would fit after others
+finish waits (logging why), and one that could never fit fails immediately at
+`FETCHING_INPUT` with the sizes involved. A job that dies frees its
+reservation automatically.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `WZ_DISK_SPACE_FACTOR` / `defaults.disk_space_factor` | `3` | Scratch needed per byte of source (one less for a local source, which is not copied) |
+| `WZ_DISK_MIN_FREE_BYTES` | 1 GiB | Always left free for everything else |
+| `WZ_DISK_WAIT_SECONDS` | `1800` | How long to wait for space before failing |
+
 ### Other sections
 
 `paths` (FFmpeg locations), `thumbnail_generation`, `audio_normalization`,

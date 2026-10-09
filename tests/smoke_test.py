@@ -365,6 +365,118 @@ def test_cpu_budget(work):
                                          if not n.startswith(".")], [])
 
 
+def test_disk_budget(work):
+    """Scratch reservations: shared, waited for, refused when hopeless, never leaked."""
+    print("disk budget")
+    import subprocess
+    import threading
+    import time
+    from hls_toolkit import disk_budget
+    from hls_toolkit.job_context import JobCancelled, TranscodeError
+
+    GB = 1024 ** 3
+    root = work / "scratch"
+    root.mkdir()
+    saved_env = os.environ.get("WZ_CPU_SLOT_DIR")
+    saved_free = disk_budget._free_bytes
+    os.environ["WZ_CPU_SLOT_DIR"] = str(work / "coord_disk")
+    disk_budget._free_bytes = lambda path: 10 * GB      # pretend 10 GB is free
+    try:
+        first = disk_budget.reserve(root, root / "a", 6 * GB, min_free_bytes=GB,
+                                    max_wait_seconds=0)
+        check("a job that fits is reserved", first.nbytes, 6 * GB)
+
+        # 10 free - 6 held - 1 spare = 3 available: 4 GB must wait (and here, give up).
+        try:
+            disk_budget.reserve(root, root / "b", 4 * GB, min_free_bytes=GB,
+                                max_wait_seconds=0)
+            check("a job that would overcommit waits", "reserved", "waited")
+        except TranscodeError as e:
+            check_true("a job that would overcommit waits", "Waited" in str(e), str(e))
+
+        # More than the disk could ever give is refused at once, with numbers.
+        started = time.time()
+        try:
+            disk_budget.reserve(root, root / "c", 50 * GB, min_free_bytes=GB,
+                                max_wait_seconds=60)
+            check("an impossible job is refused", "reserved", "refused")
+        except TranscodeError as e:
+            check_true("an impossible job is refused", "Not enough scratch space" in str(e)
+                       and e.stage == "FETCHING_INPUT", str(e))
+        check_true("…without waiting", time.time() - started < 2.0)
+
+        # A waiting job starts as soon as the space is released.
+        result = {}
+
+        def waiter():
+            result["r"] = disk_budget.reserve(root, root / "d", 4 * GB, min_free_bytes=GB,
+                                              max_wait_seconds=30)
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        time.sleep(0.3)
+        check_true("the second job is still waiting", thread.is_alive())
+        first.release()
+        first.release()                                   # idempotent
+        thread.join(15)
+        check_true("it starts once the space is released", "r" in result)
+        result["r"].release()
+
+        # Space other jobs have already written counts as used, not as held twice.
+        (root / "e").mkdir()
+        held = disk_budget.reserve(root, root / "e", 6 * GB, min_free_bytes=GB,
+                                   max_wait_seconds=0)
+        (root / "e" / "blob").write_bytes(b"x" * 1024)
+        disk_budget._free_bytes = lambda path: 10 * GB - 1024
+        again = disk_budget.reserve(root, root / "f", 3 * GB - 2048, min_free_bytes=GB,
+                                    max_wait_seconds=0)
+        check_true("written bytes are not counted twice", again.nbytes > 0)
+        again.release()
+        held.release()
+
+        # Cancelling a waiting job stops the wait.
+        hog = disk_budget.reserve(root, root / "g", 8 * GB, min_free_bytes=GB,
+                                  max_wait_seconds=0)
+        stop = threading.Event()
+        threading.Timer(0.3, stop.set).start()
+        try:
+            disk_budget.reserve(root, root / "h", 4 * GB, min_free_bytes=GB,
+                                should_abort=stop.is_set, max_wait_seconds=30)
+            check("a cancelled wait is abandoned", "reserved", "cancelled")
+        except JobCancelled:
+            check("a cancelled wait is abandoned", "cancelled", "cancelled")
+        hog.release()
+
+        # A job killed while holding space must not keep it.
+        holder = subprocess.Popen([sys.executable, "-c", (
+            "import sys, time; sys.path.insert(0, %r)\n"
+            "from hls_toolkit import disk_budget\n"
+            "disk_budget._free_bytes = lambda path: 10 * 1024 ** 3\n"
+            "r = disk_budget.reserve(%r, %r, 8 * 1024 ** 3, min_free_bytes=1024 ** 3)\n"
+            "print('held', flush=True); time.sleep(60)\n")
+            % (os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+               str(root), str(root / "dead"))],
+            stdout=subprocess.PIPE, text=True, env=dict(os.environ))
+        check("another process holds 8 GB", holder.stdout.readline().strip(), "held")
+        try:
+            disk_budget.reserve(root, root / "i", 4 * GB, min_free_bytes=GB,
+                                max_wait_seconds=0)
+            check("the hold is visible across processes", "reserved", "blocked")
+        except TranscodeError:
+            check("the hold is visible across processes", "blocked", "blocked")
+        holder.kill()
+        holder.wait()
+        after = disk_budget.reserve(root, root / "i", 4 * GB, min_free_bytes=GB,
+                                    max_wait_seconds=0)
+        check("kill -9 releases the dead job's space", after.nbytes, 4 * GB)
+        after.release()
+    finally:
+        disk_budget._free_bytes = saved_free
+        if saved_env is None:
+            os.environ.pop("WZ_CPU_SLOT_DIR", None)
+        else:
+            os.environ["WZ_CPU_SLOT_DIR"] = saved_env
+
+
 def test_transcode_scheduling():
     """Cost estimates and the order clips are released into the budget."""
     print("transcode scheduling")
@@ -554,6 +666,7 @@ def main():
         test_output_dir_names()
         test_package_validator(work)
         test_cpu_budget(work)
+        test_disk_budget(work)
         test_transcode_scheduling()
         test_unique_log_dirs(work)
         test_job_progress_isolation(work)

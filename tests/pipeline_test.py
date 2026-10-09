@@ -614,6 +614,43 @@ def test_broken_packages_are_not_published(work: Path, binaries: dict):
               client.keys_under(BUCKET, f"Visionular/V3/broken_{switch.lower()}"), [])
 
 
+def test_disk_space_is_reserved(work: Path, binaries: dict):
+    """A job that cannot fit on the scratch disk fails before downloading anything."""
+    print("disk space reservation")
+    from hls_toolkit import s3_io
+    from hls_toolkit.runner import run_transcode_job
+
+    client = fake_s3.install(s3_io, work / "s3_disk")
+    media = work / "disk"
+    media.mkdir(parents=True, exist_ok=True)
+    source_uri = client.put(BUCKET, f"inputs/{CHANNEL}.mp4", os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+
+    def run():
+        return run_transcode_job(
+            config, overrides=_quick_overrides(source_uri, upload=False, output_dir="disk",
+                                               local_output_dir=str(media / "out")),
+            log_root=str(media / "logs"), work_root=str(media / "scratch"))
+
+    coord = {"WZ_CPU_SLOT_DIR": str(media / "coord")}
+    # 4 KB x 10^15 is far more than any disk has.
+    result = _with_env({**coord, "WZ_DISK_SPACE_FACTOR": "1e15"}, run)
+    check("a job too big for the disk fails", result["status"], "FAILED")
+    check("…while fetching its input", result["stage"], "FETCHING_INPUT")
+    check_true("…saying how much space it needs",
+               "Not enough scratch space" in (result["error_message"] or ""),
+               result["error_message"])
+    check("…without downloading the source", client.downloads, [])
+
+    ok = _with_env(coord, run)
+    check("a job that fits runs normally", ok["status"], "COMPLETED")
+    logs = " ".join(p.read_text() for p in (media / "logs").rglob("job.log"))
+    check_true("…after reserving its space", "Reserved" in logs)
+    leftovers = list((media / "coord" / "disk").rglob("*.json"))
+    check("its reservation is released when it ends", leftovers, [])
+
+
 def _with_env(env: dict, fn):
     previous = {k: os.environ.get(k) for k in env}
     os.environ.update(env)
@@ -883,6 +920,8 @@ def main():
         test_broken_packages_are_not_published(work, binaries)
         print()
         test_hung_ffmpeg_is_stopped(work, binaries)
+        print()
+        test_disk_space_is_reserved(work, binaries)
         print()
         test_single_job_uses_the_budget(work, binaries)
         print()

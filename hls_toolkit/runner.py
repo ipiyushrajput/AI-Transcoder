@@ -13,7 +13,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from hls_toolkit import s3_io
+from hls_toolkit import disk_budget, s3_io
 from hls_toolkit.ffmpeg_wrapper import configure_watchdog
 from hls_toolkit.hls_generator import generate_hls_workflow
 from hls_toolkit.job_context import (JobCancelled, JobContext, TranscodeError,
@@ -186,11 +186,14 @@ def run_transcode_job(config: Dict[str, Any],
     # one. Either way the package must leave the scratch directory before that
     # is removed, or it is lost.
     keep_local_copy = (not settings["upload"]) or (not settings["delete_local_output"])
+    reservation = None
 
     try:
         _ensure_within(output_dir, work_dir, "output folder")
         ctx.mark_running()
         ctx.set_stage("FETCHING_INPUT", 0.0)
+        reservation = _reserve_scratch(input_uri, settings, defaults,
+                                       work_root, work_dir, ctx)
 
         local_input = s3_io.resolve_input(input_uri, work_dir, "Input video",
                                           ctx=ctx, region=settings["s3_region"])
@@ -264,9 +267,34 @@ def run_transcode_job(config: Dict[str, Any],
         ctx.mark_failed(f"{type(e).__name__}: {e}")
     finally:
         _remove_work_dir(work_dir, keep=settings["debug"], ctx=ctx)
+        if reservation is not None:
+            reservation.release()
         bind_context(None)
 
     return ctx.snapshot()
+
+
+def _reserve_scratch(input_uri: str, settings: Dict[str, Any], defaults: Dict[str, Any],
+                     work_root: Optional[str], work_dir: Path, ctx: JobContext):
+    """Hold this job's share of scratch space before anything is downloaded.
+
+    The estimate is the source size times the space factor: the downloaded
+    copy, the encoded clips, the merged renditions and the HLS segments. A
+    local source is not copied, so it counts one factor less.
+    """
+    factor = disk_budget.space_factor(defaults.get("disk_space_factor"))
+    if s3_io.is_s3_uri(input_uri):
+        size = int(s3_io.head_object(input_uri, region=settings["s3_region"])
+                   .get("ContentLength", 0))
+        needed = size * factor
+    else:
+        local = os.path.abspath(os.path.expanduser(str(input_uri)))
+        if not os.path.isfile(local):
+            return None             # resolve_input reports the missing file
+        needed = os.path.getsize(local) * max(0.0, factor - 1)
+    return disk_budget.reserve(work_root or tempfile.gettempdir(), work_dir, needed,
+                               label=ctx.channel, ctx=ctx,
+                               should_abort=lambda: ctx.cancelled)
 
 
 def _save_package(output_dir: Path, settings: Dict[str, Any], ctx: JobContext) -> Path:
