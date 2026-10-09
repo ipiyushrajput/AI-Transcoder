@@ -5,10 +5,12 @@ import subprocess
 import shlex
 import math
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
 from hls_toolkit import s3_io, time_utils
+from hls_toolkit.cpu_budget import BudgetAcquireAborted, get_shared_budget
 from hls_toolkit.job_context import (JobCancelled, JobContext, TranscodeError,
                                      current_context, log)
 from hls_toolkit.esam_parser import (parse_esam_xml_string, parse_mcc_xml_asset_tags,
@@ -18,10 +20,35 @@ from hls_toolkit.ffmpeg_wrapper import (get_video_info, run_loudnorm_analysis,
                                         _generate_hls_for_resolution, generate_thumbnails,
                                         _get_video_stream_details, _get_h264_profile_idc,
                                         get_ffprobe_first_pts, validate_clippings)
+from hls_toolkit.package_validator import validate_package
 from hls_toolkit.playlist_utils import create_master_playlist, parse_variant_segments
 from hls_toolkit.subtitle_processor import (generate_merged_subtitle_file,
                                             segment_vtt_for_hls)
 from hls_toolkit.time_utils import timecode_to_seconds, seconds_to_timecode
+
+
+# Cores the non-encode FFmpeg steps reserve from the shared CPU budget. They
+# used to run outside it, so other jobs' encodes could fill every core while
+# these ran on top. Stream-copy packaging and the loudnorm pass use about one
+# core; thumbnail extraction decodes video and uses about two.
+LOUDNORM_CORES = 1
+PACKAGING_CORES = 1
+THUMBNAIL_CORES = 2
+
+
+@contextmanager
+def _cores(count: int, what: str):
+    """Hold `count` cores of the shared budget while `what` runs."""
+    ctx = current_context()
+    budget = get_shared_budget()
+    try:
+        lease = budget.acquire(count, should_abort=lambda: ctx is not None and ctx.cancelled)
+    except BudgetAcquireAborted:
+        raise JobCancelled(f"Cancelled while waiting for CPU to run {what}") from None
+    try:
+        yield
+    finally:
+        lease.release()
 
 
 def validate_unique_rung_names(template_name: str,
@@ -374,9 +401,10 @@ def generate_hls_workflow(config: Dict[str, Any],
                 log().info("Performing loudnorm analysis on the full video for "
                              f"{loudnorm_analysis_duration:.3f} seconds.")
 
-            loudnorm_analysis_results = run_loudnorm_analysis(
-                ffmpeg_executable, audio_analysis_input, cwd=temp_dir,
-                duration=loudnorm_analysis_duration)
+            with _cores(LOUDNORM_CORES, "the loudnorm analysis"):
+                loudnorm_analysis_results = run_loudnorm_analysis(
+                    ffmpeg_executable, audio_analysis_input, cwd=temp_dir,
+                    duration=loudnorm_analysis_duration)
             if not loudnorm_analysis_results:
                 log().warning("Warning: Loudnorm analysis failed. "
                                 "Audio normalization will be skipped.")
@@ -433,14 +461,15 @@ def generate_hls_workflow(config: Dict[str, Any],
                                   packaged / max(1, len(selected_resolutions_data)))
                 res_name = res_data["name"]
                 merged_mp4_path = merged_video_paths_by_resolution.get(res_name)
-                if merged_mp4_path:
-                    hls_playlist_res_path = output_dir / f"channel_{res_name}.m3u8"
-                    if _generate_hls_for_resolution(
-                            res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,
-                            total_merged_duration, output_dir, hls_settings,
-                            merged_force_times_str=merged_timeline_cue_points_str,
-                            frame_rate=res_data.get("frame_rate", "")):
-                        hls_output_paths.append(hls_playlist_res_path)
+                if not merged_mp4_path:
+                    raise TranscodeError(
+                        f"No transcoded video was produced for rendition {res_name}, "
+                        f"so it cannot be packaged.", stage="PACKAGING_HLS")
+                _package_rendition(
+                    res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,
+                    total_merged_duration, output_dir, hls_settings,
+                    merged_timeline_cue_points_str)
+                hls_output_paths.append(output_dir / f"channel_{res_name}.m3u8")
         else:
             merged_audio_path = os.path.abspath(input_video)
             for res_data in selected_resolutions_data:
@@ -449,12 +478,11 @@ def generate_hls_workflow(config: Dict[str, Any],
                     res_name, os.path.abspath(input_video))
                 if merged_mp4_path:
                     hls_playlist_res_path = output_dir / f"channel_{res_name}.m3u8"
-                    if _generate_hls_for_resolution(
-                            res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,
-                            total_merged_duration, output_dir, hls_settings,
-                            merged_force_times_str=merged_timeline_cue_points_str,
-                            frame_rate=res_data.get("frame_rate", "")):
-                        hls_output_paths.append(hls_playlist_res_path)
+                    _package_rendition(
+                        res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,
+                        total_merged_duration, output_dir, hls_settings,
+                        merged_timeline_cue_points_str)
+                    hls_output_paths.append(hls_playlist_res_path)
 
         _ = []
         video_segments = []
@@ -525,7 +553,9 @@ def generate_hls_workflow(config: Dict[str, Any],
             first_mp4_for_thumbnails = next(iter(merged_video_paths_by_resolution.values()),
                                             None)
             if first_mp4_for_thumbnails:
-                generate_thumbnails(ffmpeg_executable, first_mp4_for_thumbnails, output_dir)
+                with _cores(THUMBNAIL_CORES, "thumbnail extraction"):
+                    generate_thumbnails(ffmpeg_executable, first_mp4_for_thumbnails,
+                                        output_dir)
             else:
                 log().warning("No mp4 source found for thumbnail generation.")
 
@@ -537,6 +567,20 @@ def generate_hls_workflow(config: Dict[str, Any],
                     log().info(f"Injecting ESAM markers into {playlist_path.name}")
                     process_playlist(str(playlist_path), events, asset_tags_map,
                                      video_segments=video_segments)
+
+        # --- validate the finished package --------------------------------
+        if ctx is not None:
+            ctx.set_stage("VALIDATING_OUTPUT", 0.0)
+        summary = validate_package(
+            output_dir, [r["name"] for r in selected_resolutions_data],
+            expected_duration=total_merged_duration,
+            hls_time=float(hls_settings.get("hls_time", 6)),
+            expect_thumbnails=bool(thumbnails_enabled))
+        log().info("Package validated: " + ", ".join(
+            f"{uri} {info['segments']} segment(s) / {info['duration']:.3f}s"
+            for uri, info in summary["renditions"].items()))
+        if ctx is not None:
+            ctx.metadata["package"] = summary
 
         # --- publish to S3 -------------------------------------------------
         s3_bucket_name_local = s3_config.get("bucket_name")
@@ -554,11 +598,16 @@ def generate_hls_workflow(config: Dict[str, Any],
                                                            output_dir_name)
             log().info(f"Publishing output to s3://{s3_bucket_name_local}/"
                        f"{destination_prefix}")
-            s3_io.delete_prefix(s3_bucket_name_local, destination_prefix,
-                                ctx=ctx, region=s3_region)
+            # Upload over the live output in place, master last; files from an
+            # earlier run are removed only once the new package is verified.
             upload_result = s3_io.upload_directory(
                 output_dir, s3_bucket_name_local, destination_prefix,
                 ctx=ctx, region=s3_region, delete_local=delete_local_output)
+            cleanup = s3_io.remove_stale_objects(
+                s3_bucket_name_local, destination_prefix, upload_result["keys"],
+                ctx=ctx, region=s3_region)
+            if ctx is not None and cleanup["failed"]:
+                ctx.metadata["stale_objects_not_removed"] = cleanup["failed"]
             playback_url = (f"{upload_result['prefix']}/"
                             f"{master_playlist_path.name}")
             log().info(f"Output published: {upload_result['uploaded']} object(s), "
@@ -570,7 +619,8 @@ def generate_hls_workflow(config: Dict[str, Any],
                 ctx.metadata["s3_bucket"] = s3_bucket_name_local
                 ctx.metadata["s3_prefix"] = destination_prefix
         else:
-            log().info(f"Upload disabled — output kept locally at {output_dir}")
+            log().info(f"Upload disabled — the package is staged at {output_dir} and "
+                       f"will be saved to the local output folder.")
             if ctx is not None:
                 ctx.output_prefix = str(output_dir)
                 ctx.metadata["playback_url"] = str(master_playlist_path)
@@ -594,6 +644,26 @@ def generate_hls_workflow(config: Dict[str, Any],
         _cleanup_temp_dirs(temp_clipping_dir, debug)
 
     return 0
+
+
+def _package_rendition(res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,
+                       total_merged_duration, output_dir, hls_settings,
+                       force_times: str) -> None:
+    """Package one rendition as HLS, or fail the job naming it.
+
+    A rendition that failed to package used to be skipped silently while the
+    master playlist still listed it, so the job reported success with a
+    broken ladder.
+    """
+    with _cores(PACKAGING_CORES, f"HLS packaging of {res_data['name']}"):
+        ok = _generate_hls_for_resolution(
+            res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,
+            total_merged_duration, output_dir, hls_settings,
+            merged_force_times_str=force_times, frame_rate=res_data.get("frame_rate", ""))
+    if not ok:
+        raise TranscodeError(
+            f"HLS packaging failed for rendition {res_data['name']}. The FFmpeg error "
+            f"is in error.log and the full output in ffmpeg.log.", stage="PACKAGING_HLS")
 
 
 def _cleanup_temp_dirs(temp_clipping_dir, debug: bool) -> None:

@@ -6,6 +6,8 @@ All request and response bodies are JSON.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Liveness, database state, queue depth |
+| `GET` | `/ready` | `200` when a job can run now; `503` naming the failed check |
+| `GET` | `/metrics` | Prometheus metrics |
 | `POST` | `/api/v1/jobs` (alias `/api/v1/jobs/start`) | Queue a transcoding job |
 | `GET` | `/api/v1/jobs` | List jobs (paginated, filterable) |
 | `GET` | `/api/v1/jobs/<job_id>` | Full record: settings, ladder, clips, config snapshot |
@@ -81,7 +83,45 @@ id is issued, so a rejected request never appears in the job list:
 ```
 
 Rejected for: missing/unreadable input, unknown template, unknown resolution,
-`upload` with no bucket configured, or a missing FFmpeg binary.
+`upload` with no bucket configured, a missing FFmpeg binary, an unsafe
+`output_dir`, or a field of the wrong type — booleans must be JSON `true`/`false`
+(`"false"` as a string is refused), `duration` a positive number,
+`transcode_workers` 1–256, `hls_settings.hls_time` 0.5–60 seconds, and each clip
+needs `StartTimecode`/`EndTimecode` as `HH:MM:SS:FF`.
+
+Unknown fields do not fail the request but are listed in `warnings`, so a typo
+(`"resolution"` for `"resolutions"`) is visible instead of silently ignored.
+While other jobs wait for a worker, the response includes `queue_position`
+(1 = next to start); the status endpoint reports it too.
+
+**Retrying safely.** Send an `Idempotency-Key` header (1–128 letters, digits,
+`.`, `_`, `:` or `-`; a UUID is ideal). A repeat with the same key and body
+returns the original job with `200` and `"duplicate": true` instead of queueing
+another; the same key with a different body is refused with `422`.
+
+**Back-pressure.** With `MAX_QUEUED_JOBS` jobs already waiting, the answer is
+`429` with `Retry-After: 60`. While the server is stopping it is `503` with
+`Retry-After: 30`.
+
+---
+
+## GET /ready and /metrics
+
+`/ready` checks that the server can run a job right now: accepting jobs, MySQL
+answering, FFmpeg and FFprobe present and executable, the scratch disk writable
+with more than `WZ_DISK_MIN_FREE_BYTES` free, the coordination directory
+writable, the encoder licence (once `python app.py --check` has run), and the
+queue not full. Point a load balancer or deploy health check at it.
+
+```json
+{"ready": false, "checks": {"database": {"ok": true, "detail": "connected"},
+                            "ffmpeg": {"ok": false, "detail": "not found at /opt/ai-transcoder/bin/ffmpeg"}}}
+```
+
+`/metrics` is Prometheus text: `ai_transcoder_jobs_running`, `_jobs_queued`,
+`_jobs_by_status{status=...}`, `_process_events_total{event=...}`,
+`_cpu_budget_cores`, `_cpu_budget_in_use`, `_scratch_free_bytes`,
+`_database_up`, `_shutting_down`.
 
 ---
 

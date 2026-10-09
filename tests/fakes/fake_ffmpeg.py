@@ -28,6 +28,8 @@ def arg_after(argv, flag):
 
 
 def run_ffprobe(argv):
+    if os.getenv("FAKE_HANG_FFPROBE"):
+        time.sleep(3600)                     # test switch: a probe that never returns
     entries = " ".join(argv)
     if "packet=pts_time" in entries:
         print("1.400000")
@@ -59,21 +61,35 @@ def run_ffmpeg(argv):
         }, indent=2) + "\n")
         return 0
 
+    # Test switch: the encoder refuses its licence, as an expired one would.
+    if os.getenv("FAKE_LICENSE_FAIL") and any(str(a).startswith("libwz") for a in argv):
+        sys.stderr.write("[libwz264 @ 0x1] wz license check failed: license expired\n")
+        return 1
+
     # HLS packaging: -f hls ... <segment pattern> <playlist>
     if "hls" in argv and arg_after(argv, "-f") == "hls":
         playlist = Path(argv[-1])
+        # Test switches: fail packaging, or "succeed" with a truncated package.
+        if os.getenv("FAKE_FAIL_HLS") and os.getenv("FAKE_FAIL_HLS") in playlist.name:
+            sys.stderr.write("simulated HLS packaging failure\n")
+            return 1
         pattern = arg_after(argv, "-hls_segment_filename")
         total = float(arg_after(argv, "-t") or DURATION)
-        count = max(1, int(total // SEGMENT_SECONDS))
+        if os.getenv("FAKE_TRUNCATE_HLS") and os.getenv("FAKE_TRUNCATE_HLS") in playlist.name:
+            total = total / 2
+        # Like FFmpeg: full segments, then a shorter last one, summing to `total`.
+        count = max(1, int(-(-total // SEGMENT_SECONDS)))
+        durations = [SEGMENT_SECONDS] * (count - 1)
+        durations.append(max(0.001, total - SEGMENT_SECONDS * (count - 1)))
         playlist.parent.mkdir(parents=True, exist_ok=True)
         lines = ["#EXTM3U\n", "#EXT-X-VERSION:3\n",
                  f"#EXT-X-TARGETDURATION:{int(SEGMENT_SECONDS)}\n",
                  "#EXT-X-MEDIA-SEQUENCE:1\n", "#EXT-X-PLAYLIST-TYPE:vod\n"]
-        for i in range(1, count + 1):
+        for i, seg_duration in enumerate(durations, 1):
             segment = Path(pattern % i) if pattern else playlist.with_suffix(f".{i}.ts")
             segment.parent.mkdir(parents=True, exist_ok=True)
             segment.write_bytes(os.urandom(2048))
-            lines.append(f"#EXTINF:{SEGMENT_SECONDS:.6f},\n{segment.name}\n")
+            lines.append(f"#EXTINF:{seg_duration:.6f},\n{segment.name}\n")
         lines.append("#EXT-X-ENDLIST\n")
         playlist.write_text("".join(lines))
         _emit_progress(total)
@@ -92,6 +108,22 @@ def run_ffmpeg(argv):
     outputs = [Path(a) for a in argv
                if str(a).endswith((".mp4", ".m4s")) and not _is_input_value(argv, a)]
     started = time.time()
+    kind = _encode_kind(argv)
+    if kind and os.getenv("FAKE_SELF_KILL") == kind:
+        import signal
+        os.kill(os.getpid(), signal.SIGKILL)     # test switch: as the OOM killer would
+    if kind and os.getenv("FAKE_HANG") == kind:
+        # Test switch: report a little progress, then hang with no output.
+        _emit_progress(1.0)
+        time.sleep(3600)
+    slow = float(os.getenv("FAKE_SLOW_PROGRESS_SECONDS", "0") or 0)
+    if kind == "video" and slow > 0:
+        # Test switch: slow but steady, one progress line per second.
+        for second in range(1, int(slow) + 1):
+            time.sleep(1)
+            sys.stderr.write(f"frame= {second * 25:5d} fps= 25 q=28.0 size= 1kB "
+                             f"time=00:00:{second:02d}.00 bitrate=1.0kbits/s speed=1x\n")
+            sys.stderr.flush()
     _simulate_encode_time(argv)
     for path in outputs:
         path.parent.mkdir(parents=True, exist_ok=True)

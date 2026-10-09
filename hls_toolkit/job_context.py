@@ -47,7 +47,8 @@ STAGES = [
     ("SUBTITLES", 80, 4),
     ("MANIFEST", 84, 2),
     ("AD_MARKERS", 86, 2),
-    ("THUMBNAILS", 88, 2),
+    ("THUMBNAILS", 88, 1),
+    ("VALIDATING_OUTPUT", 89, 1),
     ("UPLOADING", 90, 9),
     ("CLEANUP", 99, 1),
 ]
@@ -140,6 +141,7 @@ class JobContext:
 
         self._lock = threading.Lock()
         self.cancel_event = threading.Event()
+        self.interrupt_reason: Optional[str] = None
 
         self.stage = "QUEUED"
         self.progress_pct = 0
@@ -270,6 +272,16 @@ class JobContext:
     def request_cancel(self) -> None:
         self.cancel_event.set()
 
+    def request_interrupt(self, reason: str) -> None:
+        """Stop the job like a cancel, but record it as FAILED with `reason`.
+
+        Used when the server shuts down: the job did not finish, nobody asked
+        for it to stop, and it needs resubmitting — that is a failure the
+        caller must see, not a cancellation.
+        """
+        self.interrupt_reason = reason
+        self.cancel_event.set()
+
     @property
     def cancelled(self) -> bool:
         return self.cancel_event.is_set()
@@ -303,8 +315,11 @@ class JobContext:
 
     def _write_meta(self) -> None:
         try:
-            self.meta_path.write_text(json.dumps(self.snapshot(), indent=2),
-                                      encoding="utf-8")
+            # Write then rename, so a reader (or a crash) never sees half a file.
+            tmp = self.meta_path.with_name(
+                f".{self.meta_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(self.snapshot(), indent=2), encoding="utf-8")
+            os.replace(tmp, self.meta_path)
         except Exception:
             pass
 

@@ -115,7 +115,8 @@ def check_boto3() -> Result:
     return Result("boto3 / botocore", OK, detail)
 
 
-def check_ffmpeg(settings: Dict[str, Any]) -> List[Result]:
+def check_ffmpeg(settings: Dict[str, Any],
+                 config: Optional[Dict[str, Any]] = None) -> List[Result]:
     results = []
     for key, label in (("ffmpeg_executable", "FFmpeg"),
                        ("ffprobe_executable", "FFprobe")):
@@ -138,7 +139,28 @@ def check_ffmpeg(settings: Dict[str, Any]) -> List[Result]:
             results.append(Result(label, FAIL, f"{path} would not run: {e}",
                                   "Check the binary's architecture and its shared "
                                   "library dependencies (ldd)."))
-    results.append(_check_encoders(settings["ffmpeg_executable"]))
+    encoders = _check_encoders(settings["ffmpeg_executable"])
+    results.append(encoders)
+    if encoders.status != FAIL and os.access(settings["ffmpeg_executable"], os.X_OK):
+        results.extend(check_test_encode(settings["ffmpeg_executable"], config or {}))
+    return results
+
+
+def check_test_encode(ffmpeg: str, config: Dict[str, Any]) -> List[Result]:
+    """Encode one second of test pattern with each encoder the templates use.
+
+    Proves the licence works, not just that the encoder is compiled in. The
+    outcome is cached for the API's /ready. WZ_SKIP_TEST_ENCODE=1 skips it.
+    """
+    from hls_toolkit import encoder_check
+    if os.getenv("WZ_SKIP_TEST_ENCODE", "").lower() in ("1", "true", "yes"):
+        return [Result("Test encode", WARN, "skipped (WZ_SKIP_TEST_ENCODE)")]
+    results = []
+    for outcome in encoder_check.run_and_cache(ffmpeg,
+                                               encoder_check.encoders_in_use(config)):
+        status = OK if outcome["ok"] else (WARN if outcome["ok"] is None else FAIL)
+        results.append(Result(f"Test encode ({outcome['encoder']})", status,
+                              outcome["detail"], outcome.get("fix", "")))
     return results
 
 
@@ -315,7 +337,7 @@ def run_all(config: Dict[str, Any], log_root: str = "logs",
     s3_config = settings["s3_config"]
 
     results = [check_python(), check_tls_stack(), check_boto3()]
-    results.extend(check_ffmpeg(settings))
+    results.extend(check_ffmpeg(settings, config))
     results.extend(check_directories(log_root, work_root))
 
     if settings["upload"] or s3_io.is_s3_uri(settings["input_video"] or ""):

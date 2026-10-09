@@ -134,6 +134,8 @@ def test_pipeline(work: Path, binaries: dict):
     check_true("ffmpeg.log captured progress lines", "bitrate=" in ffmpeg_log)
     meta = json.loads((log_dir / "job.json").read_text())
     check("job.json records completion", meta["status"], "COMPLETED")
+    check_true("the package was validated before upload",
+               "Package validated" in (log_dir / "job.log").read_text())
     return client
 
 
@@ -190,6 +192,10 @@ def test_api(work: Path, binaries: dict):
 
     bad_input = http.post("/api/v1/jobs", json={"input_video": "/no/such/file.mp4"})
     check("missing local input rejected", bad_input.status_code, 400)
+
+    bad_output = http.post("/api/v1/jobs", json={"input_video": video_uri,
+                                                 "output_dir": "/home/ubuntu"})
+    check("an output path is rejected with 400", bad_output.status_code, 400)
 
     response = http.post("/api/v1/jobs", json={
         "name": "American Pickers S10E03",
@@ -251,6 +257,177 @@ def test_api(work: Path, binaries: dict):
           http.delete(f"/api/v1/jobs/{job_id}").get_json()["deleted"], True)
     check("deleted job is gone",
           http.get(f"/api/v1/jobs/{job_id}").status_code, 404)
+
+
+def test_api_operations(work: Path, binaries: dict):
+    """Readiness, metrics, request checks, idempotency, queue limits, alerts."""
+    print("api operations")
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from api import database as db
+    from api import job_manager
+    from hls_toolkit import s3_io
+
+    client = fake_s3.install(s3_io, work / "s3_ops")
+    video_uri = client.put(BUCKET, f"Visionular/{CHANNEL}.mp4", os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+    config_path = work / "ops-config.json"
+    config_path.write_text(json.dumps(config))
+    from api.app import create_app
+    http = create_app(str(config_path)).test_client()
+    quick = {"input_video": video_uri, "subtitle_file": None, "resolutions": "720p",
+             "esam": False, "audio_norm": False, "generate_thumbnails": False,
+             "upload": False}
+
+    def wait(job_id, states=("COMPLETED", "FAILED", "CANCELLED"), timeout=120):
+        deadline = time.time() + timeout
+        status = {}
+        while time.time() < deadline:
+            status = http.get(f"/api/v1/jobs/{job_id}/status").get_json()
+            if status.get("status") in states:
+                break
+            time.sleep(0.2)
+        return status
+
+    # Readiness and metrics.
+    ready = http.get("/ready")
+    check("ready when everything is in place", ready.status_code, 200)
+    check_true("…listing each check", {"database", "ffmpeg", "ffprobe", "scratch_disk",
+                                       "coordination_dir"} <= set(ready.get_json()["checks"]))
+    broken = json.loads(config_path.read_text())
+    broken["paths"]["ffmpeg_executable"] = str(work / "no-such-ffmpeg")
+    broken_path = work / "ops-broken.json"
+    broken_path.write_text(json.dumps(broken))
+    not_ready = create_app(str(broken_path)).test_client().get("/ready")
+    check("not ready without FFmpeg (503)", not_ready.status_code, 503)
+    check("…naming the failed check",
+          not_ready.get_json()["checks"]["ffmpeg"]["ok"], False)
+    metrics = http.get("/metrics")
+    text = metrics.get_data(as_text=True)
+    check_true("metrics are in Prometheus format",
+               metrics.content_type.startswith("text/plain")
+               and "# TYPE ai_transcoder_jobs_running gauge" in text
+               and 'ai_transcoder_jobs_by_status{status="COMPLETED"}' in text, text[:300])
+
+    # Wrongly typed fields are refused before a job exists.
+    for label, payload, words in (
+            ("a string boolean", {"upload": "false"}, "upload must be true or false"),
+            ("zero workers", {"transcode_workers": 0}, "transcode_workers"),
+            ("a negative duration", {"duration": -5}, "duration"),
+            ("a string hls_time", {"hls_settings": {"hls_time": "6"}}, "hls_time"),
+            ("an unknown hls setting", {"hls_settings": {"hls_tme": 6}}, "Unknown hls_settings"),
+            ("a bad timecode", {"clippings": [{"StartTimecode": "0:0",
+                                               "EndTimecode": "00:00:10:00"}]},
+             "not a timecode")):
+        response = http.post("/api/v1/jobs", json={**quick, **payload})
+        check(f"{label} is rejected with 400", response.status_code, 400)
+        check_true("…saying why", words in response.get_json()["error"],
+                   response.get_json()["error"])
+
+    # Idempotency: a retried submission returns the original job.
+    key = {"Idempotency-Key": f"test-{os.getpid()}-{int(time.time())}"}
+    first = http.post("/api/v1/jobs", json={**quick, "resolution": "typo"}, headers=key)
+    check("a keyed job is accepted", first.status_code, 202)
+    check_true("an unknown field is reported, not silently ignored",
+               any("resolution" in w for w in first.get_json().get("warnings", [])))
+    again = http.post("/api/v1/jobs", json={**quick, "resolution": "typo"}, headers=key)
+    check("a retry with the same key returns 200", again.status_code, 200)
+    check("…and the same job", again.get_json()["job_id"], first.get_json()["job_id"])
+    other = http.post("/api/v1/jobs", json={**quick, "resolutions": "1080p"}, headers=key)
+    check("the same key for a different request is refused (422)", other.status_code, 422)
+    check("the keyed job completes", wait(first.get_json()["job_id"])["status"], "COMPLETED")
+
+    # Finished jobs are not kept in memory for ever; the database still has them.
+    saved_keep = job_manager.FINISHED_JOBS_IN_MEMORY
+    job_manager.FINISHED_JOBS_IN_MEMORY = 0
+    try:
+        done = http.post("/api/v1/jobs", json=quick).get_json()["job_id"]
+        check("a job finishes", wait(done)["status"], "COMPLETED")
+        time.sleep(0.5)
+        check_true("finished jobs are dropped from memory",
+                   done not in job_manager._registry)
+        check("…and still served from the database",
+              http.get(f"/api/v1/jobs/{done}/status").get_json().get("source"), "database")
+        late = http.post("/api/v1/jobs", json={**quick, "resolution": "typo"}, headers=key)
+        check("a retry after that still finds the original job",
+              late.get_json().get("job_id"), first.get_json()["job_id"])
+    finally:
+        job_manager.FINISHED_JOBS_IN_MEMORY = saved_keep
+
+    # A bounded queue: past MAX_QUEUED_JOBS a submission gets 429.
+    saved_max = job_manager.MAX_QUEUED_JOBS
+    job_manager.MAX_QUEUED_JOBS = 1
+    os.environ["FAKE_HANG"] = "video"
+    started = []
+    try:
+        for _ in range(job_manager.MAX_CONCURRENT_JOBS):
+            job_id = http.post("/api/v1/jobs", json=quick).get_json()["job_id"]
+            started.append(job_id)
+            wait(job_id, states=("RUNNING",), timeout=30)
+        waiting = http.post("/api/v1/jobs", json=quick)
+        check("a job beyond the workers is queued", waiting.status_code, 202)
+        check("…and told its place in line", waiting.get_json().get("queue_position"), 1)
+        started.append(waiting.get_json()["job_id"])
+        check("its status shows the place too",
+              http.get(f"/api/v1/jobs/{started[-1]}/status").get_json()
+              .get("queue_position"), 1)
+        full = http.post("/api/v1/jobs", json=quick)
+        check("a full queue answers 429", full.status_code, 429)
+        check_true("…with Retry-After", full.headers.get("Retry-After"))
+        check_true("/ready reports the full queue",
+                   http.get("/ready").get_json()["checks"]["queue"]["ok"] is False)
+    finally:
+        job_manager.MAX_QUEUED_JOBS = saved_max
+        os.environ.pop("FAKE_HANG", None)
+        for job_id in reversed(started):
+            http.post(f"/api/v1/jobs/{job_id}/cancel")
+        for job_id in started:
+            wait(job_id)
+
+    # A failed job is reported to ALERT_WEBHOOK_URL.
+    received = []
+
+    class Hook(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Hook)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    saved_hook = job_manager.ALERT_WEBHOOK_URL
+    job_manager.ALERT_WEBHOOK_URL = f"http://127.0.0.1:{server.server_port}/hook"
+    os.environ["FAKE_FAIL_HLS"] = "channel_720p"
+    try:
+        failing = http.post("/api/v1/jobs", json=quick).get_json()["job_id"]
+        check("the job fails", wait(failing)["status"], "FAILED")
+        deadline = time.time() + 15
+        while time.time() < deadline and not received:
+            time.sleep(0.1)
+        check_true("a failure alert is posted",
+                   received and received[0]["job_id"] == failing
+                   and "FAILED" in received[0]["text"], received)
+    finally:
+        job_manager.ALERT_WEBHOOK_URL = saved_hook
+        os.environ.pop("FAKE_FAIL_HLS", None)
+        server.shutdown()
+
+    # A table made by the previous version is upgraded in place on start.
+    from sqlalchemy import inspect, text as sql
+    with db.engine.begin() as conn:
+        conn.execute(sql("DROP INDEX ix_jobs_submitted_at ON jobs"))
+        conn.execute(sql("ALTER TABLE jobs DROP COLUMN idempotency_key"))
+    db.init_db()
+    inspector = inspect(db.engine)
+    check_true("start-up adds the new column to an old table",
+               "idempotency_key" in {c["name"] for c in inspector.get_columns("jobs")})
+    check_true("…and the listing index",
+               ("submitted_at",) in {tuple(i["column_names"])
+                                     for i in inspector.get_indexes("jobs")})
 
 
 def test_parallel_cli_jobs(work: Path, binaries: dict):
@@ -394,6 +571,670 @@ def test_single_job_uses_the_budget(work: Path, binaries: dict):
     check("both clips encode at once on a 32-core budget", overlap, 2)
 
 
+def test_every_ffmpeg_step_uses_the_budget(work: Path, binaries: dict):
+    """Loudnorm, packaging and thumbnails take cores too, and wait for them."""
+    print("non-encode steps use the CPU budget")
+    import threading
+    from hls_toolkit import cpu_budget
+    from hls_toolkit.runner import run_transcode_job
+
+    media = work / "budget_steps"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+    cpu_budget.reset_shared_budget()
+    budget = cpu_budget.get_shared_budget(8, slot_dir=str(media / "slots"))
+    costs = []
+    original = budget.acquire
+
+    def recording(cost, should_abort=None):
+        costs.append((sys._getframe(1).f_code.co_name, cost))
+        return original(cost, should_abort=should_abort)
+
+    budget.acquire = recording
+    try:
+        # Every core taken by "another job": the loudnorm pass must wait.
+        blocker = original(8)
+        result = {}
+        thread = threading.Thread(target=lambda: result.update(run_transcode_job(
+            config, overrides=_quick_overrides(source, upload=False, output_dir="steps",
+                                               audio_norm=True, thumbnails_enabled=True,
+                                               resolution="1080p,720p",
+                                               local_output_dir=str(media / "out")),
+            log_root=str(media / "logs"), work_root=str(media / "scratch"))))
+        thread.start()
+        time.sleep(2)
+        check_true("the loudnorm pass waits while other jobs hold every core",
+                   thread.is_alive() and costs == [("_cores", 1)], costs)
+        blocker.release()
+        thread.join(120)
+    finally:
+        budget.acquire = original
+        cpu_budget.reset_shared_budget()
+    check("the job then completes", result.get("status"), "COMPLETED")
+    main_thread = [cost for caller, cost in costs if caller == "_cores"]
+    check("loudnorm (1), packaging per rendition (1 each) and thumbnails (2) reserve "
+          "cores", sorted(main_thread), sorted([1, 1, 1, 2]))
+    check("every core is returned", budget.in_use(), 0)
+
+
+def _quick_overrides(source, **extra):
+    """Overrides for a fast job: no ESAM, loudnorm or thumbnails."""
+    overrides = {"input_video": str(source), "esam": False, "audio_norm": False,
+                 "thumbnails_enabled": False}
+    overrides.update(extra)
+    return overrides
+
+
+def test_output_folder_safety(work: Path, binaries: dict):
+    """An output name that is a path must never reach outside scratch."""
+    print("output folder safety")
+    from hls_toolkit import s3_io
+    from hls_toolkit.job_context import TranscodeError
+    from hls_toolkit.runner import run_transcode_job
+
+    client = fake_s3.install(s3_io, work / "s3_safety")
+    media = work / "safety"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    victim = media / "unrelated_folder"
+    victim.mkdir()
+    (victim / "contract.pdf").write_text("was here before the job")
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+
+    for label, name in (("absolute path", str(victim)),
+                        ("'..' path", f"../../../{victim.name}"),
+                        ("hidden '..' segment", f"ok/../{victim.name}")):
+        try:
+            run_transcode_job(config, overrides=_quick_overrides(
+                source, upload=True, output_dir=name),
+                log_root=str(media / "logs"), work_root=str(media / "scratch"))
+            check(f"{label} refused", "accepted", "refused")
+        except TranscodeError as e:
+            check(f"{label} refused at validation", e.stage, "VALIDATION")
+    check_true("the unrelated folder is untouched", (victim / "contract.pdf").exists())
+    check_true("nothing was uploaded", not any(
+        k.endswith("contract.pdf") for k in client.keys_under(BUCKET)))
+
+
+def test_local_copies(work: Path, binaries: dict):
+    """--no-upload, --keep-local and a failed upload all leave a usable package."""
+    print("local copies of the package")
+    from hls_toolkit import s3_io
+    from hls_toolkit.runner import run_transcode_job
+
+    client = fake_s3.install(s3_io, work / "s3_local")
+    media = work / "local"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    local_root = media / "hls_output"
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+
+    def run(**extra):
+        return run_transcode_job(
+            config, overrides=_quick_overrides(source, local_output_dir=str(local_root),
+                                               **extra),
+            log_root=str(media / "logs"), work_root=str(media / "scratch"))
+
+    result = run(upload=False, output_dir="show")
+    saved = Path(result["output_prefix"])
+    check("--no-upload completes", result["status"], "COMPLETED")
+    check("saved under the local output folder", saved, local_root / "show")
+    check_true("the package survives the job", (saved / "channel.m3u8").exists())
+    check("playback points at the saved copy", result["metadata"]["playback_url"],
+          str(saved / "channel.m3u8"))
+
+    again = run(upload=False, output_dir="show")
+    check("a second run never overwrites the first", Path(again["output_prefix"]).name,
+          "show_2")
+    check_true("the first copy is still intact", (saved / "channel.m3u8").exists())
+
+    kept = run(upload=True, delete_local_output=False, output_dir="kept")
+    check("--keep-local completes", kept["status"], "COMPLETED")
+    check_true("--keep-local uploads to S3",
+               any(k.endswith("kept/channel.m3u8") for k in client.keys_under(BUCKET)))
+    check_true("--keep-local also keeps a local copy",
+               (local_root / "kept" / "channel.m3u8").exists())
+
+    original_upload = client.upload_file
+
+    def flaky_upload(filename, bucket, key, ExtraArgs=None, Config=None):
+        if key.endswith(".ts"):
+            raise OSError("simulated network failure")
+        return original_upload(filename, bucket, key, ExtraArgs=ExtraArgs, Config=Config)
+
+    client.upload_file = flaky_upload
+    try:
+        failed = run(upload=True, output_dir="retry_me")
+    finally:
+        client.upload_file = original_upload
+    check("a failed upload fails the job", failed["status"], "FAILED")
+    check_true("the finished package is saved for a retry",
+               (local_root / "retry_me" / "channel.m3u8").exists())
+    check_true("the error says where it is and how to retry",
+               "--upload-only" in (failed["error_message"] or "")
+               and str(local_root / "retry_me") in failed["error_message"])
+
+
+def test_safe_publish(work: Path, binaries: dict):
+    """Republishing never takes the live output down, and the master goes last."""
+    print("safe publish")
+    from hls_toolkit import s3_io
+    from hls_toolkit.runner import run_transcode_job
+
+    client = fake_s3.install(s3_io, work / "s3_publish")
+    media = work / "publish"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+    prefix = "Visionular/V3/live_show"
+
+    # A previous run's package is live, including a rendition this run drops.
+    for name in ("channel.m3u8", "channel_1080p.m3u8", "channel_1080p_00001.ts",
+                 "channel_2160p.m3u8", "channel_2160p_00001.ts"):
+        client.put(BUCKET, f"{prefix}/{name}", b"previous run")
+
+    live_during_upload = []
+    original_upload = client.upload_file
+
+    upload_threads = set()
+
+    def watching_upload(filename, bucket, key, ExtraArgs=None, Config=None):
+        import threading
+        upload_threads.add(threading.current_thread().name)
+        live_during_upload.append(
+            (client._path(bucket, f"{prefix}/channel.m3u8")).is_file())
+        return original_upload(filename, bucket, key, ExtraArgs=ExtraArgs, Config=Config)
+
+    client.upload_file = watching_upload
+    client.undeletable = {f"{prefix}/channel_2160p_00001.ts"}
+    try:
+        result = run_transcode_job(
+            config, overrides=_quick_overrides(source, upload=True, output_dir="live_show",
+                                               resolution="1080p,720p"),
+            log_root=str(media / "logs"), work_root=str(media / "scratch"))
+    finally:
+        client.upload_file = original_upload
+        client.undeletable = set()
+
+    check("republish completes", result["status"], "COMPLETED")
+    check_true("the old master stayed live for the whole upload",
+               live_during_upload and all(live_during_upload))
+    order = [u["key"].rsplit("/", 1)[-1] for u in client.uploads
+             if u["key"].startswith(prefix + "/")]
+    first_playlist = min(i for i, k in enumerate(order) if k.endswith(".m3u8"))
+    check_true("every segment is uploaded before any playlist",
+               all(not k.endswith(".m3u8") for k in order[:first_playlist])
+               and all(k.endswith(".m3u8") for k in order[first_playlist:]))
+    check("the master playlist is uploaded last", order[-1], "channel.m3u8")
+    check_true("files go up in parallel", len(upload_threads) > 1, upload_threads)
+    keys = {k.rsplit("/", 1)[-1] for k in client.keys_under(BUCKET, prefix)}
+    check_true("the dropped rendition's playlist is removed afterwards",
+               "channel_2160p.m3u8" not in keys)
+    check_true("a stale object S3 refused to delete is reported, not hidden",
+               result["metadata"].get("stale_objects_not_removed") == 1)
+
+    # An upload that fails part-way leaves the previous package fully live.
+    client.put(BUCKET, f"{prefix}/channel.m3u8", b"previous run")
+
+    def failing_upload(filename, bucket, key, ExtraArgs=None, Config=None):
+        if key.endswith("_00002.ts"):
+            raise OSError("simulated network failure")
+        return original_upload(filename, bucket, key, ExtraArgs=ExtraArgs, Config=Config)
+
+    client.upload_file = failing_upload
+    try:
+        failed = run_transcode_job(
+            config, overrides=_quick_overrides(source, upload=True, output_dir="live_show",
+                                               resolution="1080p,720p",
+                                               local_output_dir=str(media / "saved")),
+            log_root=str(media / "logs"), work_root=str(media / "scratch"))
+    finally:
+        client.upload_file = original_upload
+    check("a failed republish fails the job", failed["status"], "FAILED")
+    check("the live master is still the previous one",
+          client._path(BUCKET, f"{prefix}/channel.m3u8").read_bytes(), b"previous run")
+
+
+def test_broken_packages_are_not_published(work: Path, binaries: dict):
+    """A failed or truncated rendition fails the job and nothing goes live."""
+    print("broken packages are not published")
+    from hls_toolkit import s3_io
+    from hls_toolkit.runner import run_transcode_job
+
+    client = fake_s3.install(s3_io, work / "s3_broken")
+    media = work / "broken"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+
+    for switch, label, stage, words in (
+            ("FAKE_FAIL_HLS", "packaging failure", "PACKAGING_HLS", "720p"),
+            ("FAKE_TRUNCATE_HLS", "silently truncated rendition", "VALIDATING_OUTPUT",
+             "channel_720p.m3u8: runs")):
+        os.environ[switch] = "channel_720p"
+        try:
+            result = run_transcode_job(
+                config, overrides=_quick_overrides(
+                    source, upload=True, output_dir=f"broken_{switch.lower()}",
+                    resolution="1080p,720p", local_output_dir=str(media / "saved")),
+                log_root=str(media / "logs"), work_root=str(media / "scratch"))
+        finally:
+            os.environ.pop(switch, None)
+        check(f"{label}: job fails", result["status"], "FAILED")
+        check(f"{label}: at the right stage", result["stage"], stage)
+        check_true(f"{label}: the error names the rendition",
+                   words in (result["error_message"] or ""), result["error_message"])
+        check(f"{label}: nothing was published",
+              client.keys_under(BUCKET, f"Visionular/V3/broken_{switch.lower()}"), [])
+
+
+def test_disk_space_is_reserved(work: Path, binaries: dict):
+    """A job that cannot fit on the scratch disk fails before downloading anything."""
+    print("disk space reservation")
+    from hls_toolkit import s3_io
+    from hls_toolkit.runner import run_transcode_job
+
+    client = fake_s3.install(s3_io, work / "s3_disk")
+    media = work / "disk"
+    media.mkdir(parents=True, exist_ok=True)
+    source_uri = client.put(BUCKET, f"inputs/{CHANNEL}.mp4", os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+
+    def run():
+        return run_transcode_job(
+            config, overrides=_quick_overrides(source_uri, upload=False, output_dir="disk",
+                                               local_output_dir=str(media / "out")),
+            log_root=str(media / "logs"), work_root=str(media / "scratch"))
+
+    coord = {"WZ_CPU_SLOT_DIR": str(media / "coord")}
+    # 4 KB x 10^15 is far more than any disk has.
+    result = _with_env({**coord, "WZ_DISK_SPACE_FACTOR": "1e15"}, run)
+    check("a job too big for the disk fails", result["status"], "FAILED")
+    check("…while fetching its input", result["stage"], "FETCHING_INPUT")
+    check_true("…saying how much space it needs",
+               "Not enough scratch space" in (result["error_message"] or ""),
+               result["error_message"])
+    check("…without downloading the source", client.downloads, [])
+
+    ok = _with_env(coord, run)
+    check("a job that fits runs normally", ok["status"], "COMPLETED")
+    logs = " ".join(p.read_text() for p in (media / "logs").rglob("job.log"))
+    check_true("…after reserving its space", "Reserved" in logs)
+    leftovers = list((media / "coord" / "disk").rglob("*.json"))
+    check("its reservation is released when it ends", leftovers, [])
+
+
+def test_dead_jobs_are_cleaned_up(work: Path, binaries: dict):
+    """A CLI job killed with -9 leaves scratch behind; the next job removes it."""
+    print("cleanup after killed jobs")
+    import subprocess
+    import time
+    from hls_toolkit import housekeeping
+    from hls_toolkit.runner import run_transcode_job
+
+    media = work / "janitor"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    scratch = media / "scratch"
+    config = build_config(work, binaries)
+    config["defaults"].update({"input_video": str(source), "subtitle_file": None})
+    path = media / "config.json"
+    path.write_text(json.dumps(config))
+    coord = {"WZ_CPU_SLOT_DIR": str(media / "coord")}
+
+    proc = subprocess.Popen(
+        [sys.executable, "app.py", "--config", str(path), "--no-upload", "--no-esam",
+         "--no-audio-norm", "--no-generate-thumbnails", "--work-dir", str(scratch),
+         "--log-dir", str(media / "logs"), "--local-output-dir", str(media / "out")],
+        cwd=str(ROOT), env=dict(os.environ, FAKE_HANG="video", **coord),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.time() + 60
+    while time.time() < deadline and not list(scratch.glob("aitx_*/temp/*")):
+        time.sleep(0.1)
+    proc.kill()
+    proc.wait()
+    left = list(scratch.glob("aitx_*"))
+    check("a killed job leaves its scratch folder behind", len(left), 1)
+    # Pretend it died a while ago: a fresh folder is never judged, and sweeps
+    # run at most every few minutes (the killed job swept when it started).
+    old = time.time() - 3600
+    for folder in left:
+        os.utime(folder / housekeeping.OWNER_FILE, (old, old))
+    os.utime(media / "coord" / "housekeeping.stamp", (old, old))
+
+    def run(debug=False):
+        return run_transcode_job(
+            config, overrides=_quick_overrides(source, upload=False, output_dir="janitor",
+                                               local_output_dir=str(media / "out"),
+                                               debug=debug),
+            log_root=str(media / "logs"), work_root=str(scratch))
+
+    result = _with_env(coord, run)
+    check("the next job runs normally", result["status"], "COMPLETED")
+    check("…and removes the dead job's scratch", list(scratch.glob("aitx_*")), [])
+
+    kept = _with_env(coord, lambda: run(debug=True))
+    check("a --debug job completes", kept["status"], "COMPLETED")
+    _with_env(coord, lambda: housekeeping.run_periodic(scratch, force=True))
+    check("…and its kept scratch survives later sweeps",
+          len(list(scratch.glob("aitx_*"))), 1)
+
+
+def test_encoder_check(work: Path, binaries: dict):
+    """--check proves the encoder licence with a test encode; /ready reports it."""
+    print("encoder test encode")
+    from hls_toolkit import encoder_check, preflight
+
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+    config_path = work / "encoder-config.json"
+    config_path.write_text(json.dumps(config))
+    ffmpeg = config["paths"]["ffmpeg_executable"]
+    coord = {"WZ_CPU_SLOT_DIR": str(work / "encoder-coord"), "READY_TEST_ENCODE": "0"}
+
+    def scenario():
+        check("the templates need both encoders", encoder_check.encoders_in_use(config),
+              ["libwz264", "libwz265"])
+        good = preflight.check_test_encode(ffmpeg, config)
+        check("a licensed encoder passes", [r.status for r in good], ["ok", "ok"])
+        check_true("…and the result is cached for /ready",
+                   (encoder_check.cached_result(ffmpeg) or {}).get("ok") is True)
+
+        os.environ["FAKE_LICENSE_FAIL"] = "1"
+        try:
+            bad = preflight.check_test_encode(ffmpeg, config)
+        finally:
+            os.environ.pop("FAKE_LICENSE_FAIL", None)
+        check("an expired licence fails the check", [r.status for r in bad],
+              ["fail", "fail"])
+        check_true("…quoting the encoder", "license expired" in bad[0].detail, bad[0].detail)
+        check_true("…and pointing at the licence files", "wz_license" in bad[0].fix)
+
+        from api.app import create_app
+        response = create_app(str(config_path)).test_client().get("/ready")
+        check("/ready is 503 while the licence fails", response.status_code, 503)
+        check("…naming the licence check",
+              response.get_json()["checks"]["encoder_license"]["ok"], False)
+
+        later = time.time() + 5
+        os.utime(ffmpeg, (later, later))           # a replaced binary voids the result
+        check("a new FFmpeg binary is not judged by the old result",
+              encoder_check.cached_result(ffmpeg), None)
+
+        os.environ["WZ_SKIP_TEST_ENCODE"] = "1"
+        try:
+            check("WZ_SKIP_TEST_ENCODE skips it",
+                  [r.status for r in preflight.check_test_encode(ffmpeg, config)], ["warn"])
+        finally:
+            os.environ.pop("WZ_SKIP_TEST_ENCODE", None)
+
+    _with_env(coord, scenario)
+
+
+def _with_env(env: dict, fn):
+    previous = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    try:
+        return fn()
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_hung_ffmpeg_is_stopped(work: Path, binaries: dict):
+    """A hung FFmpeg or FFprobe fails the job promptly and frees its cores."""
+    print("hung FFmpeg / FFprobe")
+    import time
+    from hls_toolkit import cpu_budget
+    from hls_toolkit.runner import run_transcode_job
+
+    media = work / "hung"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+    cpu_budget.reset_shared_budget()
+    budget = cpu_budget.get_shared_budget(16, slot_dir=str(media / "slots"))
+
+    def run():
+        return run_transcode_job(
+            config, overrides=_quick_overrides(source, upload=False, output_dir="hung",
+                                               local_output_dir=str(media / "out")),
+            log_root=str(media / "logs"), work_root=str(media / "scratch"))
+
+    try:
+        started = time.time()
+        result = _with_env({"FAKE_HANG": "video", "WZ_FFMPEG_STALL_SECONDS": "2"}, run)
+        elapsed = time.time() - started
+        check("a hung encode fails the job", result["status"], "FAILED")
+        check("at the transcoding stage", result["stage"], "TRANSCODING")
+        check_true("the error says it was stopped as hung",
+                   "made no progress" in (result["error_message"] or ""),
+                   result["error_message"])
+        check_true("…within seconds, not forever", elapsed < 60, f"{elapsed:.0f}s")
+        check("its CPU cores are released", budget.in_use(), 0)
+
+        slow = _with_env({"FAKE_SLOW_PROGRESS_SECONDS": "5",
+                          "WZ_FFMPEG_STALL_SECONDS": "2"}, run)
+        check("a slow but progressing encode is not stopped", slow["status"], "COMPLETED")
+
+        killed = _with_env({"FAKE_SELF_KILL": "video"}, run)
+        check("an encoder killed by SIGKILL fails the job", killed["status"], "FAILED")
+        check_true("…and the error points at the out-of-memory killer",
+                   "out-of-memory killer" in (killed["error_message"] or ""),
+                   killed["error_message"])
+
+        started = time.time()
+        probe = _with_env({"FAKE_HANG_FFPROBE": "1", "WZ_FFPROBE_TIMEOUT_SECONDS": "2"},
+                          run)
+        check("a hung FFprobe fails the job", probe["status"], "FAILED")
+        check_true("…saying FFprobe did not finish",
+                   "did not finish within" in (probe["error_message"] or ""),
+                   probe["error_message"])
+        check_true("…promptly", time.time() - started < 60)
+    finally:
+        cpu_budget.reset_shared_budget()
+
+
+def test_restart_recovery(work: Path, binaries: dict):
+    """Real gunicorn: a stop interrupts jobs cleanly; a restart settles them.
+
+    Needs MySQL (the DB_* settings); skipped without it.
+    """
+    print("restarts (real gunicorn)")
+    import signal
+    import socket
+    import subprocess
+    import time
+    import urllib.request
+
+    from api import database as db
+    if not db.init_db():
+        print("  skip (MySQL not reachable)")
+        return
+
+    media = work / "restart"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"].update({"subtitle_file": None, "upload": False,
+                               "local_output_dir": str(media / "out")})
+    config_path = media / "config.json"
+    config_path.write_text(json.dumps(config))
+    gunicorn = Path(sys.executable).with_name("gunicorn")
+
+    def free_port():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def start(slow: bool):
+        port = free_port()
+        env = dict(os.environ, TRANSCODER_CONFIG=str(config_path), BIND=f"127.0.0.1:{port}",
+                   LOG_ROOT=str(media / "logs"), WORK_ROOT=str(media / "scratch"),
+                   SERVER_LOG_DIR=str(media / "server_logs"), MAX_CONCURRENT_JOBS="1",
+                   WZ_CPU_SLOT_DIR=str(media / "slots"), GRACEFUL_TIMEOUT="60",
+                   FAKE_SECONDS_PER_MEDIA_MINUTE="90" if slow else "0")
+        proc = subprocess.Popen([str(gunicorn), "-c", str(ROOT / "deploy" / "gunicorn.conf.py"),
+                                 "api.app:create_app()"], cwd=str(ROOT), env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        base = f"http://127.0.0.1:{port}"
+        for _ in range(100):
+            try:
+                urllib.request.urlopen(base + "/health", timeout=1)
+                return proc, base
+            except Exception:
+                time.sleep(0.2)
+        raise RuntimeError("gunicorn did not start")
+
+    def post(base, body):
+        request = urllib.request.Request(base + "/api/v1/jobs", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+        return json.loads(urllib.request.urlopen(request, timeout=10).read())["job_id"]
+
+    def status(base, job_id):
+        return json.loads(urllib.request.urlopen(
+            f"{base}/api/v1/jobs/{job_id}/status", timeout=10).read())
+
+    def row(job_id):
+        session = db.get_session()
+        try:
+            job = session.query(db.Job).filter(db.Job.job_id == job_id).one()
+            return job.status, job.error_message or ""
+        finally:
+            db.close_session(session)
+
+    def wait_until(predicate, seconds):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.3)
+        return False
+
+    def fakes_running():
+        out = subprocess.run(["pgrep", "-f", str(binaries["ffmpeg"])],
+                             capture_output=True, text=True).stdout.split()
+        return [pid for pid in out if pid != str(os.getpid())]
+
+    body = {"input_video": str(source), "resolutions": "720p", "esam": False,
+            "audio_norm": False, "generate_thumbnails": False, "upload": False,
+            "output_dir": "restart_show"}
+
+    # --- graceful stop -------------------------------------------------------
+    proc, base = start(slow=True)
+    try:
+        running = post(base, body)
+        queued = post(base, body)
+        check_true("first job reaches transcoding",
+                   wait_until(lambda: status(base, running).get("stage") == "TRANSCODING", 60))
+        stopped_at = time.time()
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=120)
+        check_true("the server stops promptly on SIGTERM", time.time() - stopped_at < 90)
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+    state, message = row(running)
+    check("the running job is recorded as FAILED", state, "FAILED")
+    check_true("…saying it was interrupted and should be resubmitted",
+               "Interrupted: the server shut down" in message and "Resubmit" in message,
+               message)
+    check("the queued job stays PENDING for the next start", row(queued)[0], "PENDING")
+    check("no FFmpeg is left running", fakes_running(), [])
+
+    # --- restart requeues it -------------------------------------------------
+    proc, base = start(slow=False)
+    try:
+        check_true("the queued job runs after the restart",
+                   wait_until(lambda: row(queued)[0] == "COMPLETED", 120), row(queued))
+
+        # --- crash: kill -9 mid-job ------------------------------------------
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=30)
+        proc, base = start(slow=True)
+        crashed = post(base, body)
+        check_true("a job is running before the crash",
+                   wait_until(lambda: status(base, crashed).get("stage") == "TRANSCODING", 60))
+        # A crash kills only the server's own processes, as the OOM killer or a
+        # kill -9 of gunicorn would; FFmpeg must die with them, not linger.
+        for pid in subprocess.run(["pgrep", "-g", str(proc.pid)], capture_output=True,
+                                  text=True).stdout.split():
+            subprocess.run(["kill", "-9", pid])
+        proc.wait(timeout=30)
+        check_true("FFmpeg dies with the crashed server (no orphans)",
+                   wait_until(lambda: not fakes_running(), 10), fakes_running())
+        check("after a crash the row is stuck RUNNING", row(crashed)[0], "RUNNING")
+        proc, base = start(slow=False)
+        state, message = row(crashed)
+        check("the next start marks it FAILED", state, "FAILED")
+        check_true("…as interrupted", "Interrupted" in message, message)
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=120)
+
+
+def test_recovery_leaves_owned_jobs_alone(work: Path):
+    """Startup recovery must not touch a job a live process still owns."""
+    print("recovery respects live owners")
+    import subprocess
+    import uuid
+    from api import database as db
+    from api import job_manager
+    if not db.init_db():
+        print("  skip (MySQL not reachable)")
+        return
+    slots = work / "owned_slots"
+    os.environ["WZ_CPU_SLOT_DIR"] = str(slots)
+    try:
+        owned, orphan = str(uuid.uuid4()), str(uuid.uuid4())
+        session = db.get_session()
+        for job_id in (owned, orphan):
+            session.add(db.Job(job_id=job_id, status="RUNNING", stage="TRANSCODING",
+                               channel="owned_test", submitted_at=db._utcnow()))
+        session.commit()
+        db.close_session(session)
+        holder = subprocess.Popen([sys.executable, "-c", (
+            "import os, sys, time; sys.path.insert(0, %r)\n"
+            "os.environ['WZ_CPU_SLOT_DIR'] = %r\n"
+            "from hls_toolkit.coordination import JobLock\n"
+            "lock = JobLock(%r); print('held', flush=True); time.sleep(60)\n")
+            % (str(ROOT), str(slots), owned)], stdout=subprocess.PIPE, text=True)
+        check("another process owns one job", holder.stdout.readline().strip(), "held")
+        job_manager.recover_on_startup()
+        holder.kill()
+        holder.wait()
+        statuses = {}
+        session = db.get_session()
+        for job_id in (owned, orphan):
+            statuses[job_id] = session.query(db.Job).filter(db.Job.job_id == job_id).one().status
+        db.close_session(session)
+        check("the owned job is left RUNNING", statuses[owned], "RUNNING")
+        check("the orphaned job is settled", statuses[orphan], "FAILED")
+    finally:
+        os.environ.pop("WZ_CPU_SLOT_DIR", None)
+
+
 def main():
     work = Path(tempfile.mkdtemp(prefix="aitx_pipeline_test_"))
     print(f"workspace: {work}\n")
@@ -403,11 +1244,35 @@ def main():
         print()
         test_failure_reporting(work, binaries)
         print()
+        test_output_folder_safety(work, binaries)
+        print()
+        test_local_copies(work, binaries)
+        print()
+        test_safe_publish(work, binaries)
+        print()
+        test_broken_packages_are_not_published(work, binaries)
+        print()
+        test_hung_ffmpeg_is_stopped(work, binaries)
+        print()
+        test_disk_space_is_reserved(work, binaries)
+        print()
+        test_dead_jobs_are_cleaned_up(work, binaries)
+        print()
         test_single_job_uses_the_budget(work, binaries)
+        print()
+        test_every_ffmpeg_step_uses_the_budget(work, binaries)
         print()
         test_parallel_cli_jobs(work, binaries)
         print()
         test_api(work, binaries)
+        print()
+        test_api_operations(work, binaries)
+        print()
+        test_encoder_check(work, binaries)
+        print()
+        test_restart_recovery(work, binaries)
+        print()
+        test_recovery_leaves_owned_jobs_alone(work)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

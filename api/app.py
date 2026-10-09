@@ -8,6 +8,7 @@ from flask import Flask, jsonify
 
 from api import database as db
 from hls_toolkit.cpu_budget import get_shared_budget
+from api import job_manager
 from api.routes import api_bp, health_bp
 
 CONFIG_PATH = os.getenv("TRANSCODER_CONFIG", "config.json")
@@ -76,6 +77,34 @@ def configure_logging() -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
+def _start_test_encode(config) -> None:
+    """Prove the encoders and their licence work, in the background.
+
+    The result feeds /ready, so a server whose licence is missing or expired
+    reports itself not ready instead of failing its first job. Set
+    READY_TEST_ENCODE=0 to skip it.
+    """
+    if os.getenv("READY_TEST_ENCODE", "1").lower() in ("0", "false", "no"):
+        return
+    import threading
+    from hls_toolkit import encoder_check
+    from hls_toolkit.runner import build_run_settings
+    ffmpeg = build_run_settings(config, {})["ffmpeg_executable"]
+    if not os.access(ffmpeg, os.X_OK):
+        return
+
+    def run():
+        try:
+            for outcome in encoder_check.run_and_cache(
+                    ffmpeg, encoder_check.encoders_in_use(config)):
+                level = logging.INFO if outcome["ok"] is not False else logging.ERROR
+                logging.log(level, f"Test encode: {outcome['detail']}")
+        except Exception as e:
+            logging.warning(f"Test encode could not run: {e}")
+
+    threading.Thread(target=run, name="test-encode", daemon=True).start()
+
+
 def create_app(config_path: str = None) -> Flask:
     configure_logging()
     app = Flask(__name__)
@@ -97,6 +126,15 @@ def create_app(config_path: str = None) -> Flask:
     if not db.init_db():
         logging.warning("Running without persistence: job history and listings are "
                         "unavailable until MySQL is reachable (see docs/MYSQL_SETUP.md).")
+    else:
+        # Settle what a previous process left behind: interrupted RUNNING jobs
+        # are marked FAILED, queued PENDING jobs are queued again.
+        job_manager.recover_on_startup()
+    # Remove scratch folders of jobs that died with the previous process, and
+    # job logs past LOG_RETENTION_DAYS.
+    from hls_toolkit import housekeeping
+    housekeeping.run_periodic(job_manager.WORK_ROOT, job_manager.LOG_ROOT, force=True)
+    _start_test_encode(app.config["TRANSCODER_CONFIG"])
 
     app.register_blueprint(api_bp)
     app.register_blueprint(health_bp)
@@ -127,8 +165,18 @@ def create_app(config_path: str = None) -> Flask:
     return app
 
 
+def _stop_on_signal(signum, frame):
+    """Development server: interrupt running jobs cleanly, then exit."""
+    logging.warning(f"Signal {signum} received — shutting down.")
+    job_manager.shutdown_gracefully()
+    os._exit(0)
+
+
 if __name__ == "__main__":
+    import signal
     application = create_app()
+    signal.signal(signal.SIGTERM, _stop_on_signal)
+    signal.signal(signal.SIGINT, _stop_on_signal)
     application.run(host=os.getenv("HOST", "0.0.0.0"),
                     port=int(os.getenv("PORT", "8000")),
                     debug=False, threaded=True)

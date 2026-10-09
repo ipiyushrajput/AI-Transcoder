@@ -6,16 +6,68 @@ stages output in a scratch directory, runs the pipeline, and guarantees the
 scratch directory is removed however the run ends.
 """
 import os
+import re
 import shutil
 import tempfile
 import traceback
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from hls_toolkit import s3_io
+from hls_toolkit import disk_budget, housekeeping, s3_io
+from hls_toolkit.ffmpeg_wrapper import configure_watchdog
 from hls_toolkit.hls_generator import generate_hls_workflow
 from hls_toolkit.job_context import (JobCancelled, JobContext, TranscodeError,
-                                     bind_context, channel_name_for)
+                                     bind_context, channel_name_for, claim_unique_dir)
+
+# Where a finished package is saved when it is not (only) published to S3:
+# relative paths resolve against the current directory.
+DEFAULT_LOCAL_OUTPUT_DIR = "hls_output"
+
+_MAX_OUTPUT_NAME = 1024
+_MAX_OUTPUT_SEGMENT = 255
+
+
+def validate_output_dir_name(name: Any) -> str:
+    """Return `name` if it is a safe output folder name, else raise ValueError.
+
+    The name becomes a folder inside the job's scratch directory and the S3
+    folder under ``s3.key_prefix``. An absolute path or a ``..`` segment would
+    point the staging folder somewhere else on the server, and that folder is
+    uploaded in full and then deleted — so both are refused outright rather
+    than cleaned up. Nested names (``shows/AETN_S10_E03``) are allowed.
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("The output folder name is empty.")
+    text = name.strip()
+    if len(text) > _MAX_OUTPUT_NAME:
+        raise ValueError(f"The output folder name is longer than {_MAX_OUTPUT_NAME} "
+                         f"characters.")
+    if text.startswith(("/", "~")) or "\\" in text or re.match(r"^[A-Za-z]:", text):
+        raise ValueError(
+            f"The output folder must be a plain name such as 'AETN_S10_E03', not a "
+            f"path: {name!r}. It names the folder in S3 (under s3.key_prefix); use "
+            f"--local-output-dir to choose where a local copy is saved.")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        raise ValueError(f"The output folder name contains control characters: {name!r}")
+    for segment in text.split("/"):
+        if segment in ("", ".", ".."):
+            raise ValueError(
+                f"The output folder name may not contain empty, '.' or '..' parts: "
+                f"{name!r}")
+        if len(segment) > _MAX_OUTPUT_SEGMENT:
+            raise ValueError(f"Each part of the output folder name must be at most "
+                             f"{_MAX_OUTPUT_SEGMENT} characters: {name!r}")
+    return text
+
+
+def _ensure_within(path: Path, root: Path, what: str) -> None:
+    """Refuse to work on `path` unless it really lies inside `root`."""
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+    except ValueError:
+        raise TranscodeError(
+            f"Refusing to use {what} {path}: it is outside the job's scratch "
+            f"directory {root}.", stage="VALIDATION") from None
 
 
 def build_run_settings(config: Dict[str, Any],
@@ -57,6 +109,9 @@ def build_run_settings(config: Dict[str, Any],
         "thumbnails_enabled": bool(thumbnails_enabled),
         "upload": bool(overrides.get("upload", defaults.get("upload", True))),
         "delete_local_output": bool(overrides.get("delete_local_output", True)),
+        "local_output_dir": (overrides.get("local_output_dir")
+                             or defaults.get("local_output_dir")
+                             or DEFAULT_LOCAL_OUTPUT_DIR),
         "duration": overrides.get("duration"),
         "transcode_workers": overrides.get("transcode_workers"),
         "debug": bool(overrides.get("debug", False)),
@@ -91,10 +146,18 @@ def run_transcode_job(config: Dict[str, Any],
         ``["status"]``.
     """
     settings = build_run_settings(config, overrides)
+    defaults = config.get("defaults", {})
+    configure_watchdog(defaults.get("ffmpeg_stall_timeout_seconds"),
+                       defaults.get("ffmpeg_max_seconds"),
+                       defaults.get("ffprobe_timeout_seconds"))
     input_uri = settings["input_video"]
     if not input_uri:
         raise TranscodeError("No input video was supplied (defaults.input_video "
                              "is empty and no override was given).", stage="VALIDATION")
+    try:
+        settings["output_dir_name"] = validate_output_dir_name(settings["output_dir_name"])
+    except ValueError as e:
+        raise TranscodeError(str(e), stage="VALIDATION") from e
 
     ctx = JobContext(input_uri=input_uri, job_id=job_id, log_root=log_root,
                      debug=settings["debug"],
@@ -113,16 +176,29 @@ def run_transcode_job(config: Dict[str, Any],
 
     if work_root:
         Path(work_root).mkdir(parents=True, exist_ok=True)
-    work_dir = Path(tempfile.mkdtemp(prefix=f"aitx_{ctx.channel[:24]}_", dir=work_root))
+    work_dir = Path(tempfile.mkdtemp(prefix=f"{housekeeping.SCRATCH_PREFIX}{ctx.channel[:24]}_",
+                                     dir=work_root))
+    # Held while this job lives, so a later job can tell our folder from one
+    # left behind by a job that was killed.
+    owner = housekeeping.ScratchOwner(work_dir)
     output_dir = work_dir / settings["output_dir_name"]
     temp_dir = work_dir / "temp"
     output_dir.mkdir(parents=True, exist_ok=True)
     temp_dir.mkdir(parents=True, exist_ok=True)
     ctx.metadata["work_dir"] = str(work_dir)
+    # Keep a local copy when nothing goes to S3, or when --keep-local asks for
+    # one. Either way the package must leave the scratch directory before that
+    # is removed, or it is lost.
+    keep_local_copy = (not settings["upload"]) or (not settings["delete_local_output"])
+    reservation = None
 
     try:
+        _ensure_within(output_dir, work_dir, "output folder")
+        housekeeping.run_periodic(work_root, log_root, ctx=ctx)
         ctx.mark_running()
         ctx.set_stage("FETCHING_INPUT", 0.0)
+        reservation = _reserve_scratch(input_uri, settings, defaults,
+                                       work_root, work_dir, ctx)
 
         local_input = s3_io.resolve_input(input_uri, work_dir, "Input video",
                                           ctx=ctx, region=settings["s3_region"])
@@ -162,20 +238,97 @@ def run_transcode_job(config: Dict[str, Any],
             upload=settings["upload"],
             delete_local_output=settings["delete_local_output"])
 
+        if keep_local_copy:
+            saved = _save_package(output_dir, settings, ctx)
+            if not settings["upload"]:
+                ctx.output_prefix = str(saved)
+                ctx.metadata["playback_url"] = str(saved / "channel.m3u8")
         ctx.mark_completed()
     except JobCancelled:
-        ctx.mark_cancelled()
+        if ctx.interrupt_reason:
+            ctx.mark_failed(ctx.interrupt_reason)
+        else:
+            ctx.mark_cancelled()
     except TranscodeError as e:
         ctx.stage = e.stage or ctx.stage
-        ctx.mark_failed(f"[{e.stage}] {e}")
+        message = f"[{e.stage}] {e}"
+        if ctx.interrupt_reason:
+            # Stopped mid-step by a shutdown (e.g. during the S3 download).
+            message = ctx.interrupt_reason
+        # A failed upload leaves a finished package behind: keep it so the
+        # upload can be retried without transcoding again.
+        if e.stage == "UPLOADING" and output_dir.is_dir() and any(output_dir.iterdir()):
+            try:
+                saved = _save_package(output_dir, settings, ctx)
+                message += (f"\nThe finished package was saved to {saved}. Retry the "
+                            f"upload with: python app.py --upload-only "
+                            f"--s3-upload-source-dir {saved} "
+                            f"--output {settings['output_dir_name']}")
+            except TranscodeError as save_error:
+                message += f"\nThe package could not be saved locally either: {save_error}"
+        ctx.mark_failed(message)
     except Exception as e:
         ctx.logger.error("Unhandled error in transcode job\n" + traceback.format_exc())
         ctx.mark_failed(f"{type(e).__name__}: {e}")
     finally:
+        if settings["debug"]:
+            owner.keep()
         _remove_work_dir(work_dir, keep=settings["debug"], ctx=ctx)
+        owner.release()
+        if reservation is not None:
+            reservation.release()
         bind_context(None)
 
     return ctx.snapshot()
+
+
+def _reserve_scratch(input_uri: str, settings: Dict[str, Any], defaults: Dict[str, Any],
+                     work_root: Optional[str], work_dir: Path, ctx: JobContext):
+    """Hold this job's share of scratch space before anything is downloaded.
+
+    The estimate is the source size times the space factor: the downloaded
+    copy, the encoded clips, the merged renditions and the HLS segments. A
+    local source is not copied, so it counts one factor less.
+    """
+    factor = disk_budget.space_factor(defaults.get("disk_space_factor"))
+    if s3_io.is_s3_uri(input_uri):
+        size = int(s3_io.head_object(input_uri, region=settings["s3_region"])
+                   .get("ContentLength", 0))
+        needed = size * factor
+    else:
+        local = os.path.abspath(os.path.expanduser(str(input_uri)))
+        if not os.path.isfile(local):
+            return None             # resolve_input reports the missing file
+        needed = os.path.getsize(local) * max(0.0, factor - 1)
+    return disk_budget.reserve(work_root or tempfile.gettempdir(), work_dir, needed,
+                               label=ctx.channel, ctx=ctx,
+                               should_abort=lambda: ctx.cancelled)
+
+
+def _save_package(output_dir: Path, settings: Dict[str, Any], ctx: JobContext) -> Path:
+    """Move the staged package out of scratch into the local output folder.
+
+    The destination is ``<local_output_dir>/<output folder>``; if that already
+    exists the package goes to ``<output folder>_2`` and so on, so an earlier
+    package is never overwritten or merged into. Raises TranscodeError when the
+    package cannot be saved — a job must not report success for output that
+    did not survive.
+    """
+    root = Path(os.path.abspath(os.path.expanduser(str(settings["local_output_dir"]))))
+    name = Path(settings["output_dir_name"])
+    try:
+        destination = claim_unique_dir(root / name.parent, name.name)
+        for item in sorted(Path(output_dir).iterdir()):
+            shutil.move(str(item), str(destination / item.name))
+    except OSError as e:
+        raise TranscodeError(f"Could not save the package to {root}: {e}",
+                             stage="SAVING_OUTPUT") from e
+    if destination.name != name.name:
+        ctx.logger.info(f"'{root / name}' already exists, so this package was saved "
+                        f"to '{destination}' instead.")
+    ctx.logger.info(f"Package saved locally at {destination}")
+    ctx.metadata["local_output"] = str(destination)
+    return destination
 
 
 def _remove_work_dir(work_dir: Path, keep: bool, ctx: JobContext) -> None:

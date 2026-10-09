@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from hls_toolkit import s3_io
 from hls_toolkit.job_context import TranscodeError
+from hls_toolkit.runner import validate_output_dir_name
 
 logger = logging.getLogger(__name__)
 
@@ -45,14 +46,19 @@ def handle_s3_upload_only(args: Any,
 
     destination_folder_name = (args.output if args.output != default_output_dir
                                else source_dir.name)
+    try:
+        destination_folder_name = validate_output_dir_name(destination_folder_name)
+    except ValueError as e:
+        logger.error(f"Invalid --output: {e}")
+        return 1
     prefix = s3_io.build_output_prefix(s3_key_prefix, destination_folder_name)
     logger.info(f"Uploading '{source_dir}' to s3://{s3_bucket_name}/{prefix} ...")
 
     try:
-        s3_io.delete_prefix(s3_bucket_name, prefix)
         result = s3_io.upload_directory(
             source_dir, s3_bucket_name, prefix,
             delete_local=bool(getattr(args, "delete_local", False)))
+        s3_io.remove_stale_objects(s3_bucket_name, prefix, result["keys"])
     except TranscodeError as e:
         logger.error(f"Upload failed: {e}")
         return 1

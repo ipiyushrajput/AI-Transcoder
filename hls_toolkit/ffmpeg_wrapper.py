@@ -4,12 +4,16 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import math
+import collections
 import concurrent.futures
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, Tuple
 
@@ -21,6 +25,93 @@ from hls_toolkit.esam_parser import remap_esam_events_for_merged_clips
 
 ACTIVE_PROCESSES = []
 PROCESS_LOCK = threading.Lock()
+
+# --- watchdog ---------------------------------------------------------------
+# A hung FFmpeg used to hold its CPU cores — and so every other job waiting on
+# them — for ever. FFmpeg reports its position (time=) continuously, so a run
+# whose position stops moving for STALL seconds is stopped and the job fails.
+# Slow encodes keep advancing, so only a real hang trips it. A hard per-command
+# limit is available but off by default, so a long encode is never cut short.
+DEFAULT_STALL_SECONDS = 600.0
+DEFAULT_MAX_SECONDS = 0.0            # 0 = no hard limit
+DEFAULT_FFPROBE_TIMEOUT_SECONDS = 300.0
+# Keep at most this many output lines per stream in memory; ffmpeg.log keeps all.
+OUTPUT_TAIL_LINES = 5000
+
+_watchdog_config: Dict[str, Optional[float]] = {
+    "stall": None, "max": None, "ffprobe": None}
+
+
+_launcher_lock = threading.Lock()
+_launcher: Optional[List[str]] = None
+
+
+def _launch_prefix() -> List[str]:
+    """``setpriv --pdeathsig KILL --`` when available, else nothing.
+
+    FFmpeg runs in its own session so its whole process group can be stopped
+    cleanly — which also means it outlives its parent. If a job's process is
+    killed (kill -9, a crash), its FFmpeg kept running, burning CPU the budget
+    no longer counted. With the parent-death signal set, the kernel kills
+    FFmpeg when the thread that started it dies. FFmpeg's own arguments are
+    unchanged; setpriv just sets the signal and execs it in place, so the pid
+    is FFmpeg's. Set WZ_NO_PDEATHSIG=1 to launch FFmpeg directly.
+    """
+    global _launcher
+    with _launcher_lock:
+        if _launcher is None:
+            _launcher = []
+            if sys.platform.startswith("linux") and not os.getenv("WZ_NO_PDEATHSIG"):
+                setpriv = shutil.which("setpriv")
+                if setpriv:
+                    try:
+                        helptext = subprocess.run([setpriv, "--help"], capture_output=True,
+                                                  text=True, timeout=10).stdout
+                        if "--pdeathsig" in helptext:
+                            _launcher = [setpriv, "--pdeathsig", "KILL", "--"]
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+            if not _launcher:
+                logging.getLogger(__name__).warning(
+                    "setpriv --pdeathsig is unavailable: FFmpeg will keep running if "
+                    "its parent process is killed (install util-linux >= 2.33).")
+        return list(_launcher)
+
+
+def _launch(cmd_list: List[str]) -> List[str]:
+    """The argv that actually starts `cmd_list` (see :func:`_launch_prefix`)."""
+    if not cmd_list or not os.path.exists(str(cmd_list[0])):
+        # Keep FileNotFoundError for a missing binary, as when run directly.
+        return list(cmd_list)
+    return _launch_prefix() + [str(a) for a in cmd_list]
+
+
+def configure_watchdog(stall_seconds=None, max_seconds=None,
+                       ffprobe_timeout_seconds=None) -> None:
+    """Set the limits from the config; environment variables still win."""
+    for key, value in (("stall", stall_seconds), ("max", max_seconds),
+                       ("ffprobe", ffprobe_timeout_seconds)):
+        if value is not None:
+            _watchdog_config[key] = value
+
+
+def _limit(env_name: str, key: str, default: float) -> float:
+    for value in (os.getenv(env_name), _watchdog_config.get(key)):
+        if value in (None, ""):
+            continue
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            log().warning(f"Ignoring non-numeric {env_name}/{key} value {value!r}.")
+    return default
+
+
+def watchdog_limits() -> Tuple[float, float, float]:
+    """(stall seconds, hard limit seconds, ffprobe timeout); 0 disables one."""
+    return (_limit("WZ_FFMPEG_STALL_SECONDS", "stall", DEFAULT_STALL_SECONDS),
+            _limit("WZ_FFMPEG_MAX_SECONDS", "max", DEFAULT_MAX_SECONDS),
+            _limit("WZ_FFPROBE_TIMEOUT_SECONDS", "ffprobe",
+                   DEFAULT_FFPROBE_TIMEOUT_SECONDS))
 
 
 def get_active_processes():
@@ -114,13 +205,24 @@ def _run_ffprobe_command(cmd_list: List[str],
                          check_returncode: bool = True) -> Optional[str]:
     """Runs an ffprobe command and captures its output."""
     try:
-        process = subprocess.Popen(cmd_list,
+        process = subprocess.Popen(_launch(cmd_list),
                                    stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT,
                                    universal_newlines=True,
                                    encoding="utf-8",
                                    errors="ignore")
-        output, _ = process.communicate()
+        timeout = watchdog_limits()[2] or None
+        try:
+            output, _ = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            ctx = current_context()
+            raise TranscodeError(
+                f"{log_prefix}: FFprobe did not finish within {timeout:.0f}s and was "
+                f"stopped. The input may be unreadable or on a stalled mount. "
+                f"Command: {' '.join(shlex.quote(str(a)) for a in cmd_list)}",
+                stage=(ctx.stage if ctx else "PROBING"))
         if check_returncode and process.returncode != 0:
             raise subprocess.CalledProcessError(process.returncode, cmd_list, output=output)
         return output.strip()
@@ -232,7 +334,7 @@ def _run_ffmpeg_command_with_logging(cmd_list: List[str],
         ctx.ffmpeg_command(log_prefix, full_cmd_str)
 
     try:
-        process = subprocess.Popen(cmd_list,
+        process = subprocess.Popen(_launch(cmd_list),
                                    stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE,
@@ -251,8 +353,13 @@ def _run_ffmpeg_command_with_logging(cmd_list: List[str],
 
     with PROCESS_LOCK:
         ACTIVE_PROCESSES.append(process)
+    stall_limit, max_limit, _ = watchdog_limits()
+    started = time.monotonic()
+    progress = {"position": -1.0, "advanced_at": started}
+    progress_lock = threading.Lock()
     try:
-        stdout_buffer, stderr_buffer = [], []
+        stdout_buffer = collections.deque(maxlen=OUTPUT_TAIL_LINES)
+        stderr_buffer = collections.deque(maxlen=OUTPUT_TAIL_LINES)
 
         def read_stream(stream, buffer, stream_name):
             progress_keys = ['frame=', 'fps=', 'size=', 'time=', 'bitrate=', 'speed=']
@@ -264,6 +371,12 @@ def _run_ffmpeg_command_with_logging(cmd_list: List[str],
                 if not line_stripped:
                     continue
                 if stream_name == "stderr":
+                    position = _parse_progress_seconds(line_stripped)
+                    if position is not None:
+                        with progress_lock:
+                            if position > progress["position"]:
+                                progress["position"] = position
+                                progress["advanced_at"] = time.monotonic()
                     if all(k in line_stripped for k in progress_keys):
                         log().debug(f"FFmpeg {log_prefix} progress: {line_stripped}")
                         if progress_cb and expected_seconds:
@@ -286,11 +399,33 @@ def _run_ffmpeg_command_with_logging(cmd_list: List[str],
         stdout_thread.start()
         stderr_thread.start()
         cancelled = False
+        stopped_reason = None
         try:
             while process.poll() is None:
                 if ctx is not None and ctx.cancelled:
                     cancelled = True
                     log().warning(f"Cancellation requested — terminating {log_prefix}")
+                    _terminate_process(process)
+                    break
+                now = time.monotonic()
+                with progress_lock:
+                    idle = now - progress["advanced_at"]
+                    position = progress["position"]
+                if stall_limit and idle > stall_limit:
+                    where = (f"at {position:.1f}s of output" if position >= 0
+                             else "before producing any output")
+                    stopped_reason = (
+                        f"{log_prefix} made no progress for {idle:.0f}s ({where}) and "
+                        f"was stopped as hung. The limit is {stall_limit:.0f}s "
+                        f"(WZ_FFMPEG_STALL_SECONDS or "
+                        f"defaults.ffmpeg_stall_timeout_seconds).")
+                elif max_limit and now - started > max_limit:
+                    stopped_reason = (
+                        f"{log_prefix} ran longer than the {max_limit:.0f}s limit and "
+                        f"was stopped (WZ_FFMPEG_MAX_SECONDS or "
+                        f"defaults.ffmpeg_max_seconds).")
+                if stopped_reason:
+                    log().error(stopped_reason)
                     _terminate_process(process)
                     break
                 try:
@@ -308,10 +443,15 @@ def _run_ffmpeg_command_with_logging(cmd_list: List[str],
         stderr_output = "".join(stderr_buffer)
         if cancelled:
             raise JobCancelled(f"{log_prefix} cancelled")
+        if stopped_reason:
+            tail = _tail_text(stderr_output or stdout_output, 20)
+            raise TranscodeError(
+                f"{stopped_reason}\nCommand: {full_cmd_str}\nLast FFmpeg output:\n{tail}",
+                stage=(ctx.stage if ctx is not None else "TRANSCODING"))
 
         if process.returncode != 0:
             tail = _tail_text(stderr_output or stdout_output, 40)
-            message = (f"{log_prefix} failed with exit code {process.returncode}.\n"
+            message = (f"{log_prefix} failed: {describe_exit(process.returncode)}.\n"
                        f"Command: {full_cmd_str}\n"
                        f"Last FFmpeg output:\n{tail}")
             if check_returncode:
@@ -346,6 +486,35 @@ def _terminate_process(process) -> None:
                 process.kill()
             except Exception:
                 pass
+
+
+def describe_exit(returncode: Optional[int]) -> str:
+    """How FFmpeg ended, in words — above all when a signal killed it.
+
+    A bare "exit -9" hides the usual culprit: the kernel's out-of-memory
+    killer, which picks the biggest process, typically an encoder.
+    """
+    if returncode is None:
+        return "did not exit"
+    if returncode >= 0:
+        return f"exit code {returncode}"
+    number = -returncode
+    try:
+        name = signal.Signals(number).name
+    except ValueError:
+        name = f"signal {number}"
+    if number == signal.SIGKILL:
+        return (f"killed by {name}. Nothing in this job stops FFmpeg that way, so this "
+                f"is almost always the kernel's out-of-memory killer: check "
+                f"`journalctl -k | grep -i 'out of memory'` (or `dmesg`). Run fewer "
+                f"jobs at once, lower --cpu-budget, or add memory")
+    if number in (signal.SIGSEGV, signal.SIGBUS, signal.SIGILL, signal.SIGFPE,
+                  signal.SIGABRT):
+        return (f"crashed ({name}). This is a fault inside FFmpeg; the last lines of "
+                f"its output are below and the full output is in ffmpeg.log")
+    if number == signal.SIGTERM:
+        return f"terminated by another process ({name})"
+    return f"killed by {name}"
 
 
 def _tail_text(text: str, lines: int) -> str:
@@ -822,11 +991,15 @@ def generate_clipped_transcoded_merged_mp4s(
                     log().warning("Transcode cancelled — stopping remaining tasks")
                     executor.shutdown(wait=False, cancel_futures=True)
                     raise
+                except TranscodeError:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
                 except subprocess.CalledProcessError as exc:
                     executor.shutdown(wait=False, cancel_futures=True)
                     raise TranscodeError(
-                        f"FFmpeg failed during transcode (exit {exc.returncode}). "
-                        f"See ffmpeg.log for the full output.",
+                        f"FFmpeg failed during transcode: "
+                        f"{describe_exit(exc.returncode)}. "
+                        f"See error.log for its last output and ffmpeg.log for all of it.",
                         stage="TRANSCODING") from exc
                 except Exception as exc:
                     log().error(f"A transcoding task generated an exception: {exc}",

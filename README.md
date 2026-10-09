@@ -25,7 +25,7 @@ owns the machine. See [Parallel jobs](#parallel-jobs).
 ```bash
 git clone <this-repo> && cd AI-Transcoder
 python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.lock      # the exact, tested versions (ranges: requirements.txt)
 
 # Edit inputs, ladder and S3 destination
 $EDITOR config.json
@@ -59,7 +59,8 @@ python app.py --check
 ```
 
 That validates the Python packages, the FFmpeg build (including that
-`libwz264`/`libwz265` are actually present), AWS credentials, that the input
+`libwz264`/`libwz265` are actually present, and a one-second test encode with
+each encoder the templates use, which proves the licence works), AWS credentials, that the input
 objects are readable, that the output bucket is *writable*, and MySQL —
 reporting each one with a specific remedy. Run it first on any new server.
 
@@ -135,11 +136,34 @@ than surfacing later as a confusing FFmpeg error.
 
 ## Output: straight to S3
 
-The package is staged in a scratch directory, uploaded to
+The package is staged in a scratch directory, **validated**, uploaded to
 `s3://<bucket>/<key_prefix>/<output_dir>/`, and **verified object by object**
 (every key HEADed and its size compared) before the local directory is deleted.
-A partial upload fails the job and leaves the local copy in place, so output is
-never lost silently.
+
+**Validation before upload.** The job checks what is actually on disk: the
+master playlist exists and lists every requested rendition; every playlist it
+references exists, ends with `#EXT-X-ENDLIST` and has segments; every segment
+exists and is non-empty; each rendition's total duration matches what was
+requested (within half a segment); thumbnails exist when requested. Any problem
+fails the job at `VALIDATING_OUTPUT`, every problem is listed, and nothing is
+published. A rendition that fails to package fails the job at `PACKAGING_HLS`.
+
+**Republishing never takes the live output down.** Nothing is deleted first.
+The upload goes in three phases — segments, subtitles and thumbnails, then the
+variant playlists, then the master playlist last — so a player or CDN never sees
+a playlist before the files it references. Files within a phase go up in
+parallel (`WZ_S3_UPLOAD_THREADS`, default 16), and each is HEADed and
+size-checked as it lands, before the next phase starts. If a file fails to
+upload or verify, the job stops at that phase boundary: no playlist is published over missing media, and
+the previously published package stays live. Only after every new object is
+verified are files the new package no longer has (a dropped rendition, surplus
+old segments) removed.
+
+**The output folder is a name, not a path.** `output_dir` / `--output`
+(`AETN_S10_E03`, or nested like `shows/AETN_S10_E03`) names the folder in S3 and
+for a local copy. Absolute paths, `..`, backslashes and drive letters are
+refused — such a name used to point the staging folder outside scratch, where
+it was uploaded and then deleted.
 
 Correct content types are set on the way up (`application/vnd.apple.mpegurl`
 for `.m3u8`, `video/mp2t` for `.ts`, `text/vtt` for `.vtt`) so players can read
@@ -155,7 +179,18 @@ s3://dev-us-west-2-transcoder-bucket/Visionular/V3/AETN_AmericanPickers_S10_E03_
 └── thumbnails/thumb_0001.jpg
 ```
 
-Pass `--keep-local` (or `"delete_local_output": false`) to retain the local copy.
+### Local copies
+
+A local copy of the package is saved under `--local-output-dir` (default
+`./hls_output`, or `defaults.local_output_dir`):
+
+* with `--no-upload` — the package is saved there instead of uploaded;
+* with `--keep-local` (or `"delete_local_output": false`) — uploaded *and* saved;
+* when an upload fails — the finished package is saved, and the error names the
+  folder and the `--upload-only` command that retries it without transcoding.
+
+An existing folder is never overwritten or merged into: the copy goes to
+`<name>_2`, `<name>_3` and so on. If the copy cannot be saved the job fails.
 
 ---
 
@@ -225,6 +260,11 @@ None of this touched FFmpeg. The encoder settings — preset, CRF, `threads`,
 `codec_params`, GOP — and the FFmpeg command lines themselves are byte-for-byte
 the same as before; only *when* each encode starts is different.
 
+Loudnorm analysis (1 core), HLS packaging (1 core per rendition) and thumbnail
+extraction (2 cores) reserve from the same budget as the clip encodes, so they
+no longer run on top of a budget that other jobs' encodes have already filled.
+The FFmpeg commands themselves are unchanged.
+
 ### Sizing
 
 The budget defaults to the server's CPU count. To set it:
@@ -271,8 +311,17 @@ guess. Every stage boundary is a checkpoint:
 * **Transcode** — FFmpeg exit code, with the last 40 lines of its output in the
   message and the full stream in `ffmpeg.log`; the pool cancels remaining work
   on the first failure
-* **Upload** — per-file retries, then verification; a mismatch fails the job and
-  keeps the local output
+* **Packaging / validation** — a rendition that fails to package, or a package
+  with a missing, empty, incomplete or short playlist or segment, fails the job
+  before anything is published (see *Output*)
+* **Upload** — per-file retries, then verification; a failure stops before the
+  next publishing phase, leaves the previous package live, and saves the finished
+  package locally for a retry
+* **Hung FFmpeg / FFprobe** — an FFmpeg run whose position (`time=`) stops
+  advancing for 10 minutes is stopped and the job fails, naming the step and
+  where it stopped; its CPU cores are freed for other jobs. FFprobe has a
+  5-minute limit. See *Configuration → Time limits*.
+* **Server restart** — see *Deployment → Restarts*
 
 A failed job's `GET /status` includes `error_stage`, `error_message` and the
 tail of `error.log` inline. Cancellation terminates the FFmpeg process group and
@@ -311,6 +360,46 @@ A map of template name to ABR ladder. Per rung: `name`, `width`, `height`,
 `-wz264-params` / `-wz265-params`), `bitrate` or `crf`, `preset`, `caeopts`,
 `threads`, `GopSize`, `interlace_mode`, `video_format`, `frame_rate`.
 
+### Time limits
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `WZ_FFMPEG_STALL_SECONDS` / `defaults.ffmpeg_stall_timeout_seconds` | `600` | Stop an FFmpeg run whose output position has not advanced for this long |
+| `WZ_FFMPEG_MAX_SECONDS` / `defaults.ffmpeg_max_seconds` | `0` (off) | Hard limit on any single FFmpeg command |
+| `WZ_FFPROBE_TIMEOUT_SECONDS` / `defaults.ffprobe_timeout_seconds` | `300` | Limit on any FFprobe call |
+
+The environment variable wins over the config value; `0` disables a limit.
+Slow encodes keep advancing, so the stall limit only stops a genuine hang — it
+never shortens a long encode.
+
+### Scratch disk
+
+Before downloading, each job reserves about *source size × factor* of space on
+its scratch disk (`--work-dir` / `WORK_ROOT`, or the system temp). Reservations
+are shared by every job on the machine, so parallel jobs cannot fill the disk
+together: a job that fits starts at once, one that would fit after others
+finish waits (logging why), and one that could never fit fails immediately at
+`FETCHING_INPUT` with the sizes involved. A job that dies frees its
+reservation automatically.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `WZ_DISK_SPACE_FACTOR` / `defaults.disk_space_factor` | `3` | Scratch needed per byte of source (one less for a local source, which is not copied) |
+| `WZ_DISK_MIN_FREE_BYTES` | 1 GiB | Always left free for everything else |
+| `WZ_DISK_WAIT_SECONDS` | `1800` | How long to wait for space before failing |
+
+### Cleanup
+
+A job removes its scratch folder when it ends. A job that is killed
+(`kill -9`, out of memory, power loss) cannot, so each scratch folder carries
+an owner file its job keeps locked while alive; every job, and the API at
+start-up, removes `aitx_*` folders whose owner is gone (at most once every
+10 minutes per machine). Folders kept by `--debug` are never removed.
+
+Set `LOG_RETENTION_DAYS` to remove job log folders (`logs/...`) once nothing in
+them has changed for that many days. It is `0` (keep for ever) by default.
+Database records are kept; their log endpoint then says the folder is gone.
+
 ### Other sections
 
 `paths` (FFmpeg locations), `thumbnail_generation`, `audio_normalization`,
@@ -331,8 +420,11 @@ python app.py --input s3://bucket/in.mp4 --output my_asset
 # First 60 seconds, H.265 ladder, keep local output and scratch
 python app.py --duration 60 --template h265_standard --keep-local --debug
 
-# Package locally without uploading
-python app.py --no-upload --output ./local_out
+# Package locally without uploading (saved to ./hls_output/my_asset)
+python app.py --no-upload --output my_asset
+
+# ...or somewhere else
+python app.py --no-upload --output my_asset --local-output-dir /data/packages
 
 # Upload an already-packaged directory
 python app.py --upload-only --s3-upload-source-dir ./hls_out --output my_asset
@@ -374,7 +466,28 @@ curl -s "localhost:8000/api/v1/jobs?status=RUNNING"
 | `GET` | `/api/v1/jobs/<id>/logs?type=job\|error\|ffmpeg` |
 | `POST` | `/api/v1/jobs/<id>/cancel` |
 | `DELETE` | `/api/v1/jobs/<id>` |
-| `GET` | `/api/v1/templates`, `/api/v1/config`, `/health` |
+| `GET` | `/api/v1/templates`, `/api/v1/config` |
+| `GET` | `/health` — the process is up |
+| `GET` | `/ready` — `200` when a job can run now, else `503` with the failed check |
+| `GET` | `/metrics` — Prometheus metrics (jobs by status, queue, CPU budget, scratch space) |
+
+What a submission can get back:
+
+| Code | Meaning |
+| --- | --- |
+| `202` | Queued. `queue_position` is set when it waits behind other jobs; `warnings` lists any unknown fields that were ignored (a typo such as `resolution`) |
+| `200` | Same `Idempotency-Key` as an earlier submission: the original job is returned, nothing new starts |
+| `400` | The request cannot run: a wrong type (`"upload": "false"` is refused, not read as true), a bad timecode, an unknown template, a missing local file |
+| `422` | The `Idempotency-Key` was already used for a different request |
+| `429` | `MAX_QUEUED_JOBS` jobs are already waiting; retry after `Retry-After` seconds |
+| `503` | The server is shutting down |
+
+Send an `Idempotency-Key` header (any unique string, e.g. a UUID) to make a
+retry safe: if the first response was lost, resubmitting with the same key
+returns that job instead of transcoding twice.
+
+Set `ALERT_WEBHOOK_URL` to have every failed job posted there as JSON (`text`
+plus `job_id`, `stage`, `error_message`, `log_dir`, `host`).
 
 ---
 
@@ -405,7 +518,9 @@ database name contains a hyphen, so quote it with backticks in your own SQL:
 ``USE `Visionular-Transcoder`;``.
 
 Tables: `jobs`, `job_variants`, `job_clips` (InnoDB, utf8mb4, native `JSON` for
-the config snapshot). The API also runs without a database — transcodes still
+the config snapshot). A `jobs` table from an earlier version is upgraded in
+place on start (the `idempotency_key` column and an index on `submitted_at` are
+added when missing); no migration step or manual SQL is needed. The API also runs without a database — transcodes still
 work, only history and listings are unavailable, and `/health` reports
 `"database": "unavailable"`.
 
@@ -436,6 +551,33 @@ its own scratch space.
 `WORK_ROOT` needs free space of roughly three times the source file per
 concurrent job.
 
+### Restarts
+
+The unit starts gunicorn through `deploy/gunicorn.conf.py`. On
+`systemctl stop`, `restart` or a deploy:
+
+* new submissions get `503` with `Retry-After`;
+* running jobs are interrupted — FFmpeg is stopped and each job is recorded as
+  `FAILED` with *"Interrupted: the server shut down while this job was running
+  … Resubmit the job to run it again."* Nothing half-finished is published;
+* queued jobs stay `PENDING`.
+
+On the next start, jobs a previous process left behind are settled:
+
+* `PENDING` jobs are queued again from the configuration stored with them
+  (set `REQUEUE_PENDING_ON_START=0` to mark them failed instead);
+* `RUNNING` jobs — left by a crash, `kill -9` or power loss — are marked
+  `FAILED` as interrupted, with the stage and progress they reached.
+
+Each queued or running job holds a lock file (under `WZ_CPU_SLOT_DIR`) for as
+long as it is alive, and the kernel drops it when its process ends, so startup
+only ever settles jobs whose process is gone — never one that is still running.
+
+`graceful_timeout` (120s, `GRACEFUL_TIMEOUT`) is how long gunicorn waits for
+this; keep systemd's `TimeoutStopSec` (300s) above it. Run gunicorn with
+`-c deploy/gunicorn.conf.py` if you start it by hand, or the shutdown handling
+does not run.
+
 ---
 
 ## Troubleshooting
@@ -448,6 +590,7 @@ directly, with the fix for each.
 | `module 'lib' has no attribute 'X509_V_FLAG_NOTIFY_POLICY'` | Installed `pyOpenSSL` is older than the installed `cryptography` (which dropped those constants). botocore imports pyOpenSSL optionally and versions before 1.38.46 did not catch this. Fix with `pip install --upgrade 'boto3>=1.38.46' 'botocore>=1.38.46'`, or repair the pair: `pip install --upgrade 'pyOpenSSL>=24.0.0' 'cryptography>=42'`. Installing into a virtualenv avoids the apt/pip mix that causes it. |
 | `FFmpeg executable not found at ...` | `paths.ffmpeg_executable` is wrong, or `bin/ffmpeg` is not executable |
 | `Unknown encoder 'libwz264'` | The binary in `bin/` is a stock FFmpeg without the in-house encoders |
+| `Test encode (libwz264)` fails in `--check`, or `/ready` shows `encoder_license` false | The encoder refused to run: usually `bin/wz_license.cnf` / `wz_license.key` are missing, for another server, or expired. The check quotes the encoder's own message. The test encode uses FFmpeg's built-in test pattern and changes nothing; `WZ_SKIP_TEST_ENCODE=1` skips it in `--check`, `READY_TEST_ENCODE=0` at API start |
 | `S3 object not found: s3://...` | Wrong key, or the instance role cannot see that bucket |
 | `Access denied reading s3://...` | The instance role lacks `s3:GetObject` on that prefix |
 | `upload is enabled but s3.bucket_name is not configured` | Set `s3.bucket_name`, or pass `"upload": false` |

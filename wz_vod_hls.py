@@ -95,9 +95,16 @@ def build_parser(config: Dict[str, Any], config_path: str) -> argparse.ArgumentP
     parser.add_argument("--input", default=defaults.get("input_video"),
                         help="Input video: a local path or an s3://bucket/key URI.")
     parser.add_argument("--output", default=defaults.get("output_dir", "output"),
-                        help="Output folder name. Used as the S3 folder under "
-                             "s3.key_prefix, and as the S3 destination folder "
-                             "when --upload-only is used.")
+                        help="Output folder name, e.g. AETN_S10_E03 (not a path). "
+                             "It is the S3 folder under s3.key_prefix, and the "
+                             "folder name for a local copy. Also the S3 "
+                             "destination folder when --upload-only is used.")
+    parser.add_argument("--local-output-dir",
+                        default=defaults.get("local_output_dir", "hls_output"),
+                        help="Where a local copy of the package is saved — with "
+                             "--no-upload, with --keep-local, or when an upload "
+                             "fails (default: ./hls_output). An existing folder is "
+                             "never overwritten: the copy goes to <name>_2 instead.")
     parser.add_argument("--subtitle", default=defaults.get("subtitle_file"),
                         help="Subtitle (VTT) file: a local path or an s3:// URI. "
                              "Omit for no subtitles.")
@@ -108,12 +115,14 @@ def build_parser(config: Dict[str, Any], config_path: str) -> argparse.ArgumentP
     upload_group.add_argument("--upload", action="store_true", dest="upload",
                               help="Publish the package to S3 (default).")
     upload_group.add_argument("--no-upload", action="store_false", dest="upload",
-                              help="Keep the package locally instead of uploading.")
+                              help="Do not upload; save the package under "
+                                   "--local-output-dir instead.")
     parser.set_defaults(upload=defaults.get("upload", True))
 
     parser.add_argument("--keep-local", action="store_true",
-                        help="Keep the local output after a successful S3 upload. "
-                             "By default it is deleted once every object is verified.")
+                        help="Also save a local copy under --local-output-dir after "
+                             "a successful S3 upload. By default the local package is "
+                             "deleted once every object is verified in S3.")
 
     esam_group = parser.add_mutually_exclusive_group()
     esam_group.add_argument("--esam", action="store_true", dest="esam",
@@ -245,6 +254,7 @@ def main() -> int:
         "thumbnails_enabled": args.thumbnails_enabled,
         "upload": args.upload,
         "delete_local_output": not args.keep_local,
+        "local_output_dir": args.local_output_dir,
         "duration": args.duration,
         "transcode_workers": args.transcode_workers,
         "debug": args.debug,

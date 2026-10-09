@@ -261,7 +261,9 @@ def upload_directory(local_dir, bucket: str, prefix: str,
                      extra_args_for: Optional[Callable[[Path], Dict]] = None) -> Dict:
     """Upload every file under `local_dir` to ``s3://bucket/prefix``.
 
-    Each object is verified with a HEAD (size match) after upload. The local
+    Files go up in parallel (``WZ_S3_UPLOAD_THREADS``, default 16) but phase by
+    phase — media, then playlists, then the master — and each object is
+    verified with a HEAD (size match) before the next phase starts. The local
     directory is removed only when every file has been confirmed present in S3,
     so a partial upload never silently loses the output.
 
@@ -279,7 +281,8 @@ def upload_directory(local_dir, bucket: str, prefix: str,
                              "cannot upload output.", stage="UPLOADING")
 
     prefix = (prefix or "").strip("/")
-    files = sorted(p for p in local_dir.rglob("*") if p.is_file())
+    phases = publish_phases(p for p in local_dir.rglob("*") if p.is_file())
+    files = [path for group in phases for path in group]
     if not files:
         raise TranscodeError(f"No output files were produced in {local_dir}",
                              stage="UPLOADING")
@@ -290,13 +293,15 @@ def upload_directory(local_dir, bucket: str, prefix: str,
 
     client = get_s3_client(region)
     config = _transfer_config()
-    sent_bytes = 0
+    threads = upload_threads()
+    progress = {"files": 0, "bytes": 0}
+    progress_lock = threading.Lock()
     keys: List[str] = []
-    failures: List[str] = []
 
-    for index, path in enumerate(files, 1):
-        if ctx is not None:
-            ctx.raise_if_cancelled()
+    def upload_one(path: Path):
+        """Upload one file and confirm it landed intact. Returns (key, error)."""
+        if ctx is not None and ctx.cancelled:
+            return None, "cancelled"
         rel = path.relative_to(local_dir).as_posix()
         key = f"{prefix}/{rel}" if prefix else rel
         extra = {"ContentType": _content_type(path)}
@@ -304,34 +309,51 @@ def upload_directory(local_dir, bucket: str, prefix: str,
             extra.update(extra_args_for(path) or {})
         try:
             client.upload_file(str(path), bucket, key, ExtraArgs=extra, Config=config)
-            keys.append(key)
         except Exception as e:
             _raise_environment_error(e, "UPLOADING")
             log.error(f"Upload failed for {rel}: {e}")
-            failures.append(rel)
-            continue
+            return None, "upload failed"
+        if _verify_uploads(client, bucket, local_dir, [key], prefix, log):
+            return None, "verification failed"
+        size = path.stat().st_size
+        with progress_lock:
+            progress["files"] += 1
+            progress["bytes"] += size
+            done = progress["files"]
+            if ctx is not None:
+                ctx.advance_within_stage(done / len(files))
+            if done % 50 == 0 or done == len(files):
+                log.info(f"  uploaded {done}/{len(files)} "
+                         f"({_human(progress['bytes'])} / {_human(total_bytes)})")
+        return key, None
 
-        sent_bytes += path.stat().st_size
-        if ctx is not None:
-            ctx.advance_within_stage(index / len(files))
-        if index % 50 == 0 or index == len(files):
-            log.info(f"  uploaded {index}/{len(files)} "
-                     f"({_human(sent_bytes)} / {_human(total_bytes)})")
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="s3-upload") as pool:
+        for phase_name, group in zip(PUBLISH_PHASES, phases):
+            if ctx is not None:
+                ctx.raise_if_cancelled()
+            # Files within a phase go up in parallel; phases never overlap.
+            outcomes = list(pool.map(upload_one, group))
+            if ctx is not None:
+                ctx.raise_if_cancelled()
+            failures = [path.relative_to(local_dir).as_posix()
+                        for path, (_, error) in zip(group, outcomes) if error]
+            keys.extend(key for key, _ in outcomes if key)
 
-    if failures:
-        raise TranscodeError(
-            f"{len(failures)} file(s) failed to upload to s3://{bucket}/{prefix}: "
-            f"{', '.join(failures[:10])}"
-            + (" ..." if len(failures) > 10 else ""),
-            stage="UPLOADING")
+            # Stop at the phase boundary: publishing playlists (above all the
+            # master) over media that did not arrive intact would point viewers
+            # at missing files. The previously published playlists stay live.
+            if failures:
+                remaining = list(PUBLISH_PHASES[PUBLISH_PHASES.index(phase_name) + 1:])
+                raise TranscodeError(
+                    f"{len(failures)} file(s) failed to upload to s3://{bucket}/{prefix}: "
+                    f"{', '.join(failures[:10])}" + (" ..." if len(failures) > 10 else "")
+                    + (f". The {' and '.join(remaining)} were not uploaded, so the "
+                       f"previously published package (if any) is still the live one."
+                       if remaining else ""),
+                    stage="UPLOADING")
+    sent_bytes = progress["bytes"]
 
-    log.info("Verifying uploaded objects...")
-    missing = _verify_uploads(client, bucket, local_dir, keys, prefix, log)
-    if missing:
-        raise TranscodeError(
-            f"Upload verification failed for {len(missing)} object(s): "
-            f"{', '.join(missing[:10])}" + (" ..." if len(missing) > 10 else ""),
-            stage="UPLOADING")
     log.info(f"All {len(keys)} object(s) verified in s3://{bucket}/{prefix}")
 
     if delete_local:
@@ -345,6 +367,47 @@ def upload_directory(local_dir, bucket: str, prefix: str,
     return {"uploaded": len(keys), "bytes": sent_bytes,
             "prefix": f"s3://{bucket}/{prefix}" if prefix else f"s3://{bucket}",
             "keys": keys}
+
+
+def upload_threads() -> int:
+    try:
+        return max(1, min(64, int(os.getenv("WZ_S3_UPLOAD_THREADS", "16"))))
+    except ValueError:
+        return 16
+
+
+def _is_master_playlist(path: Path) -> bool:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return "#EXT-X-STREAM-INF" in f.read()
+    except OSError:
+        return False
+
+
+PUBLISH_PHASES = ("media", "playlists", "master playlist")
+
+
+def publish_phases(files) -> List[List[Path]]:
+    """Split a package into the groups it must be published in, in order.
+
+    Segments, subtitles and thumbnails first, then the variant and subtitle
+    playlists, and the master playlist last. Whatever moment a player or CDN
+    fetches a playlist, everything it references is already in S3 — uploading
+    alphabetically put ``channel.m3u8`` first, pointing at files not yet there,
+    and a CDN could cache those 404s.
+    """
+    phases: List[List[Path]] = [[], [], []]
+    for path in files:
+        if path.suffix.lower() != ".m3u8":
+            phases[0].append(path)
+        else:
+            phases[2 if _is_master_playlist(path) else 1].append(path)
+    return [sorted(group, key=lambda p: p.as_posix()) for group in phases]
+
+
+def publish_order(files) -> List[Path]:
+    """Every file of the package, in publishing order."""
+    return [path for group in publish_phases(files) for path in group]
 
 
 def _verify_uploads(client, bucket: str, local_dir: Path, keys: List[str],
@@ -371,32 +434,63 @@ def build_output_prefix(key_prefix: str, output_dir_name: str) -> str:
     return f"{key_prefix}/{name}" if key_prefix else name
 
 
-def delete_prefix(bucket: str, prefix: str, ctx: Optional[JobContext] = None,
-                  region: Optional[str] = None) -> int:
-    """Delete everything under a prefix (clears a previous run's output)."""
+def remove_stale_objects(bucket: str, prefix: str, keep_keys,
+                         ctx: Optional[JobContext] = None,
+                         region: Optional[str] = None) -> Dict[str, int]:
+    """Delete objects under ``prefix/`` that are not part of the new package.
+
+    Called only after every new object is uploaded and verified, so the live
+    output is never missing: an earlier run's files stay until the new package
+    has fully replaced them, and only what the new package no longer contains
+    (a dropped rendition, extra old segments) is removed.
+
+    Returns ``{"deleted": n, "failed": n}``. A failure here does not fail the
+    job — the new package is complete and correct — but it is logged as a
+    warning with the keys that remain.
+    """
     log = get_logger(ctx)
     prefix = (prefix or "").strip("/")
     if not prefix:
-        raise TranscodeError("Refusing to delete an empty S3 prefix "
+        raise TranscodeError("Refusing to clean an empty S3 prefix "
                              "(that would target the whole bucket).", stage="UPLOADING")
+    keep = set(keep_keys)
     client = get_s3_client(region)
-    deleted = 0
+    stale: List[str] = []
     try:
         paginator = client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/"):
-            objects = [{"Key": o["Key"]} for o in page.get("Contents", [])]
-            if not objects:
-                continue
-            for i in range(0, len(objects), 1000):
-                client.delete_objects(Bucket=bucket,
-                                      Delete={"Objects": objects[i:i + 1000]})
-            deleted += len(objects)
+            stale.extend(o["Key"] for o in page.get("Contents", []) if o["Key"] not in keep)
     except Exception as e:
-        log.warning(f"Could not clear s3://{bucket}/{prefix}: {e}")
-        return deleted
+        log.warning(f"Could not list s3://{bucket}/{prefix} to remove files left over "
+                    f"from an earlier run: {e}. The new package is complete; stale "
+                    f"objects, if any, remain.")
+        return {"deleted": 0, "failed": 0}
+
+    deleted = failed = 0
+    for i in range(0, len(stale), 1000):
+        batch = stale[i:i + 1000]
+        try:
+            response = client.delete_objects(
+                Bucket=bucket, Delete={"Objects": [{"Key": k} for k in batch]})
+        except Exception as e:
+            log.warning(f"Could not delete {len(batch)} stale object(s) under "
+                        f"s3://{bucket}/{prefix}: {e}")
+            failed += len(batch)
+            continue
+        # delete_objects reports per-key failures in the response, not by raising.
+        errors = (response or {}).get("Errors", []) if isinstance(response, dict) else []
+        failed += len(errors)
+        deleted += len(batch) - len(errors)
+        for err in errors[:10]:
+            log.warning(f"Could not delete stale s3://{bucket}/{err.get('Key')}: "
+                        f"{err.get('Code')} {err.get('Message')}")
     if deleted:
-        log.info(f"Cleared {deleted} existing object(s) under s3://{bucket}/{prefix}")
-    return deleted
+        log.info(f"Removed {deleted} object(s) left over from an earlier run under "
+                 f"s3://{bucket}/{prefix}")
+    if failed:
+        log.warning(f"{failed} stale object(s) could not be removed from "
+                    f"s3://{bucket}/{prefix}; the new package is complete.")
+    return {"deleted": deleted, "failed": failed}
 
 
 def _content_type(path: Path) -> str:

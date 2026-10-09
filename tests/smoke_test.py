@@ -365,6 +365,219 @@ def test_cpu_budget(work):
                                          if not n.startswith(".")], [])
 
 
+def test_disk_budget(work):
+    """Scratch reservations: shared, waited for, refused when hopeless, never leaked."""
+    print("disk budget")
+    import subprocess
+    import threading
+    import time
+    from hls_toolkit import disk_budget
+    from hls_toolkit.job_context import JobCancelled, TranscodeError
+
+    GB = 1024 ** 3
+    root = work / "scratch"
+    root.mkdir()
+    saved_env = os.environ.get("WZ_CPU_SLOT_DIR")
+    saved_free = disk_budget._free_bytes
+    os.environ["WZ_CPU_SLOT_DIR"] = str(work / "coord_disk")
+    disk_budget._free_bytes = lambda path: 10 * GB      # pretend 10 GB is free
+    try:
+        first = disk_budget.reserve(root, root / "a", 6 * GB, min_free_bytes=GB,
+                                    max_wait_seconds=0)
+        check("a job that fits is reserved", first.nbytes, 6 * GB)
+
+        # 10 free - 6 held - 1 spare = 3 available: 4 GB must wait (and here, give up).
+        try:
+            disk_budget.reserve(root, root / "b", 4 * GB, min_free_bytes=GB,
+                                max_wait_seconds=0)
+            check("a job that would overcommit waits", "reserved", "waited")
+        except TranscodeError as e:
+            check_true("a job that would overcommit waits", "Waited" in str(e), str(e))
+
+        # More than the disk could ever give is refused at once, with numbers.
+        started = time.time()
+        try:
+            disk_budget.reserve(root, root / "c", 50 * GB, min_free_bytes=GB,
+                                max_wait_seconds=60)
+            check("an impossible job is refused", "reserved", "refused")
+        except TranscodeError as e:
+            check_true("an impossible job is refused", "Not enough scratch space" in str(e)
+                       and e.stage == "FETCHING_INPUT", str(e))
+        check_true("…without waiting", time.time() - started < 2.0)
+
+        # A waiting job starts as soon as the space is released.
+        result = {}
+
+        def waiter():
+            result["r"] = disk_budget.reserve(root, root / "d", 4 * GB, min_free_bytes=GB,
+                                              max_wait_seconds=30)
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        time.sleep(0.3)
+        check_true("the second job is still waiting", thread.is_alive())
+        first.release()
+        first.release()                                   # idempotent
+        thread.join(15)
+        check_true("it starts once the space is released", "r" in result)
+        result["r"].release()
+
+        # Space other jobs have already written counts as used, not as held twice.
+        (root / "e").mkdir()
+        held = disk_budget.reserve(root, root / "e", 6 * GB, min_free_bytes=GB,
+                                   max_wait_seconds=0)
+        (root / "e" / "blob").write_bytes(b"x" * 1024)
+        disk_budget._free_bytes = lambda path: 10 * GB - 1024
+        again = disk_budget.reserve(root, root / "f", 3 * GB - 2048, min_free_bytes=GB,
+                                    max_wait_seconds=0)
+        check_true("written bytes are not counted twice", again.nbytes > 0)
+        again.release()
+        held.release()
+
+        # Cancelling a waiting job stops the wait.
+        hog = disk_budget.reserve(root, root / "g", 8 * GB, min_free_bytes=GB,
+                                  max_wait_seconds=0)
+        stop = threading.Event()
+        threading.Timer(0.3, stop.set).start()
+        try:
+            disk_budget.reserve(root, root / "h", 4 * GB, min_free_bytes=GB,
+                                should_abort=stop.is_set, max_wait_seconds=30)
+            check("a cancelled wait is abandoned", "reserved", "cancelled")
+        except JobCancelled:
+            check("a cancelled wait is abandoned", "cancelled", "cancelled")
+        hog.release()
+
+        # A job killed while holding space must not keep it.
+        holder = subprocess.Popen([sys.executable, "-c", (
+            "import sys, time; sys.path.insert(0, %r)\n"
+            "from hls_toolkit import disk_budget\n"
+            "disk_budget._free_bytes = lambda path: 10 * 1024 ** 3\n"
+            "r = disk_budget.reserve(%r, %r, 8 * 1024 ** 3, min_free_bytes=1024 ** 3)\n"
+            "print('held', flush=True); time.sleep(60)\n")
+            % (os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+               str(root), str(root / "dead"))],
+            stdout=subprocess.PIPE, text=True, env=dict(os.environ))
+        check("another process holds 8 GB", holder.stdout.readline().strip(), "held")
+        try:
+            disk_budget.reserve(root, root / "i", 4 * GB, min_free_bytes=GB,
+                                max_wait_seconds=0)
+            check("the hold is visible across processes", "reserved", "blocked")
+        except TranscodeError:
+            check("the hold is visible across processes", "blocked", "blocked")
+        holder.kill()
+        holder.wait()
+        after = disk_budget.reserve(root, root / "i", 4 * GB, min_free_bytes=GB,
+                                    max_wait_seconds=0)
+        check("kill -9 releases the dead job's space", after.nbytes, 4 * GB)
+        after.release()
+    finally:
+        disk_budget._free_bytes = saved_free
+        if saved_env is None:
+            os.environ.pop("WZ_CPU_SLOT_DIR", None)
+        else:
+            os.environ["WZ_CPU_SLOT_DIR"] = saved_env
+
+
+def test_housekeeping(work):
+    """Dead jobs' scratch folders and old logs go; anything alive or kept stays."""
+    print("housekeeping")
+    import subprocess
+    import time
+    from hls_toolkit import housekeeping as hk
+
+    root = work / "janitor"
+    root.mkdir()
+    old = time.time() - 3600
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def scratch(name, owner=True, aged=True):
+        folder = root / f"aitx_{name}"
+        (folder / "input").mkdir(parents=True)
+        (folder / "input" / "source.mp4").write_bytes(b"x" * 100)
+        if owner:
+            hk.ScratchOwner(folder).release()
+            if aged:
+                os.utime(folder / hk.OWNER_FILE, (old, old))
+        return folder
+
+    dead = scratch("dead")
+    young = scratch("young", aged=False)
+    foreign = scratch("foreign", owner=False)
+    kept = scratch("kept")
+    (kept / hk.KEEP_FILE).write_text("debug")
+    unrelated = root / "something_else"
+    unrelated.mkdir()
+
+    live_here = root / "aitx_live_here"
+    live_here.mkdir()
+    holder_here = hk.ScratchOwner(live_here)
+    os.utime(live_here / hk.OWNER_FILE, (old, old))
+
+    live_there = root / "aitx_live_there"
+    live_there.mkdir()
+    holder = subprocess.Popen([sys.executable, "-c", (
+        "import os, sys, time; sys.path.insert(0, %r)\n"
+        "from hls_toolkit.housekeeping import ScratchOwner, OWNER_FILE\n"
+        "o = ScratchOwner(%r); t = time.time() - 3600\n"
+        "os.utime(os.path.join(%r, OWNER_FILE), (t, t))\n"
+        "print('held', flush=True); time.sleep(60)\n")
+        % (repo, str(live_there), str(live_there))], stdout=subprocess.PIPE, text=True)
+    check("another process owns a folder", holder.stdout.readline().strip(), "held")
+
+    removed = hk.sweep_scratch(root)
+    check("only the dead job's folder is removed", removed, 1)
+    check_true("…it is gone", not dead.exists())
+    for folder, why in ((young, "a brand-new folder"), (foreign, "a folder not made by a job"),
+                        (kept, "a --debug folder"), (unrelated, "an unrelated folder"),
+                        (live_here, "a folder this process's job owns"),
+                        (live_there, "a folder another live process owns")):
+        check_true(f"{why} is left alone", folder.exists())
+
+    holder.kill()
+    holder.wait()
+    holder_here.release()
+    check("once their jobs die, their folders go too", hk.sweep_scratch(root), 2)
+
+    # Log retention.
+    logs = work / "janitor_logs"
+    stale_cli = logs / "ShowA_2"
+    stale_api = logs / "ShowB" / "job-old"
+    fresh_api = logs / "ShowB" / "job-new"
+    lonely = logs / "ShowC" / "job-only"
+    for folder in (stale_cli, stale_api, fresh_api, lonely):
+        folder.mkdir(parents=True)
+        (folder / "job.json").write_text("{}")
+        (folder / "job.log").write_text("log")
+    ancient = time.time() - 40 * 86400
+    for folder in (stale_cli, stale_api, lonely):
+        for path in [folder, *folder.iterdir()]:
+            os.utime(path, (ancient, ancient))
+    os.utime(fresh_api / "job.log", (ancient, ancient))   # job.json still fresh
+    check("retention is off by default", hk.sweep_logs(logs), 0)
+    check("old job folders are removed after LOG_RETENTION_DAYS",
+          hk.sweep_logs(logs, days=30), 3)
+    check_true("a folder with any recent file is kept", fresh_api.exists())
+    check_true("an emptied channel folder is removed", not (logs / "ShowC").exists())
+    check_true("a channel with jobs left is kept", (logs / "ShowB").exists())
+
+    # The periodic sweep runs once per interval across processes.
+    saved = os.environ.get("WZ_CPU_SLOT_DIR")
+    os.environ["WZ_CPU_SLOT_DIR"] = str(work / "coord_janitor")
+    try:
+        first = scratch("dead_again")
+        hk.run_periodic(root)
+        check_true("the first periodic sweep runs", not first.exists())
+        second = scratch("dead_later")
+        hk.run_periodic(root)
+        check_true("a second sweep within the interval is skipped", second.exists())
+        hk.run_periodic(root, force=True)
+        check_true("…unless forced (API start-up)", not second.exists())
+    finally:
+        if saved is None:
+            os.environ.pop("WZ_CPU_SLOT_DIR", None)
+        else:
+            os.environ["WZ_CPU_SLOT_DIR"] = saved
+
+
 def test_transcode_scheduling():
     """Cost estimates and the order clips are released into the budget."""
     print("transcode scheduling")
@@ -455,6 +668,92 @@ def test_job_progress_isolation(work):
     fw._clear_clip_progress(jobs[0])
 
 
+def test_output_dir_names():
+    """Output folder names must be names, never paths out of scratch."""
+    print("output folder names")
+    from hls_toolkit.runner import validate_output_dir_name
+    for good in ("AETN_AmericanPickers_S10_E03_en", "shows/AETN_S10_E03",
+                 "Show: Part 1", "  padded  "):
+        try:
+            check(f"accepts {good!r}", validate_output_dir_name(good), good.strip())
+        except ValueError as e:
+            check(f"accepts {good!r}", f"rejected: {e}", "accepted")
+    for bad in ("/home/ubuntu", "../etc", "a/../b", "a//b", "./x", "~/x",
+                "C:\\data", "C:/data", "a\\b", "", "   ", "tab\there", None, 42):
+        try:
+            validate_output_dir_name(bad)
+            check(f"rejects {bad!r}", "accepted", "rejected")
+        except ValueError:
+            check(f"rejects {bad!r}", "rejected", "rejected")
+
+
+def test_package_validator(work):
+    """Every kind of broken package is caught; a whole one passes."""
+    print("package validator")
+    from hls_toolkit.job_context import TranscodeError
+    from hls_toolkit.package_validator import validate_package
+
+    def build(root, renditions=("1080p", "720p"), segments=3, duration=6.0):
+        root.mkdir(parents=True)
+        master = ["#EXTM3U", "#EXT-X-VERSION:3"]
+        for name in renditions:
+            master += [f"#EXT-X-STREAM-INF:BANDWIDTH=1", f"channel_{name}.m3u8"]
+            lines = ["#EXTM3U", "#EXT-X-TARGETDURATION:6"]
+            for i in range(1, segments + 1):
+                seg = f"channel_{name}_{i:05d}.ts"
+                (root / seg).write_bytes(b"x" * 188)
+                lines += [f"#EXTINF:{duration:.6f},", seg]
+            lines.append("#EXT-X-ENDLIST")
+            (root / f"channel_{name}.m3u8").write_text("\n".join(lines) + "\n")
+        (root / "channel.m3u8").write_text("\n".join(master) + "\n")
+        return root
+
+    def problem(label, root, expected_text, **kw):
+        try:
+            validate_package(root, kw.pop("renditions", ["1080p", "720p"]),
+                             expected_duration=kw.pop("expected", 18.0), **kw)
+            check(label, "passed", "caught")
+        except TranscodeError as e:
+            check_true(label, e.stage == "VALIDATING_OUTPUT" and expected_text in str(e),
+                       str(e))
+
+    good = build(work / "pkg_good")
+    try:
+        summary = validate_package(good, ["1080p", "720p"], expected_duration=18.0)
+        check("a whole package passes", len(summary["renditions"]), 2)
+    except TranscodeError as e:
+        check("a whole package passes", f"failed: {e}", "passed")
+
+    root = build(work / "pkg_missing_seg")
+    (root / "channel_720p_00002.ts").unlink()
+    problem("a missing segment is caught", root, "1 segment(s) missing")
+
+    root = build(work / "pkg_empty_seg")
+    (root / "channel_1080p_00003.ts").write_bytes(b"")
+    problem("an empty segment is caught", root, "segment(s) are empty")
+
+    root = build(work / "pkg_no_endlist")
+    text = (root / "channel_720p.m3u8").read_text().replace("#EXT-X-ENDLIST", "")
+    (root / "channel_720p.m3u8").write_text(text)
+    problem("a playlist without ENDLIST is caught", root, "no #EXT-X-ENDLIST")
+
+    root = build(work / "pkg_missing_playlist")
+    (root / "channel_720p.m3u8").unlink()
+    problem("a master pointing at a missing playlist is caught", root, "does not exist")
+
+    root = build(work / "pkg_missing_rung", renditions=("1080p",))
+    problem("a requested rendition missing from the master is caught", root,
+            "does not list rendition 720p")
+
+    root = build(work / "pkg_short")
+    problem("a rendition shorter than expected is caught", root, "runs 18.000s",
+            expected=60.0)
+
+    root = build(work / "pkg_no_thumbs")
+    problem("missing thumbnails are caught when requested", root, "thumbnails",
+            expect_thumbnails=True)
+
+
 def main():
     work = Path(tempfile.mkdtemp(prefix="aitranscoder_smoke_"))
     try:
@@ -465,7 +764,11 @@ def main():
         test_ffmpeg_command()
         test_hevc_codec_string()
         test_duplicate_rung_guard()
+        test_output_dir_names()
+        test_package_validator(work)
         test_cpu_budget(work)
+        test_disk_budget(work)
+        test_housekeeping(work)
         test_transcode_scheduling()
         test_unique_log_dirs(work)
         test_job_progress_isolation(work)
