@@ -22,6 +22,8 @@ class FakeS3Client:
         self.root.mkdir(parents=True, exist_ok=True)
         self.uploads = []
         self.downloads = []
+        self.deletes = []
+        self.undeletable = set()
 
     def _path(self, bucket: str, key: str) -> Path:
         return self.root / bucket / key
@@ -63,11 +65,20 @@ class FakeS3Client:
         return {"Contents": contents}
 
     def delete_objects(self, Bucket, Delete):
+        # Like S3, a key that cannot be deleted is reported in "Errors" rather
+        # than raised. Tests list such keys in `undeletable`.
+        deleted, errors = [], []
         for obj in Delete.get("Objects", []):
+            if obj["Key"] in self.undeletable:
+                errors.append({"Key": obj["Key"], "Code": "AccessDenied",
+                               "Message": "Access Denied"})
+                continue
             path = self._path(Bucket, obj["Key"])
             if path.is_file():
                 path.unlink()
-        return {"Deleted": Delete.get("Objects", [])}
+            deleted.append(obj)
+        self.deletes.extend(o["Key"] for o in deleted)
+        return {"Deleted": deleted, "Errors": errors}
 
     # -- helpers for tests -------------------------------------------------
     def put(self, bucket: str, key: str, data: bytes) -> str:

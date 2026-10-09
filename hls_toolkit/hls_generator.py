@@ -554,11 +554,16 @@ def generate_hls_workflow(config: Dict[str, Any],
                                                            output_dir_name)
             log().info(f"Publishing output to s3://{s3_bucket_name_local}/"
                        f"{destination_prefix}")
-            s3_io.delete_prefix(s3_bucket_name_local, destination_prefix,
-                                ctx=ctx, region=s3_region)
+            # Upload over the live output in place, master last; files from an
+            # earlier run are removed only once the new package is verified.
             upload_result = s3_io.upload_directory(
                 output_dir, s3_bucket_name_local, destination_prefix,
                 ctx=ctx, region=s3_region, delete_local=delete_local_output)
+            cleanup = s3_io.remove_stale_objects(
+                s3_bucket_name_local, destination_prefix, upload_result["keys"],
+                ctx=ctx, region=s3_region)
+            if ctx is not None and cleanup["failed"]:
+                ctx.metadata["stale_objects_not_removed"] = cleanup["failed"]
             playback_url = (f"{upload_result['prefix']}/"
                             f"{master_playlist_path.name}")
             log().info(f"Output published: {upload_result['uploaded']} object(s), "

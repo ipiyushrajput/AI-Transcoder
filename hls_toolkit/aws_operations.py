@@ -55,10 +55,10 @@ def handle_s3_upload_only(args: Any,
     logger.info(f"Uploading '{source_dir}' to s3://{s3_bucket_name}/{prefix} ...")
 
     try:
-        s3_io.delete_prefix(s3_bucket_name, prefix)
         result = s3_io.upload_directory(
             source_dir, s3_bucket_name, prefix,
             delete_local=bool(getattr(args, "delete_local", False)))
+        s3_io.remove_stale_objects(s3_bucket_name, prefix, result["keys"])
     except TranscodeError as e:
         logger.error(f"Upload failed: {e}")
         return 1

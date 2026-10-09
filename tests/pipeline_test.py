@@ -500,6 +500,83 @@ def test_local_copies(work: Path, binaries: dict):
                and str(local_root / "retry_me") in failed["error_message"])
 
 
+def test_safe_publish(work: Path, binaries: dict):
+    """Republishing never takes the live output down, and the master goes last."""
+    print("safe publish")
+    from hls_toolkit import s3_io
+    from hls_toolkit.runner import run_transcode_job
+
+    client = fake_s3.install(s3_io, work / "s3_publish")
+    media = work / "publish"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+    prefix = "Visionular/V3/live_show"
+
+    # A previous run's package is live, including a rendition this run drops.
+    for name in ("channel.m3u8", "channel_1080p.m3u8", "channel_1080p_00001.ts",
+                 "channel_2160p.m3u8", "channel_2160p_00001.ts"):
+        client.put(BUCKET, f"{prefix}/{name}", b"previous run")
+
+    live_during_upload = []
+    original_upload = client.upload_file
+
+    def watching_upload(filename, bucket, key, ExtraArgs=None, Config=None):
+        live_during_upload.append(
+            (client._path(bucket, f"{prefix}/channel.m3u8")).is_file())
+        return original_upload(filename, bucket, key, ExtraArgs=ExtraArgs, Config=Config)
+
+    client.upload_file = watching_upload
+    client.undeletable = {f"{prefix}/channel_2160p_00001.ts"}
+    try:
+        result = run_transcode_job(
+            config, overrides=_quick_overrides(source, upload=True, output_dir="live_show",
+                                               resolution="1080p,720p"),
+            log_root=str(media / "logs"), work_root=str(media / "scratch"))
+    finally:
+        client.upload_file = original_upload
+        client.undeletable = set()
+
+    check("republish completes", result["status"], "COMPLETED")
+    check_true("the old master stayed live for the whole upload",
+               live_during_upload and all(live_during_upload))
+    order = [u["key"].rsplit("/", 1)[-1] for u in client.uploads
+             if u["key"].startswith(prefix + "/")]
+    first_playlist = min(i for i, k in enumerate(order) if k.endswith(".m3u8"))
+    check_true("every segment is uploaded before any playlist",
+               all(not k.endswith(".m3u8") for k in order[:first_playlist])
+               and all(k.endswith(".m3u8") for k in order[first_playlist:]))
+    check("the master playlist is uploaded last", order[-1], "channel.m3u8")
+    keys = {k.rsplit("/", 1)[-1] for k in client.keys_under(BUCKET, prefix)}
+    check_true("the dropped rendition's playlist is removed afterwards",
+               "channel_2160p.m3u8" not in keys)
+    check_true("a stale object S3 refused to delete is reported, not hidden",
+               result["metadata"].get("stale_objects_not_removed") == 1)
+
+    # An upload that fails part-way leaves the previous package fully live.
+    client.put(BUCKET, f"{prefix}/channel.m3u8", b"previous run")
+
+    def failing_upload(filename, bucket, key, ExtraArgs=None, Config=None):
+        if key.endswith("_00002.ts"):
+            raise OSError("simulated network failure")
+        return original_upload(filename, bucket, key, ExtraArgs=ExtraArgs, Config=Config)
+
+    client.upload_file = failing_upload
+    try:
+        failed = run_transcode_job(
+            config, overrides=_quick_overrides(source, upload=True, output_dir="live_show",
+                                               resolution="1080p,720p",
+                                               local_output_dir=str(media / "saved")),
+            log_root=str(media / "logs"), work_root=str(media / "scratch"))
+    finally:
+        client.upload_file = original_upload
+    check("a failed republish fails the job", failed["status"], "FAILED")
+    check("the live master is still the previous one",
+          client._path(BUCKET, f"{prefix}/channel.m3u8").read_bytes(), b"previous run")
+
+
 def main():
     work = Path(tempfile.mkdtemp(prefix="aitx_pipeline_test_"))
     print(f"workspace: {work}\n")
@@ -512,6 +589,8 @@ def main():
         test_output_folder_safety(work, binaries)
         print()
         test_local_copies(work, binaries)
+        print()
+        test_safe_publish(work, binaries)
         print()
         test_single_job_uses_the_budget(work, binaries)
         print()
