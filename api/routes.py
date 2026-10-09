@@ -66,6 +66,8 @@ def start_job():
 
     try:
         record = job_manager.submit_job(_config(), payload)
+    except job_manager.ServiceUnavailable as e:
+        return jsonify({"error": str(e)}), 503, {"Retry-After": "30"}
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:

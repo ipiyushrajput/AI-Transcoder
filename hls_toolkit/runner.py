@@ -237,10 +237,16 @@ def run_transcode_job(config: Dict[str, Any],
                 ctx.metadata["playback_url"] = str(saved / "channel.m3u8")
         ctx.mark_completed()
     except JobCancelled:
-        ctx.mark_cancelled()
+        if ctx.interrupt_reason:
+            ctx.mark_failed(ctx.interrupt_reason)
+        else:
+            ctx.mark_cancelled()
     except TranscodeError as e:
         ctx.stage = e.stage or ctx.stage
         message = f"[{e.stage}] {e}"
+        if ctx.interrupt_reason:
+            # Stopped mid-step by a shutdown (e.g. during the S3 download).
+            message = ctx.interrupt_reason
         # A failed upload leaves a finished package behind: keep it so the
         # upload can be retried without transcoding again.
         if e.stage == "UPLOADING" and output_dir.is_dir() and any(output_dir.iterdir()):

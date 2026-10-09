@@ -135,11 +135,32 @@ than surfacing later as a confusing FFmpeg error.
 
 ## Output: straight to S3
 
-The package is staged in a scratch directory, uploaded to
+The package is staged in a scratch directory, **validated**, uploaded to
 `s3://<bucket>/<key_prefix>/<output_dir>/`, and **verified object by object**
 (every key HEADed and its size compared) before the local directory is deleted.
-A partial upload fails the job and leaves the local copy in place, so output is
-never lost silently.
+
+**Validation before upload.** The job checks what is actually on disk: the
+master playlist exists and lists every requested rendition; every playlist it
+references exists, ends with `#EXT-X-ENDLIST` and has segments; every segment
+exists and is non-empty; each rendition's total duration matches what was
+requested (within half a segment); thumbnails exist when requested. Any problem
+fails the job at `VALIDATING_OUTPUT`, every problem is listed, and nothing is
+published. A rendition that fails to package fails the job at `PACKAGING_HLS`.
+
+**Republishing never takes the live output down.** Nothing is deleted first.
+The upload goes in three phases — segments, subtitles and thumbnails, then the
+variant playlists, then the master playlist last — so a player or CDN never sees
+a playlist before the files it references. If a file fails to upload the job
+stops at that phase boundary: no playlist is published over missing media, and
+the previously published package stays live. Only after every new object is
+verified are files the new package no longer has (a dropped rendition, surplus
+old segments) removed.
+
+**The output folder is a name, not a path.** `output_dir` / `--output`
+(`AETN_S10_E03`, or nested like `shows/AETN_S10_E03`) names the folder in S3 and
+for a local copy. Absolute paths, `..`, backslashes and drive letters are
+refused — such a name used to point the staging folder outside scratch, where
+it was uploaded and then deleted.
 
 Correct content types are set on the way up (`application/vnd.apple.mpegurl`
 for `.m3u8`, `video/mp2t` for `.ts`, `text/vtt` for `.vtt`) so players can read
@@ -155,7 +176,18 @@ s3://dev-us-west-2-transcoder-bucket/Visionular/V3/AETN_AmericanPickers_S10_E03_
 └── thumbnails/thumb_0001.jpg
 ```
 
-Pass `--keep-local` (or `"delete_local_output": false`) to retain the local copy.
+### Local copies
+
+A local copy of the package is saved under `--local-output-dir` (default
+`./hls_output`, or `defaults.local_output_dir`):
+
+* with `--no-upload` — the package is saved there instead of uploaded;
+* with `--keep-local` (or `"delete_local_output": false`) — uploaded *and* saved;
+* when an upload fails — the finished package is saved, and the error names the
+  folder and the `--upload-only` command that retries it without transcoding.
+
+An existing folder is never overwritten or merged into: the copy goes to
+`<name>_2`, `<name>_3` and so on. If the copy cannot be saved the job fails.
 
 ---
 
@@ -271,8 +303,17 @@ guess. Every stage boundary is a checkpoint:
 * **Transcode** — FFmpeg exit code, with the last 40 lines of its output in the
   message and the full stream in `ffmpeg.log`; the pool cancels remaining work
   on the first failure
-* **Upload** — per-file retries, then verification; a mismatch fails the job and
-  keeps the local output
+* **Packaging / validation** — a rendition that fails to package, or a package
+  with a missing, empty, incomplete or short playlist or segment, fails the job
+  before anything is published (see *Output*)
+* **Upload** — per-file retries, then verification; a failure stops before the
+  next publishing phase, leaves the previous package live, and saves the finished
+  package locally for a retry
+* **Hung FFmpeg / FFprobe** — an FFmpeg run whose position (`time=`) stops
+  advancing for 10 minutes is stopped and the job fails, naming the step and
+  where it stopped; its CPU cores are freed for other jobs. FFprobe has a
+  5-minute limit. See *Configuration → Time limits*.
+* **Server restart** — see *Deployment → Restarts*
 
 A failed job's `GET /status` includes `error_stage`, `error_message` and the
 tail of `error.log` inline. Cancellation terminates the FFmpeg process group and
@@ -311,6 +352,18 @@ A map of template name to ABR ladder. Per rung: `name`, `width`, `height`,
 `-wz264-params` / `-wz265-params`), `bitrate` or `crf`, `preset`, `caeopts`,
 `threads`, `GopSize`, `interlace_mode`, `video_format`, `frame_rate`.
 
+### Time limits
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `WZ_FFMPEG_STALL_SECONDS` / `defaults.ffmpeg_stall_timeout_seconds` | `600` | Stop an FFmpeg run whose output position has not advanced for this long |
+| `WZ_FFMPEG_MAX_SECONDS` / `defaults.ffmpeg_max_seconds` | `0` (off) | Hard limit on any single FFmpeg command |
+| `WZ_FFPROBE_TIMEOUT_SECONDS` / `defaults.ffprobe_timeout_seconds` | `300` | Limit on any FFprobe call |
+
+The environment variable wins over the config value; `0` disables a limit.
+Slow encodes keep advancing, so the stall limit only stops a genuine hang — it
+never shortens a long encode.
+
 ### Other sections
 
 `paths` (FFmpeg locations), `thumbnail_generation`, `audio_normalization`,
@@ -331,8 +384,11 @@ python app.py --input s3://bucket/in.mp4 --output my_asset
 # First 60 seconds, H.265 ladder, keep local output and scratch
 python app.py --duration 60 --template h265_standard --keep-local --debug
 
-# Package locally without uploading
-python app.py --no-upload --output ./local_out
+# Package locally without uploading (saved to ./hls_output/my_asset)
+python app.py --no-upload --output my_asset
+
+# ...or somewhere else
+python app.py --no-upload --output my_asset --local-output-dir /data/packages
 
 # Upload an already-packaged directory
 python app.py --upload-only --s3-upload-source-dir ./hls_out --output my_asset
@@ -435,6 +491,33 @@ its own scratch space.
 
 `WORK_ROOT` needs free space of roughly three times the source file per
 concurrent job.
+
+### Restarts
+
+The unit starts gunicorn through `deploy/gunicorn.conf.py`. On
+`systemctl stop`, `restart` or a deploy:
+
+* new submissions get `503` with `Retry-After`;
+* running jobs are interrupted — FFmpeg is stopped and each job is recorded as
+  `FAILED` with *"Interrupted: the server shut down while this job was running
+  … Resubmit the job to run it again."* Nothing half-finished is published;
+* queued jobs stay `PENDING`.
+
+On the next start, jobs a previous process left behind are settled:
+
+* `PENDING` jobs are queued again from the configuration stored with them
+  (set `REQUEUE_PENDING_ON_START=0` to mark them failed instead);
+* `RUNNING` jobs — left by a crash, `kill -9` or power loss — are marked
+  `FAILED` as interrupted, with the stage and progress they reached.
+
+Each queued or running job holds a lock file (under `WZ_CPU_SLOT_DIR`) for as
+long as it is alive, and the kernel drops it when its process ends, so startup
+only ever settles jobs whose process is gone — never one that is still running.
+
+`graceful_timeout` (120s, `GRACEFUL_TIMEOUT`) is how long gunicorn waits for
+this; keep systemd's `TimeoutStopSec` (300s) above it. Run gunicorn with
+`-c deploy/gunicorn.conf.py` if you start it by hand, or the shutdown handling
+does not run.
 
 ---
 

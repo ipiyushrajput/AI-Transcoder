@@ -141,6 +141,7 @@ class JobContext:
 
         self._lock = threading.Lock()
         self.cancel_event = threading.Event()
+        self.interrupt_reason: Optional[str] = None
 
         self.stage = "QUEUED"
         self.progress_pct = 0
@@ -269,6 +270,16 @@ class JobContext:
         self.close()
 
     def request_cancel(self) -> None:
+        self.cancel_event.set()
+
+    def request_interrupt(self, reason: str) -> None:
+        """Stop the job like a cancel, but record it as FAILED with `reason`.
+
+        Used when the server shuts down: the job did not finish, nobody asked
+        for it to stop, and it needs resubmitting — that is a failure the
+        caller must see, not a cancellation.
+        """
+        self.interrupt_reason = reason
         self.cancel_event.set()
 
     @property

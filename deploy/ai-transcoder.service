@@ -10,17 +10,13 @@ Group=ubuntu
 WorkingDirectory=/opt/ai-transcoder
 EnvironmentFile=/etc/ai-transcoder.env
 ExecStart=/opt/ai-transcoder/.venv/bin/gunicorn \
-    --workers 1 \
-    --threads 8 \
-    --timeout 0 \
-    --bind 0.0.0.0:8000 \
-    --access-logfile - \
-    --error-logfile - \
+    -c /opt/ai-transcoder/deploy/gunicorn.conf.py \
     "api.app:create_app()"
 Restart=on-failure
 RestartSec=5
 KillMode=mixed
-# Transcodes are long; give in-flight jobs time to stop cleanly.
+# Running jobs are interrupted and recorded on stop (see gunicorn.conf.py,
+# graceful_timeout 120s); allow comfortably longer than that.
 TimeoutStopSec=300
 
 [Install]

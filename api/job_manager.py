@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from api import database as db
 from hls_toolkit import s3_io
+from hls_toolkit.coordination import JobLock, job_is_owned
 from hls_toolkit.job_context import JobContext, channel_name_for
 from hls_toolkit.runner import (build_run_settings, run_transcode_job,
                                 validate_output_dir_name)
@@ -28,11 +30,40 @@ MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
 LOG_ROOT = os.getenv("LOG_ROOT", "logs")
 WORK_ROOT = os.getenv("WORK_ROOT") or None
 PROGRESS_SYNC_SECONDS = float(os.getenv("PROGRESS_SYNC_SECONDS", "5"))
+REQUEUE_PENDING_ON_START = os.getenv("REQUEUE_PENDING_ON_START", "1") not in ("0", "false",
+                                                                             "no")
 
-_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS,
-                               thread_name_prefix="transcode")
+_executor: Optional[ThreadPoolExecutor] = None
+_executor_lock = threading.Lock()
 _registry: Dict[str, Dict[str, Any]] = {}
 _registry_lock = threading.Lock()
+_shutting_down = threading.Event()
+
+INTERRUPTED_MESSAGE = (
+    "Interrupted: the server shut down while this job was {where}. Its output was "
+    "not published. Resubmit the job to run it again.")
+
+
+class ServiceUnavailable(Exception):
+    """The server is shutting down and is not accepting new jobs."""
+
+
+def _get_executor() -> ThreadPoolExecutor:
+    global _executor
+    with _executor_lock:
+        if _executor is None:
+            _executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS,
+                                           thread_name_prefix="transcode")
+        return _executor
+
+
+def _release_lock(job_id: str) -> None:
+    """Give up ownership of a job once its final state is recorded."""
+    with _registry_lock:
+        entry = _registry.get(job_id)
+        lock = entry.pop("lock", None) if entry else None
+    if lock is not None:
+        lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +75,9 @@ def submit_job(base_config: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
     Returns the job record. Raises ValueError with a human-readable message when
     the payload is not runnable — the route turns that into a 400.
     """
+    if _shutting_down.is_set():
+        raise ServiceUnavailable("The server is shutting down and is not accepting "
+                                 "new jobs. Retry shortly.")
     config = _merge_config(base_config, payload)
     overrides = _overrides_from_payload(payload)
     settings = build_run_settings(config, overrides)
@@ -79,18 +113,24 @@ def submit_job(base_config: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
     }
 
     _persist_new_job(record, config, payload, settings)
-
-    with _registry_lock:
-        _registry[job_id] = {"record": dict(record), "ctx": None, "future": None}
-
-    future = _executor.submit(_run_job, job_id, config, overrides)
-    with _registry_lock:
-        if job_id in _registry:
-            _registry[job_id]["future"] = future
+    _enqueue(job_id, record, config, overrides)
 
     logger.info(f"[{job_id}] queued job for channel '{channel}' "
                 f"(input={settings['input_video']})")
     return dict(record)
+
+
+def _enqueue(job_id: str, record: Dict[str, Any], config: Dict[str, Any],
+             overrides: Dict[str, Any]) -> None:
+    """Own the job (lock file) and hand it to the worker pool."""
+    lock = JobLock(job_id)
+    with _registry_lock:
+        _registry[job_id] = {"record": dict(record), "ctx": None, "future": None,
+                             "lock": lock}
+    future = _get_executor().submit(_run_job, job_id, config, overrides)
+    with _registry_lock:
+        if job_id in _registry:
+            _registry[job_id]["future"] = future
 
 
 def _merge_config(base_config: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -256,6 +296,9 @@ def _run_job(job_id: str, config: Dict[str, Any], overrides: Dict[str, Any]) -> 
                 "log_dir": snapshot.get("log_dir"),
             })
             entry["ctx"] = None
+    # Only now that the final state is recorded may another process treat the
+    # job as abandoned.
+    _release_lock(job_id)
 
     logger.info(f"[{job_id}] finished with status {snapshot.get('status')}")
 
@@ -398,6 +441,7 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
         _update_job(job_id, status="CANCELLED", stage="QUEUED",
                     completed_at=db._utcnow(),
                     error_message="Cancelled before it started running.")
+        _release_lock(job_id)
         return {"cancelled": True, "message": "Queued job cancelled."}
 
     row = _fetch_job(job_id)
@@ -477,6 +521,129 @@ def delete_job(job_id: str) -> Dict[str, Any]:
         return {"deleted": False, "message": f"Delete failed: {e}"}
     finally:
         db.close_session(session)
+
+
+# ---------------------------------------------------------------------------
+# Restarts
+# ---------------------------------------------------------------------------
+def shutdown_gracefully(timeout: float = 90.0) -> Dict[str, int]:
+    """Stop for a restart without leaving jobs in a state nobody can explain.
+
+    New submissions are refused. Queued jobs are dropped from this process but
+    stay PENDING in the database, so the next start picks them up again.
+    Running jobs are interrupted: FFmpeg is stopped and each is recorded as
+    FAILED with a message saying the server shut down and the job should be
+    resubmitted. Waits up to `timeout` seconds for that to be written.
+    """
+    _shutting_down.set()
+    with _registry_lock:
+        running = [(job_id, e["ctx"], e["future"]) for job_id, e in _registry.items()
+                   if e.get("ctx") is not None]
+        queued = [job_id for job_id, e in _registry.items()
+                  if e.get("ctx") is None and e.get("future") is not None
+                  and not e["future"].done()]
+    for job_id, ctx, _ in running:
+        where = f"at stage {ctx.stage} ({ctx.progress_pct}%)"
+        ctx.request_interrupt(INTERRUPTED_MESSAGE.format(where=f"running, {where}"))
+        logger.warning(f"[{job_id}] interrupting for shutdown {where}")
+
+    global _executor
+    with _executor_lock:
+        executor, _executor = _executor, None
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
+    for job_id in queued:
+        _release_lock(job_id)            # stays PENDING; the next start requeues it
+    if queued:
+        logger.warning(f"{len(queued)} queued job(s) left PENDING for the next start.")
+
+    deadline = time.monotonic() + timeout
+    for job_id, _, future in running:
+        remaining = deadline - time.monotonic()
+        if future is None or remaining <= 0:
+            continue
+        try:
+            future.result(timeout=remaining)
+        except Exception:
+            pass
+    unfinished = [job_id for job_id, _, future in running
+                  if future is not None and not future.done()]
+    for job_id in unfinished:
+        logger.error(f"[{job_id}] did not stop within {timeout:.0f}s of shutdown; the "
+                     f"next start will mark it interrupted.")
+    return {"interrupted": len(running), "requeued_later": len(queued),
+            "unfinished": len(unfinished)}
+
+
+def recover_on_startup() -> Dict[str, int]:
+    """Settle jobs a previous server process left behind.
+
+    A job still RUNNING in the database whose owner is gone was interrupted by
+    a crash or restart: it is marked FAILED with an explanation. A job still
+    PENDING never started: it is queued again from the configuration stored
+    with it (unless REQUEUE_PENDING_ON_START=0). Jobs some live process still
+    owns are left alone, so this is safe to run while other processes work.
+    """
+    counts = {"interrupted": 0, "requeued": 0, "skipped_owned": 0, "unrecoverable": 0}
+    session = db.get_session()
+    if session is None:
+        logger.warning("Database unavailable: jobs interrupted by a previous restart "
+                       "cannot be settled or requeued.")
+        return counts
+    try:
+        rows = (session.query(db.Job)
+                .filter(db.Job.status.in_(("PENDING", "RUNNING")))
+                .order_by(db.Job.submitted_at.asc()).all())
+        for row in rows:
+            session.expunge(row)
+    except Exception as e:
+        logger.error(f"Could not look for interrupted jobs: {e}", exc_info=True)
+        return counts
+    finally:
+        db.close_session(session)
+
+    for row in rows:
+        if job_is_owned(row.job_id):
+            counts["skipped_owned"] += 1
+            continue
+        if row.status == "RUNNING" or not REQUEUE_PENDING_ON_START:
+            where = (f"running (last seen at stage {row.stage}, {row.progress_pct or 0}%)"
+                     if row.status == "RUNNING" else "queued")
+            _update_job(row.job_id, status="FAILED", error_stage="INTERRUPTED",
+                        error_message=INTERRUPTED_MESSAGE.format(where=where),
+                        completed_at=db._utcnow())
+            counts["interrupted"] += 1
+            logger.warning(f"[{row.job_id}] marked interrupted ({where})")
+            continue
+
+        config, payload = _decode_json(row.config_snapshot), _decode_json(row.request_payload)
+        if not isinstance(config, dict) or not isinstance(payload, dict):
+            _update_job(row.job_id, status="FAILED", error_stage="INTERRUPTED",
+                        error_message="Interrupted while queued, and its stored "
+                                      "configuration could not be read. Resubmit the job.",
+                        completed_at=db._utcnow())
+            counts["unrecoverable"] += 1
+            continue
+        record = row.to_dict()
+        try:
+            _enqueue(row.job_id, record, config, _overrides_from_payload(payload))
+        except RuntimeError:
+            counts["skipped_owned"] += 1           # another process just took it
+            continue
+        counts["requeued"] += 1
+        logger.info(f"[{row.job_id}] requeued after restart")
+    if any(counts.values()):
+        logger.info(f"Startup recovery: {counts}")
+    return counts
+
+
+def _decode_json(value):
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return None
+    return value
 
 
 def queue_stats() -> Dict[str, Any]:
@@ -594,4 +761,8 @@ def _as_float(value) -> Optional[float]:
 
 
 def shutdown(wait: bool = True) -> None:
-    _executor.shutdown(wait=wait)
+    global _executor
+    with _executor_lock:
+        executor, _executor = _executor, None
+    if executor is not None:
+        executor.shutdown(wait=wait)

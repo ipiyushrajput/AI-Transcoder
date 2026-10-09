@@ -8,6 +8,7 @@ from flask import Flask, jsonify
 
 from api import database as db
 from hls_toolkit.cpu_budget import get_shared_budget
+from api import job_manager
 from api.routes import api_bp, health_bp
 
 CONFIG_PATH = os.getenv("TRANSCODER_CONFIG", "config.json")
@@ -97,6 +98,10 @@ def create_app(config_path: str = None) -> Flask:
     if not db.init_db():
         logging.warning("Running without persistence: job history and listings are "
                         "unavailable until MySQL is reachable (see docs/MYSQL_SETUP.md).")
+    else:
+        # Settle what a previous process left behind: interrupted RUNNING jobs
+        # are marked FAILED, queued PENDING jobs are queued again.
+        job_manager.recover_on_startup()
 
     app.register_blueprint(api_bp)
     app.register_blueprint(health_bp)
@@ -127,8 +132,18 @@ def create_app(config_path: str = None) -> Flask:
     return app
 
 
+def _stop_on_signal(signum, frame):
+    """Development server: interrupt running jobs cleanly, then exit."""
+    logging.warning(f"Signal {signum} received — shutting down.")
+    job_manager.shutdown_gracefully()
+    os._exit(0)
+
+
 if __name__ == "__main__":
+    import signal
     application = create_app()
+    signal.signal(signal.SIGTERM, _stop_on_signal)
+    signal.signal(signal.SIGINT, _stop_on_signal)
     application.run(host=os.getenv("HOST", "0.0.0.0"),
                     port=int(os.getenv("PORT", "8000")),
                     debug=False, threaded=True)

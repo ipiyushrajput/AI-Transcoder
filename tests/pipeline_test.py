@@ -677,6 +677,184 @@ def test_hung_ffmpeg_is_stopped(work: Path, binaries: dict):
         cpu_budget.reset_shared_budget()
 
 
+def test_restart_recovery(work: Path, binaries: dict):
+    """Real gunicorn: a stop interrupts jobs cleanly; a restart settles them.
+
+    Needs MySQL (the DB_* settings); skipped without it.
+    """
+    print("restarts (real gunicorn)")
+    import signal
+    import socket
+    import subprocess
+    import time
+    import urllib.request
+
+    from api import database as db
+    if not db.init_db():
+        print("  skip (MySQL not reachable)")
+        return
+
+    media = work / "restart"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"].update({"subtitle_file": None, "upload": False,
+                               "local_output_dir": str(media / "out")})
+    config_path = media / "config.json"
+    config_path.write_text(json.dumps(config))
+    gunicorn = Path(sys.executable).with_name("gunicorn")
+
+    def free_port():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def start(slow: bool):
+        port = free_port()
+        env = dict(os.environ, TRANSCODER_CONFIG=str(config_path), BIND=f"127.0.0.1:{port}",
+                   LOG_ROOT=str(media / "logs"), WORK_ROOT=str(media / "scratch"),
+                   SERVER_LOG_DIR=str(media / "server_logs"), MAX_CONCURRENT_JOBS="1",
+                   WZ_CPU_SLOT_DIR=str(media / "slots"), GRACEFUL_TIMEOUT="60",
+                   FAKE_SECONDS_PER_MEDIA_MINUTE="90" if slow else "0")
+        proc = subprocess.Popen([str(gunicorn), "-c", str(ROOT / "deploy" / "gunicorn.conf.py"),
+                                 "api.app:create_app()"], cwd=str(ROOT), env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        base = f"http://127.0.0.1:{port}"
+        for _ in range(100):
+            try:
+                urllib.request.urlopen(base + "/health", timeout=1)
+                return proc, base
+            except Exception:
+                time.sleep(0.2)
+        raise RuntimeError("gunicorn did not start")
+
+    def post(base, body):
+        request = urllib.request.Request(base + "/api/v1/jobs", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+        return json.loads(urllib.request.urlopen(request, timeout=10).read())["job_id"]
+
+    def status(base, job_id):
+        return json.loads(urllib.request.urlopen(
+            f"{base}/api/v1/jobs/{job_id}/status", timeout=10).read())
+
+    def row(job_id):
+        session = db.get_session()
+        try:
+            job = session.query(db.Job).filter(db.Job.job_id == job_id).one()
+            return job.status, job.error_message or ""
+        finally:
+            db.close_session(session)
+
+    def wait_until(predicate, seconds):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.3)
+        return False
+
+    def fakes_running():
+        out = subprocess.run(["pgrep", "-f", str(binaries["ffmpeg"])],
+                             capture_output=True, text=True).stdout.split()
+        return [pid for pid in out if pid != str(os.getpid())]
+
+    body = {"input_video": str(source), "resolutions": "720p", "esam": False,
+            "audio_norm": False, "generate_thumbnails": False, "upload": False,
+            "output_dir": "restart_show"}
+
+    # --- graceful stop -------------------------------------------------------
+    proc, base = start(slow=True)
+    try:
+        running = post(base, body)
+        queued = post(base, body)
+        check_true("first job reaches transcoding",
+                   wait_until(lambda: status(base, running).get("stage") == "TRANSCODING", 60))
+        stopped_at = time.time()
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=120)
+        check_true("the server stops promptly on SIGTERM", time.time() - stopped_at < 90)
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+    state, message = row(running)
+    check("the running job is recorded as FAILED", state, "FAILED")
+    check_true("…saying it was interrupted and should be resubmitted",
+               "Interrupted: the server shut down" in message and "Resubmit" in message,
+               message)
+    check("the queued job stays PENDING for the next start", row(queued)[0], "PENDING")
+    check("no FFmpeg is left running", fakes_running(), [])
+
+    # --- restart requeues it -------------------------------------------------
+    proc, base = start(slow=False)
+    try:
+        check_true("the queued job runs after the restart",
+                   wait_until(lambda: row(queued)[0] == "COMPLETED", 120), row(queued))
+
+        # --- crash: kill -9 mid-job ------------------------------------------
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=30)
+        proc, base = start(slow=True)
+        crashed = post(base, body)
+        check_true("a job is running before the crash",
+                   wait_until(lambda: status(base, crashed).get("stage") == "TRANSCODING", 60))
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=30)
+        for pid in fakes_running():                     # orphans of the killed worker
+            subprocess.run(["kill", "-9", pid])
+        check("after a crash the row is stuck RUNNING", row(crashed)[0], "RUNNING")
+        proc, base = start(slow=False)
+        state, message = row(crashed)
+        check("the next start marks it FAILED", state, "FAILED")
+        check_true("…as interrupted", "Interrupted" in message, message)
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=120)
+
+
+def test_recovery_leaves_owned_jobs_alone(work: Path):
+    """Startup recovery must not touch a job a live process still owns."""
+    print("recovery respects live owners")
+    import subprocess
+    import uuid
+    from api import database as db
+    from api import job_manager
+    if not db.init_db():
+        print("  skip (MySQL not reachable)")
+        return
+    slots = work / "owned_slots"
+    os.environ["WZ_CPU_SLOT_DIR"] = str(slots)
+    try:
+        owned, orphan = str(uuid.uuid4()), str(uuid.uuid4())
+        session = db.get_session()
+        for job_id in (owned, orphan):
+            session.add(db.Job(job_id=job_id, status="RUNNING", stage="TRANSCODING",
+                               channel="owned_test", submitted_at=db._utcnow()))
+        session.commit()
+        db.close_session(session)
+        holder = subprocess.Popen([sys.executable, "-c", (
+            "import os, sys, time; sys.path.insert(0, %r)\n"
+            "os.environ['WZ_CPU_SLOT_DIR'] = %r\n"
+            "from hls_toolkit.coordination import JobLock\n"
+            "lock = JobLock(%r); print('held', flush=True); time.sleep(60)\n")
+            % (str(ROOT), str(slots), owned)], stdout=subprocess.PIPE, text=True)
+        check("another process owns one job", holder.stdout.readline().strip(), "held")
+        job_manager.recover_on_startup()
+        holder.kill()
+        holder.wait()
+        statuses = {}
+        session = db.get_session()
+        for job_id in (owned, orphan):
+            statuses[job_id] = session.query(db.Job).filter(db.Job.job_id == job_id).one().status
+        db.close_session(session)
+        check("the owned job is left RUNNING", statuses[owned], "RUNNING")
+        check("the orphaned job is settled", statuses[orphan], "FAILED")
+    finally:
+        os.environ.pop("WZ_CPU_SLOT_DIR", None)
+
+
 def main():
     work = Path(tempfile.mkdtemp(prefix="aitx_pipeline_test_"))
     print(f"workspace: {work}\n")
@@ -701,6 +879,10 @@ def main():
         test_parallel_cli_jobs(work, binaries)
         print()
         test_api(work, binaries)
+        print()
+        test_restart_recovery(work, binaries)
+        print()
+        test_recovery_leaves_owned_jobs_alone(work)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
