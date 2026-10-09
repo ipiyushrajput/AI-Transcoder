@@ -614,6 +614,69 @@ def test_broken_packages_are_not_published(work: Path, binaries: dict):
               client.keys_under(BUCKET, f"Visionular/V3/broken_{switch.lower()}"), [])
 
 
+def _with_env(env: dict, fn):
+    previous = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    try:
+        return fn()
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_hung_ffmpeg_is_stopped(work: Path, binaries: dict):
+    """A hung FFmpeg or FFprobe fails the job promptly and frees its cores."""
+    print("hung FFmpeg / FFprobe")
+    import time
+    from hls_toolkit import cpu_budget
+    from hls_toolkit.runner import run_transcode_job
+
+    media = work / "hung"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+    cpu_budget.reset_shared_budget()
+    budget = cpu_budget.get_shared_budget(16, slot_dir=str(media / "slots"))
+
+    def run():
+        return run_transcode_job(
+            config, overrides=_quick_overrides(source, upload=False, output_dir="hung",
+                                               local_output_dir=str(media / "out")),
+            log_root=str(media / "logs"), work_root=str(media / "scratch"))
+
+    try:
+        started = time.time()
+        result = _with_env({"FAKE_HANG": "video", "WZ_FFMPEG_STALL_SECONDS": "2"}, run)
+        elapsed = time.time() - started
+        check("a hung encode fails the job", result["status"], "FAILED")
+        check("at the transcoding stage", result["stage"], "TRANSCODING")
+        check_true("the error says it was stopped as hung",
+                   "made no progress" in (result["error_message"] or ""),
+                   result["error_message"])
+        check_true("…within seconds, not forever", elapsed < 60, f"{elapsed:.0f}s")
+        check("its CPU cores are released", budget.in_use(), 0)
+
+        slow = _with_env({"FAKE_SLOW_PROGRESS_SECONDS": "5",
+                          "WZ_FFMPEG_STALL_SECONDS": "2"}, run)
+        check("a slow but progressing encode is not stopped", slow["status"], "COMPLETED")
+
+        started = time.time()
+        probe = _with_env({"FAKE_HANG_FFPROBE": "1", "WZ_FFPROBE_TIMEOUT_SECONDS": "2"},
+                          run)
+        check("a hung FFprobe fails the job", probe["status"], "FAILED")
+        check_true("…saying FFprobe did not finish",
+                   "did not finish within" in (probe["error_message"] or ""),
+                   probe["error_message"])
+        check_true("…promptly", time.time() - started < 60)
+    finally:
+        cpu_budget.reset_shared_budget()
+
+
 def main():
     work = Path(tempfile.mkdtemp(prefix="aitx_pipeline_test_"))
     print(f"workspace: {work}\n")
@@ -630,6 +693,8 @@ def main():
         test_safe_publish(work, binaries)
         print()
         test_broken_packages_are_not_published(work, binaries)
+        print()
+        test_hung_ffmpeg_is_stopped(work, binaries)
         print()
         test_single_job_uses_the_budget(work, binaries)
         print()

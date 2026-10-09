@@ -28,6 +28,8 @@ def arg_after(argv, flag):
 
 
 def run_ffprobe(argv):
+    if os.getenv("FAKE_HANG_FFPROBE"):
+        time.sleep(3600)                     # test switch: a probe that never returns
     entries = " ".join(argv)
     if "packet=pts_time" in entries:
         print("1.400000")
@@ -101,6 +103,19 @@ def run_ffmpeg(argv):
     outputs = [Path(a) for a in argv
                if str(a).endswith((".mp4", ".m4s")) and not _is_input_value(argv, a)]
     started = time.time()
+    kind = _encode_kind(argv)
+    if kind and os.getenv("FAKE_HANG") == kind:
+        # Test switch: report a little progress, then hang with no output.
+        _emit_progress(1.0)
+        time.sleep(3600)
+    slow = float(os.getenv("FAKE_SLOW_PROGRESS_SECONDS", "0") or 0)
+    if kind == "video" and slow > 0:
+        # Test switch: slow but steady, one progress line per second.
+        for second in range(1, int(slow) + 1):
+            time.sleep(1)
+            sys.stderr.write(f"frame= {second * 25:5d} fps= 25 q=28.0 size= 1kB "
+                             f"time=00:00:{second:02d}.00 bitrate=1.0kbits/s speed=1x\n")
+            sys.stderr.flush()
     _simulate_encode_time(argv)
     for path in outputs:
         path.parent.mkdir(parents=True, exist_ok=True)

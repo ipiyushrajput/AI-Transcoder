@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from hls_toolkit import s3_io
+from hls_toolkit.ffmpeg_wrapper import configure_watchdog
 from hls_toolkit.hls_generator import generate_hls_workflow
 from hls_toolkit.job_context import (JobCancelled, JobContext, TranscodeError,
                                      bind_context, channel_name_for, claim_unique_dir)
@@ -145,6 +146,10 @@ def run_transcode_job(config: Dict[str, Any],
         ``["status"]``.
     """
     settings = build_run_settings(config, overrides)
+    defaults = config.get("defaults", {})
+    configure_watchdog(defaults.get("ffmpeg_stall_timeout_seconds"),
+                       defaults.get("ffmpeg_max_seconds"),
+                       defaults.get("ffprobe_timeout_seconds"))
     input_uri = settings["input_video"]
     if not input_uri:
         raise TranscodeError("No input video was supplied (defaults.input_video "

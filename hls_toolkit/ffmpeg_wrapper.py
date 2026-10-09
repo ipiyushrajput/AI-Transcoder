@@ -8,8 +8,10 @@ import signal
 import subprocess
 import tempfile
 import math
+import collections
 import concurrent.futures
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, Tuple
 
@@ -21,6 +23,49 @@ from hls_toolkit.esam_parser import remap_esam_events_for_merged_clips
 
 ACTIVE_PROCESSES = []
 PROCESS_LOCK = threading.Lock()
+
+# --- watchdog ---------------------------------------------------------------
+# A hung FFmpeg used to hold its CPU cores — and so every other job waiting on
+# them — for ever. FFmpeg reports its position (time=) continuously, so a run
+# whose position stops moving for STALL seconds is stopped and the job fails.
+# Slow encodes keep advancing, so only a real hang trips it. A hard per-command
+# limit is available but off by default, so a long encode is never cut short.
+DEFAULT_STALL_SECONDS = 600.0
+DEFAULT_MAX_SECONDS = 0.0            # 0 = no hard limit
+DEFAULT_FFPROBE_TIMEOUT_SECONDS = 300.0
+# Keep at most this many output lines per stream in memory; ffmpeg.log keeps all.
+OUTPUT_TAIL_LINES = 5000
+
+_watchdog_config: Dict[str, Optional[float]] = {
+    "stall": None, "max": None, "ffprobe": None}
+
+
+def configure_watchdog(stall_seconds=None, max_seconds=None,
+                       ffprobe_timeout_seconds=None) -> None:
+    """Set the limits from the config; environment variables still win."""
+    for key, value in (("stall", stall_seconds), ("max", max_seconds),
+                       ("ffprobe", ffprobe_timeout_seconds)):
+        if value is not None:
+            _watchdog_config[key] = value
+
+
+def _limit(env_name: str, key: str, default: float) -> float:
+    for value in (os.getenv(env_name), _watchdog_config.get(key)):
+        if value in (None, ""):
+            continue
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            log().warning(f"Ignoring non-numeric {env_name}/{key} value {value!r}.")
+    return default
+
+
+def watchdog_limits() -> Tuple[float, float, float]:
+    """(stall seconds, hard limit seconds, ffprobe timeout); 0 disables one."""
+    return (_limit("WZ_FFMPEG_STALL_SECONDS", "stall", DEFAULT_STALL_SECONDS),
+            _limit("WZ_FFMPEG_MAX_SECONDS", "max", DEFAULT_MAX_SECONDS),
+            _limit("WZ_FFPROBE_TIMEOUT_SECONDS", "ffprobe",
+                   DEFAULT_FFPROBE_TIMEOUT_SECONDS))
 
 
 def get_active_processes():
@@ -120,7 +165,18 @@ def _run_ffprobe_command(cmd_list: List[str],
                                    universal_newlines=True,
                                    encoding="utf-8",
                                    errors="ignore")
-        output, _ = process.communicate()
+        timeout = watchdog_limits()[2] or None
+        try:
+            output, _ = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            ctx = current_context()
+            raise TranscodeError(
+                f"{log_prefix}: FFprobe did not finish within {timeout:.0f}s and was "
+                f"stopped. The input may be unreadable or on a stalled mount. "
+                f"Command: {' '.join(shlex.quote(str(a)) for a in cmd_list)}",
+                stage=(ctx.stage if ctx else "PROBING"))
         if check_returncode and process.returncode != 0:
             raise subprocess.CalledProcessError(process.returncode, cmd_list, output=output)
         return output.strip()
@@ -251,8 +307,13 @@ def _run_ffmpeg_command_with_logging(cmd_list: List[str],
 
     with PROCESS_LOCK:
         ACTIVE_PROCESSES.append(process)
+    stall_limit, max_limit, _ = watchdog_limits()
+    started = time.monotonic()
+    progress = {"position": -1.0, "advanced_at": started}
+    progress_lock = threading.Lock()
     try:
-        stdout_buffer, stderr_buffer = [], []
+        stdout_buffer = collections.deque(maxlen=OUTPUT_TAIL_LINES)
+        stderr_buffer = collections.deque(maxlen=OUTPUT_TAIL_LINES)
 
         def read_stream(stream, buffer, stream_name):
             progress_keys = ['frame=', 'fps=', 'size=', 'time=', 'bitrate=', 'speed=']
@@ -264,6 +325,12 @@ def _run_ffmpeg_command_with_logging(cmd_list: List[str],
                 if not line_stripped:
                     continue
                 if stream_name == "stderr":
+                    position = _parse_progress_seconds(line_stripped)
+                    if position is not None:
+                        with progress_lock:
+                            if position > progress["position"]:
+                                progress["position"] = position
+                                progress["advanced_at"] = time.monotonic()
                     if all(k in line_stripped for k in progress_keys):
                         log().debug(f"FFmpeg {log_prefix} progress: {line_stripped}")
                         if progress_cb and expected_seconds:
@@ -286,11 +353,33 @@ def _run_ffmpeg_command_with_logging(cmd_list: List[str],
         stdout_thread.start()
         stderr_thread.start()
         cancelled = False
+        stopped_reason = None
         try:
             while process.poll() is None:
                 if ctx is not None and ctx.cancelled:
                     cancelled = True
                     log().warning(f"Cancellation requested — terminating {log_prefix}")
+                    _terminate_process(process)
+                    break
+                now = time.monotonic()
+                with progress_lock:
+                    idle = now - progress["advanced_at"]
+                    position = progress["position"]
+                if stall_limit and idle > stall_limit:
+                    where = (f"at {position:.1f}s of output" if position >= 0
+                             else "before producing any output")
+                    stopped_reason = (
+                        f"{log_prefix} made no progress for {idle:.0f}s ({where}) and "
+                        f"was stopped as hung. The limit is {stall_limit:.0f}s "
+                        f"(WZ_FFMPEG_STALL_SECONDS or "
+                        f"defaults.ffmpeg_stall_timeout_seconds).")
+                elif max_limit and now - started > max_limit:
+                    stopped_reason = (
+                        f"{log_prefix} ran longer than the {max_limit:.0f}s limit and "
+                        f"was stopped (WZ_FFMPEG_MAX_SECONDS or "
+                        f"defaults.ffmpeg_max_seconds).")
+                if stopped_reason:
+                    log().error(stopped_reason)
                     _terminate_process(process)
                     break
                 try:
@@ -308,6 +397,11 @@ def _run_ffmpeg_command_with_logging(cmd_list: List[str],
         stderr_output = "".join(stderr_buffer)
         if cancelled:
             raise JobCancelled(f"{log_prefix} cancelled")
+        if stopped_reason:
+            tail = _tail_text(stderr_output or stdout_output, 20)
+            raise TranscodeError(
+                f"{stopped_reason}\nCommand: {full_cmd_str}\nLast FFmpeg output:\n{tail}",
+                stage=(ctx.stage if ctx is not None else "TRANSCODING"))
 
         if process.returncode != 0:
             tail = _tail_text(stderr_output or stdout_output, 40)
@@ -820,6 +914,9 @@ def generate_clipped_transcoded_merged_mp4s(
                     result = future.result()
                 except JobCancelled:
                     log().warning("Transcode cancelled — stopping remaining tasks")
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
+                except TranscodeError:
                     executor.shutdown(wait=False, cancel_futures=True)
                     raise
                 except subprocess.CalledProcessError as exc:
