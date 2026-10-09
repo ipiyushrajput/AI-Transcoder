@@ -59,7 +59,8 @@ python app.py --check
 ```
 
 That validates the Python packages, the FFmpeg build (including that
-`libwz264`/`libwz265` are actually present), AWS credentials, that the input
+`libwz264`/`libwz265` are actually present, and a one-second test encode with
+each encoder the templates use, which proves the licence works), AWS credentials, that the input
 objects are readable, that the output bucket is *writable*, and MySQL —
 reporting each one with a specific remedy. Run it first on any new server.
 
@@ -582,6 +583,7 @@ directly, with the fix for each.
 | `module 'lib' has no attribute 'X509_V_FLAG_NOTIFY_POLICY'` | Installed `pyOpenSSL` is older than the installed `cryptography` (which dropped those constants). botocore imports pyOpenSSL optionally and versions before 1.38.46 did not catch this. Fix with `pip install --upgrade 'boto3>=1.38.46' 'botocore>=1.38.46'`, or repair the pair: `pip install --upgrade 'pyOpenSSL>=24.0.0' 'cryptography>=42'`. Installing into a virtualenv avoids the apt/pip mix that causes it. |
 | `FFmpeg executable not found at ...` | `paths.ffmpeg_executable` is wrong, or `bin/ffmpeg` is not executable |
 | `Unknown encoder 'libwz264'` | The binary in `bin/` is a stock FFmpeg without the in-house encoders |
+| `Test encode (libwz264)` fails in `--check`, or `/ready` shows `encoder_license` false | The encoder refused to run: usually `bin/wz_license.cnf` / `wz_license.key` are missing, for another server, or expired. The check quotes the encoder's own message. The test encode uses FFmpeg's built-in test pattern and changes nothing; `WZ_SKIP_TEST_ENCODE=1` skips it in `--check`, `READY_TEST_ENCODE=0` at API start |
 | `S3 object not found: s3://...` | Wrong key, or the instance role cannot see that bucket |
 | `Access denied reading s3://...` | The instance role lacks `s3:GetObject` on that prefix |
 | `upload is enabled but s3.bucket_name is not configured` | Set `s3.bucket_name`, or pass `"upload": false` |

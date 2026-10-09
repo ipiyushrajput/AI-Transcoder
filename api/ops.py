@@ -93,7 +93,7 @@ def readiness(config: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     record("coordination_dir", *_check_coordination())
     try:
         from hls_toolkit.encoder_check import cached_result
-        encoder = cached_result()
+        encoder = cached_result(settings["ffmpeg_executable"])
     except ImportError:
         encoder = None
     if encoder is not None:

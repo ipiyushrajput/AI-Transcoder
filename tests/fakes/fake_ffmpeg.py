@@ -61,6 +61,11 @@ def run_ffmpeg(argv):
         }, indent=2) + "\n")
         return 0
 
+    # Test switch: the encoder refuses its licence, as an expired one would.
+    if os.getenv("FAKE_LICENSE_FAIL") and any(str(a).startswith("libwz") for a in argv):
+        sys.stderr.write("[libwz264 @ 0x1] wz license check failed: license expired\n")
+        return 1
+
     # HLS packaging: -f hls ... <segment pattern> <playlist>
     if "hls" in argv and arg_after(argv, "-f") == "hls":
         playlist = Path(argv[-1])

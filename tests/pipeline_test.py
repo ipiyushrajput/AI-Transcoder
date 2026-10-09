@@ -879,6 +879,57 @@ def test_dead_jobs_are_cleaned_up(work: Path, binaries: dict):
           len(list(scratch.glob("aitx_*"))), 1)
 
 
+def test_encoder_check(work: Path, binaries: dict):
+    """--check proves the encoder licence with a test encode; /ready reports it."""
+    print("encoder test encode")
+    from hls_toolkit import encoder_check, preflight
+
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+    config_path = work / "encoder-config.json"
+    config_path.write_text(json.dumps(config))
+    ffmpeg = config["paths"]["ffmpeg_executable"]
+    coord = {"WZ_CPU_SLOT_DIR": str(work / "encoder-coord"), "READY_TEST_ENCODE": "0"}
+
+    def scenario():
+        check("the templates need both encoders", encoder_check.encoders_in_use(config),
+              ["libwz264", "libwz265"])
+        good = preflight.check_test_encode(ffmpeg, config)
+        check("a licensed encoder passes", [r.status for r in good], ["ok", "ok"])
+        check_true("…and the result is cached for /ready",
+                   (encoder_check.cached_result(ffmpeg) or {}).get("ok") is True)
+
+        os.environ["FAKE_LICENSE_FAIL"] = "1"
+        try:
+            bad = preflight.check_test_encode(ffmpeg, config)
+        finally:
+            os.environ.pop("FAKE_LICENSE_FAIL", None)
+        check("an expired licence fails the check", [r.status for r in bad],
+              ["fail", "fail"])
+        check_true("…quoting the encoder", "license expired" in bad[0].detail, bad[0].detail)
+        check_true("…and pointing at the licence files", "wz_license" in bad[0].fix)
+
+        from api.app import create_app
+        response = create_app(str(config_path)).test_client().get("/ready")
+        check("/ready is 503 while the licence fails", response.status_code, 503)
+        check("…naming the licence check",
+              response.get_json()["checks"]["encoder_license"]["ok"], False)
+
+        later = time.time() + 5
+        os.utime(ffmpeg, (later, later))           # a replaced binary voids the result
+        check("a new FFmpeg binary is not judged by the old result",
+              encoder_check.cached_result(ffmpeg), None)
+
+        os.environ["WZ_SKIP_TEST_ENCODE"] = "1"
+        try:
+            check("WZ_SKIP_TEST_ENCODE skips it",
+                  [r.status for r in preflight.check_test_encode(ffmpeg, config)], ["warn"])
+        finally:
+            os.environ.pop("WZ_SKIP_TEST_ENCODE", None)
+
+    _with_env(coord, scenario)
+
+
 def _with_env(env: dict, fn):
     previous = {k: os.environ.get(k) for k in env}
     os.environ.update(env)
@@ -1160,6 +1211,8 @@ def main():
         test_api(work, binaries)
         print()
         test_api_operations(work, binaries)
+        print()
+        test_encoder_check(work, binaries)
         print()
         test_restart_recovery(work, binaries)
         print()
