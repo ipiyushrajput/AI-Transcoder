@@ -665,6 +665,12 @@ def test_hung_ffmpeg_is_stopped(work: Path, binaries: dict):
                           "WZ_FFMPEG_STALL_SECONDS": "2"}, run)
         check("a slow but progressing encode is not stopped", slow["status"], "COMPLETED")
 
+        killed = _with_env({"FAKE_SELF_KILL": "video"}, run)
+        check("an encoder killed by SIGKILL fails the job", killed["status"], "FAILED")
+        check_true("…and the error points at the out-of-memory killer",
+                   "out-of-memory killer" in (killed["error_message"] or ""),
+                   killed["error_message"])
+
         started = time.time()
         probe = _with_env({"FAKE_HANG_FFPROBE": "1", "WZ_FFPROBE_TIMEOUT_SECONDS": "2"},
                           run)
@@ -799,10 +805,14 @@ def test_restart_recovery(work: Path, binaries: dict):
         crashed = post(base, body)
         check_true("a job is running before the crash",
                    wait_until(lambda: status(base, crashed).get("stage") == "TRANSCODING", 60))
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait(timeout=30)
-        for pid in fakes_running():                     # orphans of the killed worker
+        # A crash kills only the server's own processes, as the OOM killer or a
+        # kill -9 of gunicorn would; FFmpeg must die with them, not linger.
+        for pid in subprocess.run(["pgrep", "-g", str(proc.pid)], capture_output=True,
+                                  text=True).stdout.split():
             subprocess.run(["kill", "-9", pid])
+        proc.wait(timeout=30)
+        check_true("FFmpeg dies with the crashed server (no orphans)",
+                   wait_until(lambda: not fakes_running(), 10), fakes_running())
         check("after a crash the row is stuck RUNNING", row(crashed)[0], "RUNNING")
         proc, base = start(slow=False)
         state, message = row(crashed)

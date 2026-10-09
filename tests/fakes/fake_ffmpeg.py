@@ -104,6 +104,9 @@ def run_ffmpeg(argv):
                if str(a).endswith((".mp4", ".m4s")) and not _is_input_value(argv, a)]
     started = time.time()
     kind = _encode_kind(argv)
+    if kind and os.getenv("FAKE_SELF_KILL") == kind:
+        import signal
+        os.kill(os.getpid(), signal.SIGKILL)     # test switch: as the OOM killer would
     if kind and os.getenv("FAKE_HANG") == kind:
         # Test switch: report a little progress, then hang with no output.
         _emit_progress(1.0)

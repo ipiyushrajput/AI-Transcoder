@@ -4,8 +4,10 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import math
 import collections
@@ -38,6 +40,50 @@ OUTPUT_TAIL_LINES = 5000
 
 _watchdog_config: Dict[str, Optional[float]] = {
     "stall": None, "max": None, "ffprobe": None}
+
+
+_launcher_lock = threading.Lock()
+_launcher: Optional[List[str]] = None
+
+
+def _launch_prefix() -> List[str]:
+    """``setpriv --pdeathsig KILL --`` when available, else nothing.
+
+    FFmpeg runs in its own session so its whole process group can be stopped
+    cleanly — which also means it outlives its parent. If a job's process is
+    killed (kill -9, a crash), its FFmpeg kept running, burning CPU the budget
+    no longer counted. With the parent-death signal set, the kernel kills
+    FFmpeg when the thread that started it dies. FFmpeg's own arguments are
+    unchanged; setpriv just sets the signal and execs it in place, so the pid
+    is FFmpeg's. Set WZ_NO_PDEATHSIG=1 to launch FFmpeg directly.
+    """
+    global _launcher
+    with _launcher_lock:
+        if _launcher is None:
+            _launcher = []
+            if sys.platform.startswith("linux") and not os.getenv("WZ_NO_PDEATHSIG"):
+                setpriv = shutil.which("setpriv")
+                if setpriv:
+                    try:
+                        helptext = subprocess.run([setpriv, "--help"], capture_output=True,
+                                                  text=True, timeout=10).stdout
+                        if "--pdeathsig" in helptext:
+                            _launcher = [setpriv, "--pdeathsig", "KILL", "--"]
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+            if not _launcher:
+                logging.getLogger(__name__).warning(
+                    "setpriv --pdeathsig is unavailable: FFmpeg will keep running if "
+                    "its parent process is killed (install util-linux >= 2.33).")
+        return list(_launcher)
+
+
+def _launch(cmd_list: List[str]) -> List[str]:
+    """The argv that actually starts `cmd_list` (see :func:`_launch_prefix`)."""
+    if not cmd_list or not os.path.exists(str(cmd_list[0])):
+        # Keep FileNotFoundError for a missing binary, as when run directly.
+        return list(cmd_list)
+    return _launch_prefix() + [str(a) for a in cmd_list]
 
 
 def configure_watchdog(stall_seconds=None, max_seconds=None,
@@ -159,7 +205,7 @@ def _run_ffprobe_command(cmd_list: List[str],
                          check_returncode: bool = True) -> Optional[str]:
     """Runs an ffprobe command and captures its output."""
     try:
-        process = subprocess.Popen(cmd_list,
+        process = subprocess.Popen(_launch(cmd_list),
                                    stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT,
                                    universal_newlines=True,
@@ -288,7 +334,7 @@ def _run_ffmpeg_command_with_logging(cmd_list: List[str],
         ctx.ffmpeg_command(log_prefix, full_cmd_str)
 
     try:
-        process = subprocess.Popen(cmd_list,
+        process = subprocess.Popen(_launch(cmd_list),
                                    stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE,
@@ -405,7 +451,7 @@ def _run_ffmpeg_command_with_logging(cmd_list: List[str],
 
         if process.returncode != 0:
             tail = _tail_text(stderr_output or stdout_output, 40)
-            message = (f"{log_prefix} failed with exit code {process.returncode}.\n"
+            message = (f"{log_prefix} failed: {describe_exit(process.returncode)}.\n"
                        f"Command: {full_cmd_str}\n"
                        f"Last FFmpeg output:\n{tail}")
             if check_returncode:
@@ -440,6 +486,35 @@ def _terminate_process(process) -> None:
                 process.kill()
             except Exception:
                 pass
+
+
+def describe_exit(returncode: Optional[int]) -> str:
+    """How FFmpeg ended, in words — above all when a signal killed it.
+
+    A bare "exit -9" hides the usual culprit: the kernel's out-of-memory
+    killer, which picks the biggest process, typically an encoder.
+    """
+    if returncode is None:
+        return "did not exit"
+    if returncode >= 0:
+        return f"exit code {returncode}"
+    number = -returncode
+    try:
+        name = signal.Signals(number).name
+    except ValueError:
+        name = f"signal {number}"
+    if number == signal.SIGKILL:
+        return (f"killed by {name}. Nothing in this job stops FFmpeg that way, so this "
+                f"is almost always the kernel's out-of-memory killer: check "
+                f"`journalctl -k | grep -i 'out of memory'` (or `dmesg`). Run fewer "
+                f"jobs at once, lower --cpu-budget, or add memory")
+    if number in (signal.SIGSEGV, signal.SIGBUS, signal.SIGILL, signal.SIGFPE,
+                  signal.SIGABRT):
+        return (f"crashed ({name}). This is a fault inside FFmpeg; the last lines of "
+                f"its output are below and the full output is in ffmpeg.log")
+    if number == signal.SIGTERM:
+        return f"terminated by another process ({name})"
+    return f"killed by {name}"
 
 
 def _tail_text(text: str, lines: int) -> str:
@@ -922,8 +997,9 @@ def generate_clipped_transcoded_merged_mp4s(
                 except subprocess.CalledProcessError as exc:
                     executor.shutdown(wait=False, cancel_futures=True)
                     raise TranscodeError(
-                        f"FFmpeg failed during transcode (exit {exc.returncode}). "
-                        f"See ffmpeg.log for the full output.",
+                        f"FFmpeg failed during transcode: "
+                        f"{describe_exit(exc.returncode)}. "
+                        f"See error.log for its last output and ffmpeg.log for all of it.",
                         stage="TRANSCODING") from exc
                 except Exception as exc:
                     log().error(f"A transcoding task generated an exception: {exc}",
