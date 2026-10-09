@@ -10,6 +10,7 @@ import copy
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -32,12 +33,21 @@ WORK_ROOT = os.getenv("WORK_ROOT") or None
 PROGRESS_SYNC_SECONDS = float(os.getenv("PROGRESS_SYNC_SECONDS", "5"))
 REQUEUE_PENDING_ON_START = os.getenv("REQUEUE_PENDING_ON_START", "1") not in ("0", "false",
                                                                              "no")
+# Jobs allowed to wait for a worker; past this, submissions get 429.
+MAX_QUEUED_JOBS = int(os.getenv("MAX_QUEUED_JOBS", "100"))
+# Finished jobs kept in memory (the database keeps them all).
+FINISHED_JOBS_IN_MEMORY = int(os.getenv("FINISHED_JOBS_IN_MEMORY", "200"))
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
 
 _executor: Optional[ThreadPoolExecutor] = None
 _executor_lock = threading.Lock()
 _registry: Dict[str, Dict[str, Any]] = {}
 _registry_lock = threading.Lock()
 _shutting_down = threading.Event()
+_submit_lock = threading.Lock()
+_counters = {"submitted": 0, "completed": 0, "failed": 0, "cancelled": 0,
+             "rejected_queue_full": 0, "duplicate_submissions": 0}
+_FINAL_STATUSES = ("COMPLETED", "FAILED", "CANCELLED")
 
 INTERRUPTED_MESSAGE = (
     "Interrupted: the server shut down while this job was {where}. Its output was "
@@ -46,6 +56,19 @@ INTERRUPTED_MESSAGE = (
 
 class ServiceUnavailable(Exception):
     """The server is shutting down and is not accepting new jobs."""
+
+
+class QueueFull(Exception):
+    """Too many jobs are already waiting; the client should retry later."""
+
+
+class IdempotencyConflict(ValueError):
+    """An Idempotency-Key was reused for a different request."""
+
+
+def _count(name: str) -> None:
+    with _registry_lock:
+        _counters[name] = _counters.get(name, 0) + 1
 
 
 def _get_executor() -> ThreadPoolExecutor:
@@ -69,21 +92,51 @@ def _release_lock(job_id: str) -> None:
 # ---------------------------------------------------------------------------
 # Submission
 # ---------------------------------------------------------------------------
-def submit_job(base_config: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+def submit_job(base_config: Dict[str, Any], payload: Dict[str, Any],
+               idempotency_key: Optional[str] = None) -> Dict[str, Any]:
     """Validate a request, persist it as PENDING and queue it for execution.
 
-    Returns the job record. Raises ValueError with a human-readable message when
-    the payload is not runnable — the route turns that into a 400.
+    Returns the job record; ``record["duplicate"]`` is True when an earlier
+    submission with the same `idempotency_key` is returned instead. Raises
+    ValueError with a human-readable message when the payload is not runnable
+    (the route turns that into a 400), QueueFull when too many jobs are
+    waiting, and ServiceUnavailable while shutting down.
     """
     if _shutting_down.is_set():
         raise ServiceUnavailable("The server is shutting down and is not accepting "
                                  "new jobs. Retry shortly.")
+    warnings = validate_payload(payload)
+    idempotency_key = _check_idempotency_key(idempotency_key)
     config = _merge_config(base_config, payload)
     overrides = _overrides_from_payload(payload)
     settings = build_run_settings(config, overrides)
 
     _validate(config, settings)
 
+    with _submit_lock:
+        if idempotency_key:
+            existing = _find_by_idempotency_key(idempotency_key)
+            if existing is not None:
+                if _jsonable(existing.get("request_payload")) != _jsonable(payload):
+                    raise IdempotencyConflict(
+                        f"Idempotency-Key {idempotency_key!r} was already used for a "
+                        f"different request (job {existing['job_id']}). Use a new key "
+                        f"for a new job.")
+                _count("duplicate_submissions")
+                existing.pop("request_payload", None)
+                return {**existing, "duplicate": True}
+        queued = _queued_job_ids()
+        if MAX_QUEUED_JOBS > 0 and len(queued) >= MAX_QUEUED_JOBS:
+            _count("rejected_queue_full")
+            raise QueueFull(f"{len(queued)} jobs are already waiting to run "
+                            f"(MAX_QUEUED_JOBS={MAX_QUEUED_JOBS}). Retry later.")
+        record = _create_job(config, payload, overrides, settings, idempotency_key)
+    record["warnings"] = warnings
+    record["queue_position"] = _queue_position(record["job_id"])
+    return record
+
+
+def _create_job(config, payload, overrides, settings, idempotency_key) -> Dict[str, Any]:
     job_id = str(uuid.uuid4())
     channel = channel_name_for(settings["input_video"])
     name = payload.get("name") or channel
@@ -112,21 +165,159 @@ def submit_job(base_config: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
         "submitted_at": db._utcnow(),
     }
 
-    _persist_new_job(record, config, payload, settings)
-    _enqueue(job_id, record, config, overrides)
+    _persist_new_job(record, config, payload, settings, idempotency_key)
+    if idempotency_key:
+        record["idempotency_key"] = idempotency_key
+    _enqueue(job_id, record, config, overrides, payload=payload)
+    _count("submitted")
 
     logger.info(f"[{job_id}] queued job for channel '{channel}' "
                 f"(input={settings['input_video']})")
     return dict(record)
 
 
+# ---------------------------------------------------------------------------
+# Request checks
+# ---------------------------------------------------------------------------
+_STRING_FIELDS = ("name", "input_video", "subtitle_file", "subtitle_language",
+                  "output_dir", "template", "resolutions", "s3_bucket", "s3_key_prefix",
+                  "esam_scc_xml", "esam_mcc_xml")
+_BOOL_FIELDS = ("esam", "audio_norm", "generate_thumbnails", "upload",
+                "delete_local_output", "debug")
+_OTHER_FIELDS = ("duration", "transcode_workers", "clippings", "hls_settings", "config")
+_HLS_SETTINGS = {"hls_time", "hls_playlist_type", "hls_flags", "hls_segment_type"}
+_SAFE_KEY = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+def validate_payload(payload: Dict[str, Any]) -> List[str]:
+    """Reject wrongly typed fields up front; return warnings for unknown ones.
+
+    Without this a mistake surfaces minutes later, deep in the job, or not at
+    all: ``"upload": "false"`` is a non-empty string and would mean *true*.
+    """
+    def is_number(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    for key in _STRING_FIELDS:
+        value = payload.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{key} must be a string.")
+    for key in _BOOL_FIELDS:
+        value = payload.get(key)
+        if value is not None and not isinstance(value, bool):
+            raise ValueError(f"{key} must be true or false (JSON boolean), "
+                             f"not {json.dumps(value)}.")
+
+    duration = payload.get("duration")
+    if duration is not None and (not is_number(duration) or duration <= 0):
+        raise ValueError("duration must be a positive number of seconds.")
+    workers = payload.get("transcode_workers")
+    if workers is not None and (isinstance(workers, bool) or not isinstance(workers, int)
+                                or not 1 <= workers <= 256):
+        raise ValueError("transcode_workers must be a whole number from 1 to 256.")
+
+    hls = payload.get("hls_settings")
+    if hls is not None:
+        if not isinstance(hls, dict):
+            raise ValueError("hls_settings must be an object.")
+        unknown = sorted(set(hls) - _HLS_SETTINGS)
+        if unknown:
+            raise ValueError(f"Unknown hls_settings: {', '.join(unknown)}. "
+                             f"Allowed: {', '.join(sorted(_HLS_SETTINGS))}.")
+        hls_time = hls.get("hls_time")
+        if hls_time is not None and (not is_number(hls_time) or not 0.5 <= hls_time <= 60):
+            raise ValueError("hls_settings.hls_time must be a number of seconds "
+                             "from 0.5 to 60.")
+        for key in _HLS_SETTINGS - {"hls_time"}:
+            if hls.get(key) is not None and not isinstance(hls[key], str):
+                raise ValueError(f"hls_settings.{key} must be a string.")
+
+    clippings = payload.get("clippings")
+    if clippings is not None:
+        from hls_toolkit.time_utils import parse_timecode
+        if not isinstance(clippings, list) or not clippings:
+            raise ValueError("clippings must be a non-empty list.")
+        for i, clip in enumerate(clippings, 1):
+            if not isinstance(clip, dict):
+                raise ValueError(f"clippings[{i}] must be an object with "
+                                 f"StartTimecode and EndTimecode.")
+            for key in ("StartTimecode", "EndTimecode"):
+                value = clip.get(key)
+                if not isinstance(value, str):
+                    raise ValueError(f"clippings[{i}].{key} is required "
+                                     f"(HH:MM:SS:FF).")
+                try:
+                    parse_timecode(value)
+                except ValueError:
+                    raise ValueError(f"clippings[{i}].{key} is not a timecode "
+                                     f"(HH:MM:SS:FF): {value!r}") from None
+
+    inline = payload.get("config")
+    if inline is not None and not isinstance(inline, dict):
+        raise ValueError("config must be an object.")
+
+    known = set(_STRING_FIELDS) | set(_BOOL_FIELDS) | set(_OTHER_FIELDS)
+    return [f"Unknown field {key!r} was ignored." for key in sorted(set(payload) - known)]
+
+
+def _check_idempotency_key(key: Optional[str]) -> Optional[str]:
+    if key is None or key == "":
+        return None
+    if not _SAFE_KEY.match(key):
+        raise ValueError("Idempotency-Key must be 1-128 characters of letters, digits, "
+                         "'.', '_', ':' or '-'.")
+    return key
+
+
+def _find_by_idempotency_key(key: str) -> Optional[Dict[str, Any]]:
+    """The earlier job submitted with `key`, with its request payload."""
+    with _registry_lock:
+        for entry in _registry.values():
+            if entry["record"].get("idempotency_key") == key:
+                return {**entry["record"], "request_payload": entry.get("payload")}
+    session = db.get_session()
+    if session is None:
+        return None
+    try:
+        job = session.query(db.Job).filter(db.Job.idempotency_key == key).first()
+        if job is None:
+            return None
+        return {**job.to_dict(), "request_payload": job.request_payload}
+    finally:
+        db.close_session(session)
+
+
+def _queued_job_ids() -> List[str]:
+    """Jobs waiting for a worker, oldest first."""
+    with _registry_lock:
+        return [job_id for job_id, e in _registry.items()
+                if e.get("ctx") is None and e.get("lock") is not None
+                and e["record"].get("status") == "PENDING"]
+
+
+def _queue_position(job_id: str) -> Optional[int]:
+    """1 for the next job to start, None when not waiting."""
+    queued = _queued_job_ids()
+    return queued.index(job_id) + 1 if job_id in queued else None
+
+
+def _prune_finished() -> None:
+    """Forget the oldest finished jobs; the database still has them."""
+    with _registry_lock:
+        finished = [job_id for job_id, e in _registry.items()
+                    if e.get("ctx") is None and e.get("lock") is None
+                    and e["record"].get("status") in _FINAL_STATUSES]
+        for job_id in finished[:max(0, len(finished) - FINISHED_JOBS_IN_MEMORY)]:
+            _registry.pop(job_id, None)
+
+
 def _enqueue(job_id: str, record: Dict[str, Any], config: Dict[str, Any],
-             overrides: Dict[str, Any]) -> None:
+             overrides: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> None:
     """Own the job (lock file) and hand it to the worker pool."""
     lock = JobLock(job_id)
     with _registry_lock:
         _registry[job_id] = {"record": dict(record), "ctx": None, "future": None,
-                             "lock": lock}
+                             "lock": lock, "payload": _jsonable(payload)}
     future = _get_executor().submit(_run_job, job_id, config, overrides)
     with _registry_lock:
         if job_id in _registry:
@@ -299,8 +490,49 @@ def _run_job(job_id: str, config: Dict[str, Any], overrides: Dict[str, Any]) -> 
     # Only now that the final state is recorded may another process treat the
     # job as abandoned.
     _release_lock(job_id)
+    status = snapshot.get("status")
+    if status in _FINAL_STATUSES:
+        _count(status.lower())
+    if status == "FAILED":
+        _send_alert(job_id, snapshot)
+    _prune_finished()
 
-    logger.info(f"[{job_id}] finished with status {snapshot.get('status')}")
+    logger.info(f"[{job_id}] finished with status {status}")
+
+
+def _send_alert(job_id: str, snapshot: Dict[str, Any]) -> None:
+    """POST a failed job's summary to ALERT_WEBHOOK_URL, without blocking.
+
+    The body carries ``text`` (shown by Slack and Teams incoming webhooks) and
+    the same facts as fields, for anything else.
+    """
+    if not ALERT_WEBHOOK_URL:
+        return
+    with _registry_lock:
+        record = dict(_registry.get(job_id, {}).get("record", {}))
+    error = (snapshot.get("error_message") or "").strip()
+    first_line = error.splitlines()[0] if error else "no message"
+    body = {
+        "text": (f"Transcode job FAILED: {record.get('name') or job_id} at stage "
+                 f"{snapshot.get('stage')}: {first_line[:500]}"),
+        "job_id": job_id, "name": record.get("name"), "channel": snapshot.get("channel"),
+        "stage": snapshot.get("stage"), "error_message": error[:4000],
+        "input_video": record.get("input_video"), "log_dir": snapshot.get("log_dir"),
+        "host": os.uname().nodename,
+    }
+
+    def post():
+        import urllib.request
+        try:
+            request = urllib.request.Request(
+                ALERT_WEBHOOK_URL, data=json.dumps(body, default=str).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(request, timeout=10) as response:
+                response.read(1024)
+        except Exception as e:
+            logger.warning(f"[{job_id}] failure alert could not be sent: {e}")
+
+    threading.Thread(target=post, name=f"alert-{job_id[:8]}", daemon=True).start()
 
 
 def _sync_progress(job_id: str, ctx: JobContext, stop: threading.Event) -> None:
@@ -342,6 +574,7 @@ def get_status(job_id: str) -> Optional[Dict[str, Any]]:
             "source": "live",
         }
 
+    position = _queue_position(job_id)
     row = _fetch_job(job_id)
     if row is None:
         with _registry_lock:
@@ -349,10 +582,14 @@ def get_status(job_id: str) -> Optional[Dict[str, Any]]:
         if entry:
             record = dict(entry["record"])
             record["source"] = "memory"
+            if position is not None:
+                record["queue_position"] = position
             return record
         return None
     data = row.to_dict()
     data["source"] = "database"
+    if position is not None and data.get("status") == "PENDING":
+        data["queue_position"] = position
     return data
 
 
@@ -628,7 +865,8 @@ def recover_on_startup() -> Dict[str, int]:
             continue
         record = row.to_dict()
         try:
-            _enqueue(row.job_id, record, config, _overrides_from_payload(payload))
+            _enqueue(row.job_id, record, config, _overrides_from_payload(payload),
+                     payload=payload)
         except RuntimeError:
             counts["skipped_owned"] += 1           # another process just took it
             continue
@@ -649,18 +887,23 @@ def _decode_json(value):
 
 
 def queue_stats() -> Dict[str, Any]:
+    queued = len(_queued_job_ids())
     with _registry_lock:
         running = sum(1 for e in _registry.values() if e["ctx"] is not None)
         tracked = len(_registry)
+        counters = dict(_counters)
     return {"max_concurrent_jobs": MAX_CONCURRENT_JOBS,
-            "running": running, "tracked_in_process": tracked}
+            "max_queued_jobs": MAX_QUEUED_JOBS,
+            "running": running, "queued": queued, "tracked_in_process": tracked,
+            "shutting_down": _shutting_down.is_set(), "counters": counters}
 
 
 # ---------------------------------------------------------------------------
 # Persistence helpers
 # ---------------------------------------------------------------------------
 def _persist_new_job(record: Dict[str, Any], config: Dict[str, Any],
-                     payload: Dict[str, Any], settings: Dict[str, Any]) -> None:
+                     payload: Dict[str, Any], settings: Dict[str, Any],
+                     idempotency_key: Optional[str] = None) -> None:
     session = db.get_session()
     if session is None:
         logger.warning(f"[{record['job_id']}] database unavailable — "
@@ -669,7 +912,8 @@ def _persist_new_job(record: Dict[str, Any], config: Dict[str, Any],
     try:
         job = db.Job(**record,
                      config_snapshot=_jsonable(config),
-                     request_payload=_jsonable(payload))
+                     request_payload=_jsonable(payload),
+                     idempotency_key=idempotency_key)
         session.add(job)
 
         ladder = config.get("video_templates", {}).get(settings["template_name"], [])
@@ -695,6 +939,11 @@ def _persist_new_job(record: Dict[str, Any], config: Dict[str, Any],
         session.commit()
     except Exception as e:
         session.rollback()
+        if idempotency_key and type(e).__name__ == "IntegrityError":
+            # Another process stored the same key a moment ago.
+            raise IdempotencyConflict(
+                f"A job with Idempotency-Key {idempotency_key!r} was submitted at the "
+                f"same time; retry the request to get that job.") from e
         logger.error(f"[{record['job_id']}] failed to persist job: {e}", exc_info=True)
     finally:
         db.close_session(session)

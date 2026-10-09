@@ -9,11 +9,16 @@
     DELETE /api/v1/jobs/<id>             delete a finished job's rows
     GET    /api/v1/templates             configured encoding ladders
     GET    /api/v1/config                the server's active configuration
-    GET    /health                       liveness + dependency check
+    GET    /health                       liveness (the process is up)
+    GET    /ready                        readiness: 200 when a job can run now, else 503
+    GET    /metrics                      Prometheus metrics
+
+A POST /jobs may carry an ``Idempotency-Key`` header: retrying with the same key
+returns the original job (200) instead of starting another.
 """
 import logging
 
-from flask import Blueprint, current_app, jsonify, request
+from flask import Blueprint, Response, current_app, jsonify, request
 
 from api import database as db
 from api import job_manager
@@ -65,24 +70,38 @@ def start_job():
         return jsonify({"error": "Request body must be a JSON object."}), 400
 
     try:
-        record = job_manager.submit_job(_config(), payload)
+        record = job_manager.submit_job(_config(), payload,
+                                        idempotency_key=request.headers.get("Idempotency-Key"))
     except job_manager.ServiceUnavailable as e:
         return jsonify({"error": str(e)}), 503, {"Retry-After": "30"}
+    except job_manager.QueueFull as e:
+        return jsonify({"error": str(e)}), 429, {"Retry-After": "60"}
+    except job_manager.IdempotencyConflict as e:
+        return jsonify({"error": str(e)}), 422
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
         logger.error(f"Job submission failed: {e}", exc_info=True)
         return jsonify({"error": f"Could not submit job: {e}"}), 500
 
-    return jsonify({
-        "message": "Transcoding job queued.",
+    duplicate = bool(record.get("duplicate"))
+    body = {
+        "message": ("This Idempotency-Key was already used; returning the original job."
+                    if duplicate else "Transcoding job queued."),
         "job_id": record["job_id"],
         "name": record["name"],
         "channel": record["channel"],
         "status": record["status"],
         "log_dir": record["log_dir"],
         "status_url": f"/api/v1/jobs/{record['job_id']}/status",
-    }), 202
+    }
+    if duplicate:
+        body["duplicate"] = True
+    if record.get("queue_position"):
+        body["queue_position"] = record["queue_position"]
+    if record.get("warnings"):
+        body["warnings"] = record["warnings"]
+    return jsonify(body), 200 if duplicate else 202
 
 
 @api_bp.route("/jobs/<job_id>/status", methods=["GET"])
@@ -197,6 +216,20 @@ def health():
         "queue": job_manager.queue_stats(),
     }
     return jsonify(payload), 200
+
+
+@health_bp.route("/ready", methods=["GET"])
+def ready():
+    from api.ops import readiness
+    ok, payload = readiness(_config())
+    return jsonify(payload), 200 if ok else 503
+
+
+@health_bp.route("/metrics", methods=["GET"])
+def metrics():
+    from api.ops import metrics_text
+    return Response(metrics_text(_config()),
+                    mimetype="text/plain; version=0.0.4; charset=utf-8")
 
 
 def _elide(value, keep: int = 120):

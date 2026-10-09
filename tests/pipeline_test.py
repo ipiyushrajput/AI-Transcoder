@@ -259,6 +259,177 @@ def test_api(work: Path, binaries: dict):
           http.get(f"/api/v1/jobs/{job_id}").status_code, 404)
 
 
+def test_api_operations(work: Path, binaries: dict):
+    """Readiness, metrics, request checks, idempotency, queue limits, alerts."""
+    print("api operations")
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from api import database as db
+    from api import job_manager
+    from hls_toolkit import s3_io
+
+    client = fake_s3.install(s3_io, work / "s3_ops")
+    video_uri = client.put(BUCKET, f"Visionular/{CHANNEL}.mp4", os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+    config_path = work / "ops-config.json"
+    config_path.write_text(json.dumps(config))
+    from api.app import create_app
+    http = create_app(str(config_path)).test_client()
+    quick = {"input_video": video_uri, "subtitle_file": None, "resolutions": "720p",
+             "esam": False, "audio_norm": False, "generate_thumbnails": False,
+             "upload": False}
+
+    def wait(job_id, states=("COMPLETED", "FAILED", "CANCELLED"), timeout=120):
+        deadline = time.time() + timeout
+        status = {}
+        while time.time() < deadline:
+            status = http.get(f"/api/v1/jobs/{job_id}/status").get_json()
+            if status.get("status") in states:
+                break
+            time.sleep(0.2)
+        return status
+
+    # Readiness and metrics.
+    ready = http.get("/ready")
+    check("ready when everything is in place", ready.status_code, 200)
+    check_true("…listing each check", {"database", "ffmpeg", "ffprobe", "scratch_disk",
+                                       "coordination_dir"} <= set(ready.get_json()["checks"]))
+    broken = json.loads(config_path.read_text())
+    broken["paths"]["ffmpeg_executable"] = str(work / "no-such-ffmpeg")
+    broken_path = work / "ops-broken.json"
+    broken_path.write_text(json.dumps(broken))
+    not_ready = create_app(str(broken_path)).test_client().get("/ready")
+    check("not ready without FFmpeg (503)", not_ready.status_code, 503)
+    check("…naming the failed check",
+          not_ready.get_json()["checks"]["ffmpeg"]["ok"], False)
+    metrics = http.get("/metrics")
+    text = metrics.get_data(as_text=True)
+    check_true("metrics are in Prometheus format",
+               metrics.content_type.startswith("text/plain")
+               and "# TYPE ai_transcoder_jobs_running gauge" in text
+               and 'ai_transcoder_jobs_by_status{status="COMPLETED"}' in text, text[:300])
+
+    # Wrongly typed fields are refused before a job exists.
+    for label, payload, words in (
+            ("a string boolean", {"upload": "false"}, "upload must be true or false"),
+            ("zero workers", {"transcode_workers": 0}, "transcode_workers"),
+            ("a negative duration", {"duration": -5}, "duration"),
+            ("a string hls_time", {"hls_settings": {"hls_time": "6"}}, "hls_time"),
+            ("an unknown hls setting", {"hls_settings": {"hls_tme": 6}}, "Unknown hls_settings"),
+            ("a bad timecode", {"clippings": [{"StartTimecode": "0:0",
+                                               "EndTimecode": "00:00:10:00"}]},
+             "not a timecode")):
+        response = http.post("/api/v1/jobs", json={**quick, **payload})
+        check(f"{label} is rejected with 400", response.status_code, 400)
+        check_true("…saying why", words in response.get_json()["error"],
+                   response.get_json()["error"])
+
+    # Idempotency: a retried submission returns the original job.
+    key = {"Idempotency-Key": f"test-{os.getpid()}-{int(time.time())}"}
+    first = http.post("/api/v1/jobs", json={**quick, "resolution": "typo"}, headers=key)
+    check("a keyed job is accepted", first.status_code, 202)
+    check_true("an unknown field is reported, not silently ignored",
+               any("resolution" in w for w in first.get_json().get("warnings", [])))
+    again = http.post("/api/v1/jobs", json={**quick, "resolution": "typo"}, headers=key)
+    check("a retry with the same key returns 200", again.status_code, 200)
+    check("…and the same job", again.get_json()["job_id"], first.get_json()["job_id"])
+    other = http.post("/api/v1/jobs", json={**quick, "resolutions": "1080p"}, headers=key)
+    check("the same key for a different request is refused (422)", other.status_code, 422)
+    check("the keyed job completes", wait(first.get_json()["job_id"])["status"], "COMPLETED")
+
+    # Finished jobs are not kept in memory for ever; the database still has them.
+    saved_keep = job_manager.FINISHED_JOBS_IN_MEMORY
+    job_manager.FINISHED_JOBS_IN_MEMORY = 0
+    try:
+        done = http.post("/api/v1/jobs", json=quick).get_json()["job_id"]
+        check("a job finishes", wait(done)["status"], "COMPLETED")
+        time.sleep(0.5)
+        check_true("finished jobs are dropped from memory",
+                   done not in job_manager._registry)
+        check("…and still served from the database",
+              http.get(f"/api/v1/jobs/{done}/status").get_json().get("source"), "database")
+        late = http.post("/api/v1/jobs", json={**quick, "resolution": "typo"}, headers=key)
+        check("a retry after that still finds the original job",
+              late.get_json().get("job_id"), first.get_json()["job_id"])
+    finally:
+        job_manager.FINISHED_JOBS_IN_MEMORY = saved_keep
+
+    # A bounded queue: past MAX_QUEUED_JOBS a submission gets 429.
+    saved_max = job_manager.MAX_QUEUED_JOBS
+    job_manager.MAX_QUEUED_JOBS = 1
+    os.environ["FAKE_HANG"] = "video"
+    started = []
+    try:
+        for _ in range(job_manager.MAX_CONCURRENT_JOBS):
+            job_id = http.post("/api/v1/jobs", json=quick).get_json()["job_id"]
+            started.append(job_id)
+            wait(job_id, states=("RUNNING",), timeout=30)
+        waiting = http.post("/api/v1/jobs", json=quick)
+        check("a job beyond the workers is queued", waiting.status_code, 202)
+        check("…and told its place in line", waiting.get_json().get("queue_position"), 1)
+        started.append(waiting.get_json()["job_id"])
+        check("its status shows the place too",
+              http.get(f"/api/v1/jobs/{started[-1]}/status").get_json()
+              .get("queue_position"), 1)
+        full = http.post("/api/v1/jobs", json=quick)
+        check("a full queue answers 429", full.status_code, 429)
+        check_true("…with Retry-After", full.headers.get("Retry-After"))
+        check_true("/ready reports the full queue",
+                   http.get("/ready").get_json()["checks"]["queue"]["ok"] is False)
+    finally:
+        job_manager.MAX_QUEUED_JOBS = saved_max
+        os.environ.pop("FAKE_HANG", None)
+        for job_id in reversed(started):
+            http.post(f"/api/v1/jobs/{job_id}/cancel")
+        for job_id in started:
+            wait(job_id)
+
+    # A failed job is reported to ALERT_WEBHOOK_URL.
+    received = []
+
+    class Hook(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Hook)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    saved_hook = job_manager.ALERT_WEBHOOK_URL
+    job_manager.ALERT_WEBHOOK_URL = f"http://127.0.0.1:{server.server_port}/hook"
+    os.environ["FAKE_FAIL_HLS"] = "channel_720p"
+    try:
+        failing = http.post("/api/v1/jobs", json=quick).get_json()["job_id"]
+        check("the job fails", wait(failing)["status"], "FAILED")
+        deadline = time.time() + 15
+        while time.time() < deadline and not received:
+            time.sleep(0.1)
+        check_true("a failure alert is posted",
+                   received and received[0]["job_id"] == failing
+                   and "FAILED" in received[0]["text"], received)
+    finally:
+        job_manager.ALERT_WEBHOOK_URL = saved_hook
+        os.environ.pop("FAKE_FAIL_HLS", None)
+        server.shutdown()
+
+    # A table made by the previous version is upgraded in place on start.
+    from sqlalchemy import inspect, text as sql
+    with db.engine.begin() as conn:
+        conn.execute(sql("DROP INDEX ix_jobs_submitted_at ON jobs"))
+        conn.execute(sql("ALTER TABLE jobs DROP COLUMN idempotency_key"))
+    db.init_db()
+    inspector = inspect(db.engine)
+    check_true("start-up adds the new column to an old table",
+               "idempotency_key" in {c["name"] for c in inspector.get_columns("jobs")})
+    check_true("…and the listing index",
+               ("submitted_at",) in {tuple(i["column_names"])
+                                     for i in inspector.get_indexes("jobs")})
+
+
 def test_parallel_cli_jobs(work: Path, binaries: dict):
     """Three `python app.py --config ...` runs started together, on one source.
 
@@ -987,6 +1158,8 @@ def main():
         test_parallel_cli_jobs(work, binaries)
         print()
         test_api(work, binaries)
+        print()
+        test_api_operations(work, binaries)
         print()
         test_restart_recovery(work, binaries)
         print()

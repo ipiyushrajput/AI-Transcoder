@@ -458,7 +458,28 @@ curl -s "localhost:8000/api/v1/jobs?status=RUNNING"
 | `GET` | `/api/v1/jobs/<id>/logs?type=job\|error\|ffmpeg` |
 | `POST` | `/api/v1/jobs/<id>/cancel` |
 | `DELETE` | `/api/v1/jobs/<id>` |
-| `GET` | `/api/v1/templates`, `/api/v1/config`, `/health` |
+| `GET` | `/api/v1/templates`, `/api/v1/config` |
+| `GET` | `/health` — the process is up |
+| `GET` | `/ready` — `200` when a job can run now, else `503` with the failed check |
+| `GET` | `/metrics` — Prometheus metrics (jobs by status, queue, CPU budget, scratch space) |
+
+What a submission can get back:
+
+| Code | Meaning |
+| --- | --- |
+| `202` | Queued. `queue_position` is set when it waits behind other jobs; `warnings` lists any unknown fields that were ignored (a typo such as `resolution`) |
+| `200` | Same `Idempotency-Key` as an earlier submission: the original job is returned, nothing new starts |
+| `400` | The request cannot run: a wrong type (`"upload": "false"` is refused, not read as true), a bad timecode, an unknown template, a missing local file |
+| `422` | The `Idempotency-Key` was already used for a different request |
+| `429` | `MAX_QUEUED_JOBS` jobs are already waiting; retry after `Retry-After` seconds |
+| `503` | The server is shutting down |
+
+Send an `Idempotency-Key` header (any unique string, e.g. a UUID) to make a
+retry safe: if the first response was lost, resubmitting with the same key
+returns that job instead of transcoding twice.
+
+Set `ALERT_WEBHOOK_URL` to have every failed job posted there as JSON (`text`
+plus `job_id`, `stage`, `error_message`, `log_dir`, `host`).
 
 ---
 
@@ -489,7 +510,9 @@ database name contains a hyphen, so quote it with backticks in your own SQL:
 ``USE `Visionular-Transcoder`;``.
 
 Tables: `jobs`, `job_variants`, `job_clips` (InnoDB, utf8mb4, native `JSON` for
-the config snapshot). The API also runs without a database — transcodes still
+the config snapshot). A `jobs` table from an earlier version is upgraded in
+place on start (the `idempotency_key` column and an index on `submitted_at` are
+added when missing); no migration step or manual SQL is needed. The API also runs without a database — transcodes still
 work, only history and listings are unavailable, and `/health` reports
 `"database": "unavailable"`.
 

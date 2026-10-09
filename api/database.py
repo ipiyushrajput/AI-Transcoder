@@ -125,8 +125,11 @@ class Job(Base):
 
     config_snapshot = Column(_JSON)
     request_payload = Column(_JSON)
+    # The client's Idempotency-Key header: a retried submission with the same
+    # key returns the original job instead of starting a second one.
+    idempotency_key = Column(String(128), unique=True)
 
-    submitted_at = Column(DateTime, default=_utcnow)
+    submitted_at = Column(DateTime, default=_utcnow, index=True)
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
     duration_seconds = Column(Float)
@@ -246,6 +249,7 @@ def init_db(create_database: bool = True) -> bool:
         engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True,
                                pool_recycle=3600, pool_size=5, max_overflow=10)
         Base.metadata.create_all(engine)
+        _ensure_schema(engine)
         SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -257,6 +261,35 @@ def init_db(create_database: bool = True) -> bool:
         engine = None
         SessionLocal = None
         return False
+
+
+def _ensure_schema(engine) -> None:
+    """Bring a ``jobs`` table made by an older version up to date.
+
+    ``create_all`` only creates missing tables; it never changes an existing
+    one. The few additions since then are applied here, in place, so an
+    upgrade needs no migration tool and no manual SQL. Each step is skipped
+    when it is already done, so this is safe on every start.
+    """
+    from sqlalchemy import inspect
+    inspector = inspect(engine)
+    columns = {c["name"] for c in inspector.get_columns("jobs")}
+    indexes = {tuple(i["column_names"]) for i in inspector.get_indexes("jobs")}
+    indexes |= {tuple(u["column_names"]) for u in inspector.get_unique_constraints("jobs")}
+    table = Job.__table__
+    with engine.begin() as conn:
+        if "idempotency_key" not in columns:
+            column_type = table.c.idempotency_key.type.compile(dialect=engine.dialect)
+            conn.execute(text(f"ALTER TABLE jobs ADD COLUMN idempotency_key {column_type} NULL"))
+            logger.info("Database upgraded: added jobs.idempotency_key")
+        if ("idempotency_key",) not in indexes:
+            conn.execute(text("CREATE UNIQUE INDEX ux_jobs_idempotency_key "
+                              "ON jobs (idempotency_key)"))
+        if ("submitted_at",) not in indexes:
+            # Listings sort by submission time; without this every page scans
+            # the whole table.
+            conn.execute(text("CREATE INDEX ix_jobs_submitted_at ON jobs (submitted_at)"))
+            logger.info("Database upgraded: indexed jobs.submitted_at")
 
 
 # MySQL identifiers: letters, digits, '_', '$' and '-' cover every real name. The
