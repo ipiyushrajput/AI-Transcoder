@@ -18,6 +18,7 @@ from hls_toolkit.ffmpeg_wrapper import (get_video_info, run_loudnorm_analysis,
                                         _generate_hls_for_resolution, generate_thumbnails,
                                         _get_video_stream_details, _get_h264_profile_idc,
                                         get_ffprobe_first_pts, validate_clippings)
+from hls_toolkit.package_validator import validate_package
 from hls_toolkit.playlist_utils import create_master_playlist, parse_variant_segments
 from hls_toolkit.subtitle_processor import (generate_merged_subtitle_file,
                                             segment_vtt_for_hls)
@@ -433,14 +434,15 @@ def generate_hls_workflow(config: Dict[str, Any],
                                   packaged / max(1, len(selected_resolutions_data)))
                 res_name = res_data["name"]
                 merged_mp4_path = merged_video_paths_by_resolution.get(res_name)
-                if merged_mp4_path:
-                    hls_playlist_res_path = output_dir / f"channel_{res_name}.m3u8"
-                    if _generate_hls_for_resolution(
-                            res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,
-                            total_merged_duration, output_dir, hls_settings,
-                            merged_force_times_str=merged_timeline_cue_points_str,
-                            frame_rate=res_data.get("frame_rate", "")):
-                        hls_output_paths.append(hls_playlist_res_path)
+                if not merged_mp4_path:
+                    raise TranscodeError(
+                        f"No transcoded video was produced for rendition {res_name}, "
+                        f"so it cannot be packaged.", stage="PACKAGING_HLS")
+                _package_rendition(
+                    res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,
+                    total_merged_duration, output_dir, hls_settings,
+                    merged_timeline_cue_points_str)
+                hls_output_paths.append(output_dir / f"channel_{res_name}.m3u8")
         else:
             merged_audio_path = os.path.abspath(input_video)
             for res_data in selected_resolutions_data:
@@ -449,12 +451,11 @@ def generate_hls_workflow(config: Dict[str, Any],
                     res_name, os.path.abspath(input_video))
                 if merged_mp4_path:
                     hls_playlist_res_path = output_dir / f"channel_{res_name}.m3u8"
-                    if _generate_hls_for_resolution(
-                            res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,
-                            total_merged_duration, output_dir, hls_settings,
-                            merged_force_times_str=merged_timeline_cue_points_str,
-                            frame_rate=res_data.get("frame_rate", "")):
-                        hls_output_paths.append(hls_playlist_res_path)
+                    _package_rendition(
+                        res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,
+                        total_merged_duration, output_dir, hls_settings,
+                        merged_timeline_cue_points_str)
+                    hls_output_paths.append(hls_playlist_res_path)
 
         _ = []
         video_segments = []
@@ -538,6 +539,20 @@ def generate_hls_workflow(config: Dict[str, Any],
                     process_playlist(str(playlist_path), events, asset_tags_map,
                                      video_segments=video_segments)
 
+        # --- validate the finished package --------------------------------
+        if ctx is not None:
+            ctx.set_stage("VALIDATING_OUTPUT", 0.0)
+        summary = validate_package(
+            output_dir, [r["name"] for r in selected_resolutions_data],
+            expected_duration=total_merged_duration,
+            hls_time=float(hls_settings.get("hls_time", 6)),
+            expect_thumbnails=bool(thumbnails_enabled))
+        log().info("Package validated: " + ", ".join(
+            f"{uri} {info['segments']} segment(s) / {info['duration']:.3f}s"
+            for uri, info in summary["renditions"].items()))
+        if ctx is not None:
+            ctx.metadata["package"] = summary
+
         # --- publish to S3 -------------------------------------------------
         s3_bucket_name_local = s3_config.get("bucket_name")
         s3_key_prefix_local = s3_config.get("key_prefix", "").strip("/")
@@ -600,6 +615,25 @@ def generate_hls_workflow(config: Dict[str, Any],
         _cleanup_temp_dirs(temp_clipping_dir, debug)
 
     return 0
+
+
+def _package_rendition(res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,
+                       total_merged_duration, output_dir, hls_settings,
+                       force_times: str) -> None:
+    """Package one rendition as HLS, or fail the job naming it.
+
+    A rendition that failed to package used to be skipped silently while the
+    master playlist still listed it, so the job reported success with a
+    broken ladder.
+    """
+    ok = _generate_hls_for_resolution(
+        res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,
+        total_merged_duration, output_dir, hls_settings,
+        merged_force_times_str=force_times, frame_rate=res_data.get("frame_rate", ""))
+    if not ok:
+        raise TranscodeError(
+            f"HLS packaging failed for rendition {res_data['name']}. The FFmpeg error "
+            f"is in error.log and the full output in ffmpeg.log.", stage="PACKAGING_HLS")
 
 
 def _cleanup_temp_dirs(temp_clipping_dir, debug: bool) -> None:

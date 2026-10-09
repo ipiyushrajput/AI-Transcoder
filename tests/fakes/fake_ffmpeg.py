@@ -62,18 +62,27 @@ def run_ffmpeg(argv):
     # HLS packaging: -f hls ... <segment pattern> <playlist>
     if "hls" in argv and arg_after(argv, "-f") == "hls":
         playlist = Path(argv[-1])
+        # Test switches: fail packaging, or "succeed" with a truncated package.
+        if os.getenv("FAKE_FAIL_HLS") and os.getenv("FAKE_FAIL_HLS") in playlist.name:
+            sys.stderr.write("simulated HLS packaging failure\n")
+            return 1
         pattern = arg_after(argv, "-hls_segment_filename")
         total = float(arg_after(argv, "-t") or DURATION)
-        count = max(1, int(total // SEGMENT_SECONDS))
+        if os.getenv("FAKE_TRUNCATE_HLS") and os.getenv("FAKE_TRUNCATE_HLS") in playlist.name:
+            total = total / 2
+        # Like FFmpeg: full segments, then a shorter last one, summing to `total`.
+        count = max(1, int(-(-total // SEGMENT_SECONDS)))
+        durations = [SEGMENT_SECONDS] * (count - 1)
+        durations.append(max(0.001, total - SEGMENT_SECONDS * (count - 1)))
         playlist.parent.mkdir(parents=True, exist_ok=True)
         lines = ["#EXTM3U\n", "#EXT-X-VERSION:3\n",
                  f"#EXT-X-TARGETDURATION:{int(SEGMENT_SECONDS)}\n",
                  "#EXT-X-MEDIA-SEQUENCE:1\n", "#EXT-X-PLAYLIST-TYPE:vod\n"]
-        for i in range(1, count + 1):
+        for i, seg_duration in enumerate(durations, 1):
             segment = Path(pattern % i) if pattern else playlist.with_suffix(f".{i}.ts")
             segment.parent.mkdir(parents=True, exist_ok=True)
             segment.write_bytes(os.urandom(2048))
-            lines.append(f"#EXTINF:{SEGMENT_SECONDS:.6f},\n{segment.name}\n")
+            lines.append(f"#EXTINF:{seg_duration:.6f},\n{segment.name}\n")
         lines.append("#EXT-X-ENDLIST\n")
         playlist.write_text("".join(lines))
         _emit_progress(total)

@@ -474,6 +474,73 @@ def test_output_dir_names():
             check(f"rejects {bad!r}", "rejected", "rejected")
 
 
+def test_package_validator(work):
+    """Every kind of broken package is caught; a whole one passes."""
+    print("package validator")
+    from hls_toolkit.job_context import TranscodeError
+    from hls_toolkit.package_validator import validate_package
+
+    def build(root, renditions=("1080p", "720p"), segments=3, duration=6.0):
+        root.mkdir(parents=True)
+        master = ["#EXTM3U", "#EXT-X-VERSION:3"]
+        for name in renditions:
+            master += [f"#EXT-X-STREAM-INF:BANDWIDTH=1", f"channel_{name}.m3u8"]
+            lines = ["#EXTM3U", "#EXT-X-TARGETDURATION:6"]
+            for i in range(1, segments + 1):
+                seg = f"channel_{name}_{i:05d}.ts"
+                (root / seg).write_bytes(b"x" * 188)
+                lines += [f"#EXTINF:{duration:.6f},", seg]
+            lines.append("#EXT-X-ENDLIST")
+            (root / f"channel_{name}.m3u8").write_text("\n".join(lines) + "\n")
+        (root / "channel.m3u8").write_text("\n".join(master) + "\n")
+        return root
+
+    def problem(label, root, expected_text, **kw):
+        try:
+            validate_package(root, kw.pop("renditions", ["1080p", "720p"]),
+                             expected_duration=kw.pop("expected", 18.0), **kw)
+            check(label, "passed", "caught")
+        except TranscodeError as e:
+            check_true(label, e.stage == "VALIDATING_OUTPUT" and expected_text in str(e),
+                       str(e))
+
+    good = build(work / "pkg_good")
+    try:
+        summary = validate_package(good, ["1080p", "720p"], expected_duration=18.0)
+        check("a whole package passes", len(summary["renditions"]), 2)
+    except TranscodeError as e:
+        check("a whole package passes", f"failed: {e}", "passed")
+
+    root = build(work / "pkg_missing_seg")
+    (root / "channel_720p_00002.ts").unlink()
+    problem("a missing segment is caught", root, "1 segment(s) missing")
+
+    root = build(work / "pkg_empty_seg")
+    (root / "channel_1080p_00003.ts").write_bytes(b"")
+    problem("an empty segment is caught", root, "segment(s) are empty")
+
+    root = build(work / "pkg_no_endlist")
+    text = (root / "channel_720p.m3u8").read_text().replace("#EXT-X-ENDLIST", "")
+    (root / "channel_720p.m3u8").write_text(text)
+    problem("a playlist without ENDLIST is caught", root, "no #EXT-X-ENDLIST")
+
+    root = build(work / "pkg_missing_playlist")
+    (root / "channel_720p.m3u8").unlink()
+    problem("a master pointing at a missing playlist is caught", root, "does not exist")
+
+    root = build(work / "pkg_missing_rung", renditions=("1080p",))
+    problem("a requested rendition missing from the master is caught", root,
+            "does not list rendition 720p")
+
+    root = build(work / "pkg_short")
+    problem("a rendition shorter than expected is caught", root, "runs 18.000s",
+            expected=60.0)
+
+    root = build(work / "pkg_no_thumbs")
+    problem("missing thumbnails are caught when requested", root, "thumbnails",
+            expect_thumbnails=True)
+
+
 def main():
     work = Path(tempfile.mkdtemp(prefix="aitranscoder_smoke_"))
     try:
@@ -485,6 +552,7 @@ def main():
         test_hevc_codec_string()
         test_duplicate_rung_guard()
         test_output_dir_names()
+        test_package_validator(work)
         test_cpu_budget(work)
         test_transcode_scheduling()
         test_unique_log_dirs(work)

@@ -47,7 +47,8 @@ STAGES = [
     ("SUBTITLES", 80, 4),
     ("MANIFEST", 84, 2),
     ("AD_MARKERS", 86, 2),
-    ("THUMBNAILS", 88, 2),
+    ("THUMBNAILS", 88, 1),
+    ("VALIDATING_OUTPUT", 89, 1),
     ("UPLOADING", 90, 9),
     ("CLEANUP", 99, 1),
 ]

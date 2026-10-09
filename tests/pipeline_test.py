@@ -134,6 +134,8 @@ def test_pipeline(work: Path, binaries: dict):
     check_true("ffmpeg.log captured progress lines", "bitrate=" in ffmpeg_log)
     meta = json.loads((log_dir / "job.json").read_text())
     check("job.json records completion", meta["status"], "COMPLETED")
+    check_true("the package was validated before upload",
+               "Package validated" in (log_dir / "job.log").read_text())
     return client
 
 
@@ -577,6 +579,41 @@ def test_safe_publish(work: Path, binaries: dict):
           client._path(BUCKET, f"{prefix}/channel.m3u8").read_bytes(), b"previous run")
 
 
+def test_broken_packages_are_not_published(work: Path, binaries: dict):
+    """A failed or truncated rendition fails the job and nothing goes live."""
+    print("broken packages are not published")
+    from hls_toolkit import s3_io
+    from hls_toolkit.runner import run_transcode_job
+
+    client = fake_s3.install(s3_io, work / "s3_broken")
+    media = work / "broken"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+
+    for switch, label, stage, words in (
+            ("FAKE_FAIL_HLS", "packaging failure", "PACKAGING_HLS", "720p"),
+            ("FAKE_TRUNCATE_HLS", "silently truncated rendition", "VALIDATING_OUTPUT",
+             "channel_720p.m3u8: runs")):
+        os.environ[switch] = "channel_720p"
+        try:
+            result = run_transcode_job(
+                config, overrides=_quick_overrides(
+                    source, upload=True, output_dir=f"broken_{switch.lower()}",
+                    resolution="1080p,720p", local_output_dir=str(media / "saved")),
+                log_root=str(media / "logs"), work_root=str(media / "scratch"))
+        finally:
+            os.environ.pop(switch, None)
+        check(f"{label}: job fails", result["status"], "FAILED")
+        check(f"{label}: at the right stage", result["stage"], stage)
+        check_true(f"{label}: the error names the rendition",
+                   words in (result["error_message"] or ""), result["error_message"])
+        check(f"{label}: nothing was published",
+              client.keys_under(BUCKET, f"Visionular/V3/broken_{switch.lower()}"), [])
+
+
 def main():
     work = Path(tempfile.mkdtemp(prefix="aitx_pipeline_test_"))
     print(f"workspace: {work}\n")
@@ -591,6 +628,8 @@ def main():
         test_local_copies(work, binaries)
         print()
         test_safe_publish(work, binaries)
+        print()
+        test_broken_packages_are_not_published(work, binaries)
         print()
         test_single_job_uses_the_budget(work, binaries)
         print()
