@@ -352,6 +352,16 @@ cleans up scratch space.
 | `esam`, `audio_norm`, `generate_thumbnails`, `upload` | Feature switches |
 | `InputClippings` | `[{"StartTimecode": "HH:MM:SS:FF", "EndTimecode": "..."}]` |
 | `hls_settings` | `hls_time`, `hls_playlist_type`, `hls_flags`, `hls_segment_type` |
+| `hls_bandwidth_from_segments` | `true` (default): measure `BANDWIDTH` from the segments; `false`: use the template |
+
+**Timecodes** (SDK v2.3 rules). `HH:MM:SS:FF` or `HH:MM:SS;FF`, two digits for
+minutes, seconds and frames. At 29.97 (30000/1001) and 59.94 (60000/1001) fps
+both `:` and `;` are read as drop-frame; at every other rate `:` is non-drop
+and `;` is refused. Timecodes are checked: minutes and seconds 0-59, frames
+below the frame rate, and drop-frame labels that do not exist are refused — at
+29.97 frames `00` and `01` of every minute except each tenth (e.g. `00:01:00:00`)
+are skipped, so the first frame of minute 1 is `00:01:00:02` (frames `00`-`03`
+at 59.94). A clip list with such a timecode fails at `VALIDATION`.
 
 ### `s3`
 

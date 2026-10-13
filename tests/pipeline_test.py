@@ -463,8 +463,8 @@ def test_parallel_cli_jobs(work: Path, binaries: dict):
             "resolutions": "1080p,720p,540p,360p", "output_dir": f"job{k}",
             "InputClippings": [
                 {"StartTimecode": "00:00:00:00", "EndTimecode": "00:00:30:00"},
-                {"StartTimecode": "00:00:30:01", "EndTimecode": "00:01:00:00"},
-                {"StartTimecode": "00:01:00:01", "EndTimecode": "00:01:30:00"}]})
+                {"StartTimecode": "00:00:30:01", "EndTimecode": "00:00:59:29"},
+                {"StartTimecode": "00:01:00:02", "EndTimecode": "00:01:30:00"}]})
         for rung in config["video_templates"]["h265_standard"]:
             rung["threads"] = 4
         path = media / f"config{k}.json"

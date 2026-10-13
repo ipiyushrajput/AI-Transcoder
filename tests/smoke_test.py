@@ -54,6 +54,41 @@ def test_time_utils():
     check("drop-frame 00:01:00;02 @29.97",
           timecode_to_frame("00:01:00;02", "30000/1001"), 1800)
 
+    # SDK v2.3 timecode rules.
+    from hls_toolkit import time_utils as tu
+    check("'29.97' is read as 30000/1001", parse_fps("29.97"), (Fraction(30000, 1001), False))
+    check("'59.94 DF' is read as 60000/1001 drop-frame",
+          parse_fps("59.94 DF"), (Fraction(60000, 1001), True))
+    check("colon at 29.97 is drop-frame with allow_colon_df",
+          timecode_to_frame("00:10:02:27", "30000/1001", allow_colon_df=True),
+          timecode_to_frame("00:10:02;27", "30000/1001"))
+    check("colon at 59.94 is drop-frame with allow_colon_df",
+          timecode_to_frame("00:42:50:14", "60000/1001", allow_colon_df=True),
+          timecode_to_frame("00:42:50;14", "60000/1001"))
+    check("colon at 59.94 is non-drop without it",
+          timecode_to_frame("00:01:00:00", "60000/1001"), 3596)
+    check("25 fps is unaffected by allow_colon_df",
+          timecode_to_frame("00:42:50:14", "25", allow_colon_df=True), 64264)
+    for label, tc, fps, words in (
+            ("a dropped label is rejected", "00:01:00;00", "30000/1001", "does not exist"),
+            ("';' at a non-DF rate is rejected", "00:00:10;00", "25", "not valid for frame rate"),
+            ("frames past the rate are rejected", "00:00:10:30", "30000/1001", "Invalid frames"),
+            ("seconds past 59 are rejected", "00:00:60:00", "25", "Invalid seconds"),
+            ("a malformed timecode is rejected", "0:0:10:00", "25", "Invalid timecode format")):
+        try:
+            timecode_to_seconds(tc, fps, allow_colon_df=True)
+            check(label, "accepted", "rejected")
+        except ValueError as e:
+            check_true(label, words in str(e), str(e))
+    # Frames -> timecode -> frames is exact in drop-frame.
+    check_true("drop-frame frame/timecode round trip is exact",
+               all(tu._df_tc_to_frames(*tu._df_frames_to_tc(n, Fraction(30000, 1001)),
+                                       Fraction(30000, 1001)) == n
+                   for n in range(0, 200000, 997)))
+    check("DF seconds_to_timecode uses ';'",
+          seconds_to_timecode(Fraction(3600), "30000/1001", drop_frame_tc_format=True),
+          "01:00:00;00")
+
 
 def test_subtitles(work):
     print("subtitle_processor")

@@ -52,6 +52,19 @@ def _cores(count: int, what: str):
         lease.release()
 
 
+def _df_rate(video_fps) -> bool:
+    """True at 30000/1001 and 60000/1001, where clip timecodes are drop-frame."""
+    try:
+        return time_utils.is_drop_frame_rate(time_utils.parse_fps(str(video_fps))[0])
+    except (ValueError, ZeroDivisionError):
+        return False
+
+
+def _zero_timecode(video_fps) -> str:
+    """The first frame's timecode, in the notation the rate uses."""
+    return "00:00:00;00" if _df_rate(video_fps) else "00:00:00:00"
+
+
 def validate_unique_rung_names(template_name: str,
                                selected_rungs: List[Dict[str, Any]]) -> None:
     """Refuse a selection in which two renditions share a name.
@@ -183,8 +196,10 @@ def generate_hls_workflow(config: Dict[str, Any],
                      "Using full input video as a single clip.")
         duration_seconds = get_video_info(ffprobe_executable, input_video).get("duration", 0.0)
         if duration_seconds > 0:
-            clippings = [{'StartTimecode': "00:00:00:00",
-                          'EndTimecode': seconds_to_timecode(duration_seconds, str(video_fps))}]
+            clippings = [{'StartTimecode': _zero_timecode(video_fps),
+                          'EndTimecode': seconds_to_timecode(
+                              duration_seconds, str(video_fps),
+                              drop_frame_tc_format=_df_rate(video_fps))}]
         else:
             raise TranscodeError(
                 "Could not determine the video duration and no InputClippings were "
@@ -215,9 +230,10 @@ def generate_hls_workflow(config: Dict[str, Any],
                              f"Frame {frame_number} -> "
                              f"{quantized_effective_end_duration:.6f}s")
                 effective_clippings = [{
-                    'StartTimecode': "00:00:00:00",
+                    'StartTimecode': _zero_timecode(video_fps),
                     'EndTimecode': seconds_to_timecode(quantized_effective_end_duration,
-                                                       str(video_fps)),
+                                                       str(video_fps),
+                                                       drop_frame_tc_format=_df_rate(video_fps)),
                     'Name': "FullDurationClip"}]
             except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as e:
                 log().error(f"Failed to get video duration: {e}")
@@ -244,7 +260,8 @@ def generate_hls_workflow(config: Dict[str, Any],
         gop_size_frames = int(round(gop_size_seconds * float(video_fps)))
         for clip in effective_clippings:
             start_tc = clip["StartTimecode"]
-            absolute_start_frame = time_utils.timecode_to_frame(start_tc, str(video_fps))
+            absolute_start_frame = time_utils.timecode_to_frame(start_tc, str(video_fps),
+                                                                allow_colon_df=True)
             offset_frames = (gop_size_frames - absolute_start_frame % gop_size_frames) % gop_size_frames
             offset_seconds = float(offset_frames) / float(video_fps)
             clip_gop_offsets.append(offset_seconds)
@@ -272,7 +289,8 @@ def generate_hls_workflow(config: Dict[str, Any],
                 log().info(f"Applying ad snapping logic with a tolerance of "
                              f"{tolerance_frames} frames.")
                 clip_end_frames = [
-                    math.floor(timecode_to_seconds(c.get("EndTimecode"), str(video_fps))
+                    math.floor(timecode_to_seconds(c.get("EndTimecode"), str(video_fps),
+                                                   allow_colon_df=True)
                                * float(video_fps))
                     for c in effective_clippings]
 
@@ -298,8 +316,10 @@ def generate_hls_workflow(config: Dict[str, Any],
                 accumulated_duration = 0.0
                 for i, clip in enumerate(effective_clippings):
                     duration_seconds = (
-                        timecode_to_seconds(clip.get("EndTimecode"), str(video_fps))
-                        - timecode_to_seconds(clip.get("StartTimecode"), str(video_fps)))
+                        timecode_to_seconds(clip.get("EndTimecode"), str(video_fps),
+                                            allow_colon_df=True)
+                        - timecode_to_seconds(clip.get("StartTimecode"), str(video_fps),
+                                              allow_colon_df=True))
                     quantized_duration = float(
                         round(duration_seconds * float(video_fps)) / float(video_fps))
                     accumulated_duration += quantized_duration
@@ -389,9 +409,9 @@ def generate_hls_workflow(config: Dict[str, Any],
             if effective_clippings:
                 first_clip = effective_clippings[0]
                 start_seconds = timecode_to_seconds(first_clip.get("StartTimecode"),
-                                                    str(video_fps))
+                                                    str(video_fps), allow_colon_df=True)
                 end_seconds = timecode_to_seconds(first_clip.get("EndTimecode"),
-                                                  str(video_fps))
+                                                  str(video_fps), allow_colon_df=True)
                 loudnorm_analysis_duration = end_seconds - start_seconds
                 log().info("Performing loudnorm analysis on the first clipping for "
                              f"{float(loudnorm_analysis_duration):.3f} seconds.")

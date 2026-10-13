@@ -951,8 +951,9 @@ def generate_clipped_transcoded_merged_mp4s(
     tasks = []
     total_merged_duration = 0.0
     for i, clip in enumerate(clippings):
-        start_seconds = timecode_to_seconds(clip["StartTimecode"], str(video_fps))
-        end_seconds = timecode_to_seconds(clip["EndTimecode"], str(video_fps))
+        start_seconds = timecode_to_seconds(clip["StartTimecode"], str(video_fps),
+                                            allow_colon_df=True)
+        end_seconds = timecode_to_seconds(clip["EndTimecode"], str(video_fps), allow_colon_df=True)
         clip_duration = float(end_seconds) - float(start_seconds)
         clip_start_compacted = total_merged_duration
         clip_end_compacted = total_merged_duration + clip_duration
@@ -1109,8 +1110,9 @@ def validate_clippings(clippings: List[Dict[str, Any]], video_fps: fractions.Fra
     """Validates a list of clipping configurations to ensure they have positive durations."""
     for i, clip in enumerate(clippings):
         try:
-            s_check = timecode_to_seconds(clip["StartTimecode"], str(video_fps))
-            e_check = timecode_to_seconds(clip["EndTimecode"], str(video_fps))
+            s_check = timecode_to_seconds(clip["StartTimecode"], str(video_fps),
+                                          allow_colon_df=True)
+            e_check = timecode_to_seconds(clip["EndTimecode"], str(video_fps), allow_colon_df=True)
             if e_check <= s_check:
                 raise ValueError("Duration must be positive.")
         except Exception as e:

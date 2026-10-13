@@ -378,8 +378,9 @@ def remap_esam_events_for_merged_clips(original_events: List[Dict[str, Any]],
             log().warning(f"Clipping missing StartTimecode or EndTimecode. Skipping: {clip}")
             continue
         try:
-            clip_start_orig = timecode_to_seconds(start_timecode, str(video_fps))
-            clip_end_orig = timecode_to_seconds(end_timecode, str(video_fps))
+            clip_start_orig = timecode_to_seconds(start_timecode, str(video_fps),
+                                                  allow_colon_df=True)
+            clip_end_orig = timecode_to_seconds(end_timecode, str(video_fps), allow_colon_df=True)
             if clip_end_orig <= clip_start_orig:
                 log().warning(f"Clipping has non-positive duration. Skipping: {clip}")
                 continue
