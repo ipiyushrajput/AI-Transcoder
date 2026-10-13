@@ -92,6 +92,82 @@ def environment_problem(exc: BaseException) -> Optional[str]:
     return None
 
 
+_AUTH_EXCEPTIONS = ("NoCredentialsError", "PartialCredentialsError",
+                    "CredentialRetrievalError", "UnauthorizedSSOTokenError")
+_AUTH_CODES = ("AccessDenied", "AccessDeniedException", "InvalidAccessKeyId",
+               "InvalidClientTokenId", "SignatureDoesNotMatch", "ExpiredToken",
+               "TokenRefreshRequired", "RequestExpired", "AuthFailure",
+               "UnauthorizedOperation", "UnauthorizedSSOTokenError", "403")
+_AUTH_TEXT = ("Unable to locate credentials", "The security token included in the request "
+              "is invalid", "InvalidAccessKeyId", "AccessDenied", "Access Denied",
+              "SignatureDoesNotMatch", "ExpiredToken", "TokenRefreshRequired",
+              "InvalidClientTokenId", "UnrecognizedClientException", "Forbidden", "HTTP 403")
+
+
+def is_aws_auth_error(exc: BaseException) -> bool:
+    """True when `exc` is a missing, wrong, expired or insufficient credential."""
+    if type(exc).__name__ in _AUTH_EXCEPTIONS:
+        return True
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        if str(response.get("Error", {}).get("Code", "")) in _AUTH_CODES:
+            return True
+        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if status in (401, 403):
+            return True
+    text = str(exc)
+    return any(marker in text for marker in _AUTH_TEXT)
+
+
+def credential_sources() -> List[str]:
+    """Where boto3 could be getting credentials from on this host.
+
+    Only names and masked values: the secret key is never read, and the access
+    key id is shown as its first and last four characters.
+    """
+    found = []
+    key_id = os.environ.get("AWS_ACCESS_KEY_ID", "")
+    if key_id:
+        masked = f"{key_id[:4]}...{key_id[-4:]}" if len(key_id) > 8 else "set"
+        found.append(f"Environment variable AWS_ACCESS_KEY_ID ({masked})")
+    if os.environ.get("AWS_PROFILE"):
+        found.append(f"Environment variable AWS_PROFILE ('{os.environ['AWS_PROFILE']}')")
+    if os.environ.get("AWS_SESSION_TOKEN"):
+        found.append("Environment variable AWS_SESSION_TOKEN (STS temporary token)")
+    for env, default, label in (
+            ("AWS_SHARED_CREDENTIALS_FILE", Path.home() / ".aws" / "credentials",
+             "Shared credentials file"),
+            ("AWS_CONFIG_FILE", Path.home() / ".aws" / "config", "AWS config file")):
+        path = Path(os.environ.get(env) or default)
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                found.append(f"{label}: {path}")
+        except OSError:
+            pass
+    if os.environ.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") or \
+            os.environ.get("AWS_CONTAINER_CREDENTIALS_FULL_URI"):
+        found.append("Container (ECS/EKS) task role credentials endpoint")
+    if os.environ.get("AWS_WEB_IDENTITY_TOKEN_FILE"):
+        found.append("Web identity token (EKS service account / IRSA)")
+    return found
+
+
+def auth_diagnosis(exc: BaseException) -> str:
+    """Extra lines for a credential or permission failure, else an empty string."""
+    if not is_aws_auth_error(exc):
+        return ""
+    sources = credential_sources()
+    listed = ("\n".join(f"    - {s}" for s in sources) if sources else
+              "    - none in the environment or ~/.aws (an EC2 instance role is used "
+              "if one is attached)")
+    return ("\n  Active credential sources detected:\n" + listed +
+            "\n  Note: environment variables take precedence over ~/.aws/credentials, "
+            "which takes precedence over the instance role."
+            "\n  Check that this identity's IAM policy allows s3:GetObject, s3:PutObject "
+            "and s3:ListBucket on the bucket (plus kms:Decrypt / kms:GenerateDataKey "
+            "for KMS-encrypted buckets), and that s3.region matches the bucket.")
+
+
 def _raise_environment_error(exc: BaseException, stage: str) -> None:
     """Re-raise `exc` as a TranscodeError if it is an environment problem."""
     hint = environment_problem(exc)
@@ -165,11 +241,12 @@ def head_object(uri: str, region: Optional[str] = None) -> Dict:
         if code in ("403", "AccessDenied"):
             raise TranscodeError(
                 f"Access denied reading {uri}. Check the instance role or AWS "
-                f"credentials on this server.", stage="FETCHING_INPUT") from e
+                f"credentials on this server.{auth_diagnosis(e)}",
+                stage="FETCHING_INPUT") from e
         if code in ("NoSuchBucket",):
             raise TranscodeError(f"S3 bucket does not exist: {bucket}",
                                  stage="FETCHING_INPUT") from e
-        raise TranscodeError(f"Could not read {uri}: {e}",
+        raise TranscodeError(f"Could not read {uri}: {e}{auth_diagnosis(e)}",
                              stage="FETCHING_INPUT") from e
 
 
@@ -216,7 +293,7 @@ def download_file(uri: str, dest_dir: Path, ctx: Optional[JobContext] = None,
         raise
     except Exception as e:
         _raise_environment_error(e, "FETCHING_INPUT")
-        raise TranscodeError(f"Failed to download {uri}: {e}",
+        raise TranscodeError(f"Failed to download {uri}: {e}{auth_diagnosis(e)}",
                              stage="FETCHING_INPUT") from e
 
     size = local_path.stat().st_size
@@ -296,6 +373,7 @@ def upload_directory(local_dir, bucket: str, prefix: str,
     threads = upload_threads()
     progress = {"files": 0, "bytes": 0}
     progress_lock = threading.Lock()
+    auth_reported = threading.Event()
     keys: List[str] = []
 
     def upload_one(path: Path):
@@ -311,7 +389,12 @@ def upload_directory(local_dir, bucket: str, prefix: str,
             client.upload_file(str(path), bucket, key, ExtraArgs=extra, Config=config)
         except Exception as e:
             _raise_environment_error(e, "UPLOADING")
-            log.error(f"Upload failed for {rel}: {e}")
+            diagnosis = auth_diagnosis(e)
+            if diagnosis and not auth_reported.is_set():
+                auth_reported.set()          # once per upload, not once per file
+                log.error(f"Upload failed for {rel}: {e}{diagnosis}")
+            else:
+                log.error(f"Upload failed for {rel}: {e}")
             return None, "upload failed"
         if _verify_uploads(client, bucket, local_dir, [key], prefix, log):
             return None, "verification failed"

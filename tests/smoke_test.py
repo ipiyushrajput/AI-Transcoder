@@ -327,6 +327,35 @@ def test_environment_diagnostics():
     check("AWS errors stay AWS errors", s3_io.environment_problem(_Denied()), None)
     check("error code extraction", s3_io._error_code(_Denied()), "AccessDenied")
 
+    # Credential failures say which credential sources were found, masked.
+    class NoCredentialsError(Exception):
+        pass
+    check("missing credentials are an auth error",
+          s3_io.is_aws_auth_error(NoCredentialsError("Unable to locate credentials")), True)
+    check("AccessDenied is an auth error", s3_io.is_aws_auth_error(_Denied()), True)
+    check("a 404 is not an auth error",
+          s3_io.is_aws_auth_error(type("E", (Exception,), {
+              "response": {"Error": {"Code": "404"}}})("not found")), False)
+    check("non-auth errors add nothing", s3_io.auth_diagnosis(ValueError("boom")), "")
+    saved = {k: os.environ.get(k) for k in ("AWS_ACCESS_KEY_ID", "AWS_PROFILE",
+                                            "AWS_SECRET_ACCESS_KEY")}
+    os.environ.update(AWS_ACCESS_KEY_ID="AKIAEXAMPLEKEY1234", AWS_PROFILE="transcoder",
+                      AWS_SECRET_ACCESS_KEY="never-shown-secret")
+    try:
+        diagnosis = s3_io.auth_diagnosis(_Denied())
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    check_true("the diagnosis lists the access key masked",
+               "AWS_ACCESS_KEY_ID (AKIA...1234)" in diagnosis, diagnosis)
+    check_true("…and the profile", "AWS_PROFILE ('transcoder')" in diagnosis)
+    check_true("…and never the full key or the secret",
+               "AKIAEXAMPLEKEY1234" not in diagnosis
+               and "never-shown-secret" not in diagnosis)
+
 
 def test_cpu_budget(work):
     """The machine-wide budget: never over-committed, never leaked."""

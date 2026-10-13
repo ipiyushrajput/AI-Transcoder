@@ -660,6 +660,32 @@ def test_hevc_templates(work: Path, binaries: dict):
                    "2160p" in str(e) and "1080p" in str(e), str(e))
 
 
+def test_s3_permission_errors_explain_credentials(work: Path, binaries: dict):
+    """An S3 403 says which credentials were in play."""
+    print("s3 permission diagnostics")
+    from hls_toolkit import s3_io
+    from hls_toolkit.runner import run_transcode_job
+
+    client = fake_s3.install(s3_io, work / "s3_denied")
+    uri = client.put(BUCKET, f"denied/{CHANNEL}.mp4", os.urandom(4096))
+
+    def denied(Bucket, Key):
+        raise fake_s3.FakeClientError("403")
+
+    client.head_object = denied
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+    media = work / "denied"
+    result = run_transcode_job(
+        config, overrides=_quick_overrides(uri, upload=False, output_dir="denied",
+                                           local_output_dir=str(media / "out")),
+        log_root=str(media / "logs"), work_root=str(media / "scratch"))
+    check("the job fails at FETCHING_INPUT", result["stage"], "FETCHING_INPUT")
+    check_true("the error lists the credential sources",
+               "Active credential sources detected" in (result["error_message"] or ""),
+               result["error_message"])
+
+
 def _quick_overrides(source, **extra):
     """Overrides for a fast job: no ESAM, loudnorm or thumbnails."""
     overrides = {"input_video": str(source), "esam": False, "audio_norm": False,
@@ -1305,6 +1331,8 @@ def main():
         test_local_copies(work, binaries)
         print()
         test_hevc_templates(work, binaries)
+        print()
+        test_s3_permission_errors_explain_credentials(work, binaries)
         print()
         test_safe_publish(work, binaries)
         print()
