@@ -257,8 +257,8 @@ its cores back immediately.
 ### What changed, and why it was slow
 
 The worker count used to be worked out from **every rung in the template**, not
-just the ones being encoded. In `h265_standard` the unselected `2160p` rung has
-`threads: 12`, which made a four-rung H.265 job size itself as needing 36 cores
+just the ones being encoded. In `h265_standard` an unselected `2160p` rung with
+`threads: 12` (the 4K rungs have since moved to `h265_4k_standard`) made a four-rung H.265 job size itself as needing 36 cores
 per clip — so on any server under 96 cores it got **one worker and encoded its
 clips one after another**. Separately, each job sized its pool as if it owned the
 whole machine, so jobs started side by side asked for several machines' worth of
@@ -373,11 +373,12 @@ Shipped ladders (as in SDK v2.3):
 | Template | Rungs |
 | --- | --- |
 | `h264_standard` | 1080p, 720p, 540p, 360p (H.264) |
-| `h265_standard` | 2160p, 1440p, 1080p, 720p, 540p, 360p (H.265) |
+| `h265_standard` | 1080p, 720p, 540p, 360p (H.265) |
 | `h265_4k_standard` | 2160p, 1440p, 1080p, 720p (H.265, for UHD sources) |
 
-`h265_4k_standard`'s 1080p and 720p rungs have their own settings (CRF,
-maxrate, level), different from `h265_standard`'s.
+`h265_standard` no longer contains 2160p / 1440p; a job asking for those rungs
+must use `h265_4k_standard`. Its 1080p and 720p rungs have their own settings
+(CRF, maxrate, level), different from `h265_standard`'s.
 
 ### Time limits
 

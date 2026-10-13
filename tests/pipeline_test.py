@@ -623,6 +623,7 @@ def test_every_ffmpeg_step_uses_the_budget(work: Path, binaries: dict):
 def test_hevc_templates(work: Path, binaries: dict):
     """h265_4k_standard carries the UHD rungs; h265_standard no longer does."""
     print("hevc templates")
+    from api import job_manager
     from hls_toolkit.runner import run_transcode_job
 
     media = work / "templates"
@@ -632,6 +633,8 @@ def test_hevc_templates(work: Path, binaries: dict):
     config = build_config(work, binaries)
     config["defaults"]["subtitle_file"] = None
     templates = config["video_templates"]
+    check("h265_standard is 1080p..360p", [r["name"] for r in templates["h265_standard"]],
+          ["1080p", "720p", "540p", "360p"])
     check("h265_4k_standard is 2160p..720p",
           [r["name"] for r in templates["h265_4k_standard"]],
           ["2160p", "1440p", "1080p", "720p"])
@@ -646,6 +649,15 @@ def test_hevc_templates(work: Path, binaries: dict):
     master = (Path(result["output_prefix"]) / "channel.m3u8").read_text()
     check("its master lists all four rungs", master.count("#EXT-X-STREAM-INF"), 4)
     check_true("…including 3840x2160", "RESOLUTION=3840x2160" in master)
+
+    try:
+        job_manager._validate(config, {**job_manager.build_run_settings(
+            config, {"input_video": str(source), "template": "h265_standard",
+                     "resolution": "2160p", "upload": False})})
+        check("2160p under h265_standard is refused", "accepted", "refused")
+    except ValueError as e:
+        check_true("2160p under h265_standard is refused, naming the rungs",
+                   "2160p" in str(e) and "1080p" in str(e), str(e))
 
 
 def _quick_overrides(source, **extra):
