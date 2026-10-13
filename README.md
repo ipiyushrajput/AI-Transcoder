@@ -165,6 +165,14 @@ for a local copy. Absolute paths, `..`, backslashes and drive letters are
 refused — such a name used to point the staging folder outside scratch, where
 it was uploaded and then deleted.
 
+**Master playlist bandwidth is measured.** Each rendition's `BANDWIDTH` is the
+highest per-segment bitrate of the segments it actually produced plus 10%
+headroom (so it covers audio and TS overhead, as the HLS spec requires), and
+`AVERAGE-BANDWIDTH` is its total bits over total duration. A rendition that
+cannot be measured falls back to the template's `bitrate` / `vbv-maxrate`. Set
+`defaults.hls_bandwidth_from_segments` to `false` to always use the template
+values, as before.
+
 Correct content types are set on the way up (`application/vnd.apple.mpegurl`
 for `.m3u8`, `video/mp2t` for `.ts`, `text/vtt` for `.vtt`) so players can read
 the package directly from S3 or CloudFront.

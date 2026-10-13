@@ -21,7 +21,8 @@ from hls_toolkit.ffmpeg_wrapper import (get_video_info, run_loudnorm_analysis,
                                         _get_video_stream_details, _get_h264_profile_idc,
                                         get_ffprobe_first_pts, validate_clippings)
 from hls_toolkit.package_validator import validate_package
-from hls_toolkit.playlist_utils import create_master_playlist, parse_variant_segments
+from hls_toolkit.playlist_utils import (calculate_bitrates_from_segments,
+                                        create_master_playlist, parse_variant_segments)
 from hls_toolkit.subtitle_processor import (generate_merged_subtitle_file,
                                             segment_vtt_for_hls)
 from hls_toolkit.time_utils import timecode_to_seconds, seconds_to_timecode
@@ -541,11 +542,24 @@ def generate_hls_workflow(config: Dict[str, Any],
 
         if ctx is not None:
             ctx.set_stage("MANIFEST", 0.0)
+        # BANDWIDTH / AVERAGE-BANDWIDTH measured from the segments produced,
+        # not taken from the template (defaults.hls_bandwidth_from_segments).
+        bitrate_data_by_resolution = {}
+        if defaults.get("hls_bandwidth_from_segments", True):
+            for res_data in selected_resolutions_data:
+                res_name = res_data["name"]
+                if res_name in merged_video_paths_by_resolution:
+                    bitrate_data_by_resolution[res_name] = calculate_bitrates_from_segments(
+                        output_dir / f"channel_{res_name}.m3u8")
+        else:
+            log().info("hls_bandwidth_from_segments is off: BANDWIDTH comes from the "
+                       "template bitrate / vbv-maxrate.")
         create_master_playlist(str(master_playlist_path), selected_resolutions_data,
                                merged_video_paths_by_resolution, ffprobe_executable,
                                float(video_fps), subtitle_file, hls_sub_playlist_path,
                                default_subtitle_language, _get_video_stream_details,
-                               _get_h264_profile_idc)
+                               _get_h264_profile_idc,
+                               bitrate_data_by_resolution=bitrate_data_by_resolution)
 
         if thumbnails_enabled:
             if ctx is not None:

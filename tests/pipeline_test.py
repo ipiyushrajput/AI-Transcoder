@@ -690,6 +690,22 @@ def test_local_copies(work: Path, binaries: dict):
     check("playback points at the saved copy", result["metadata"]["playback_url"],
           str(saved / "channel.m3u8"))
 
+    # BANDWIDTH in the master comes from the segments the job produced.
+    from hls_toolkit.playlist_utils import calculate_bitrates_from_segments
+    master_text = (saved / "channel.m3u8").read_text()
+    for rung in ("1080p", "720p"):
+        measured = calculate_bitrates_from_segments(saved / f"channel_{rung}.m3u8")
+        check_true(f"{rung} BANDWIDTH is measured from its segments",
+                   f"BANDWIDTH={measured['bandwidth']},"
+                   f"AVERAGE-BANDWIDTH={measured['avg_bandwidth']}" in master_text,
+                   master_text)
+    config["defaults"]["hls_bandwidth_from_segments"] = False
+    template_run = run(upload=False, output_dir="template_bandwidth")
+    config["defaults"].pop("hls_bandwidth_from_segments")
+    check_true("hls_bandwidth_from_segments=false restores the template values",
+               "BANDWIDTH=3000000,AVERAGE-BANDWIDTH=3000000" in
+               (Path(template_run["output_prefix"]) / "channel.m3u8").read_text())
+
     again = run(upload=False, output_dir="show")
     check("a second run never overwrites the first", Path(again["output_prefix"]).name,
           "show_2")

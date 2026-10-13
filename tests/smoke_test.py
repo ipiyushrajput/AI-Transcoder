@@ -20,7 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hls_toolkit import ffmpeg_wrapper as fw
 from hls_toolkit.esam_parser import (parse_esam_xml_string, parse_mcc_xml_asset_tags,
                                      process_playlist, remap_esam_events_for_merged_clips)
-from hls_toolkit.playlist_utils import create_master_playlist, parse_variant_segments
+from hls_toolkit.playlist_utils import (calculate_bitrates_from_segments, create_master_playlist,
+                                        parse_variant_segments)
 from hls_toolkit.subtitle_processor import (generate_merged_subtitle_file, parse_vtt_file,
                                             segment_vtt_for_hls)
 from hls_toolkit.time_utils import (parse_fps, seconds_to_timecode, timecode_to_frame,
@@ -124,6 +125,40 @@ def test_playlists(work):
         fw._get_h264_profile_idc)
     check("hevc codec string follows the probed stream",
           "hvc1.2.6.L120.B0" in hevc_master.read_text(), True)
+
+    # BANDWIDTH measured from the real segments: peak x 1.1, plus the average.
+    # Three 6 s segments of 750 kB, 1500 kB, 750 kB -> 1 / 2 / 1 Mbit/s.
+    for i, size in ((1, 750_000), (2, 1_500_000), (3, 750_000)):
+        (work / f"channel_1080p_{i:05d}.ts").write_bytes(b"\0" * size)
+    measured_variant = work / "channel_1080p.m3u8"
+    measured_variant.write_text(
+        "#EXTM3U\n#EXT-X-TARGETDURATION:6\n"
+        + "".join(f"#EXTINF:6.000000,\nchannel_1080p_{i:05d}.ts\n" for i in (1, 2, 3))
+        + "#EXT-X-ENDLIST\n")
+    measured = calculate_bitrates_from_segments(measured_variant)
+    check("measured BANDWIDTH is the peak segment bitrate + 10%",
+          measured["bandwidth"], 2_200_000)
+    check("measured AVERAGE-BANDWIDTH is total bits / duration",
+          measured["avg_bandwidth"], 1_333_333)
+    check("a missing playlist measures as 0 (so the template value is used)",
+          calculate_bitrates_from_segments(work / "nope.m3u8"),
+          {"bandwidth": 0, "avg_bandwidth": 0})
+    measured_master = work / "channel_measured.m3u8"
+    create_master_playlist(
+        str(measured_master), ladder, {"1080p": "a.mp4", "720p": "b.mp4"}, "ffprobe",
+        25.0, None, None, "en",
+        lambda p, f: {"codec_name": "h264", "profile": "High", "level": 40,
+                      "avg_frame_rate": 25.0},
+        fw._get_h264_profile_idc, bitrate_data_by_resolution={"1080p": measured})
+    text = measured_master.read_text()
+    check("the master uses the measured values",
+          "BANDWIDTH=2200000,AVERAGE-BANDWIDTH=1333333" in text, True)
+    check("a rung without a measurement falls back to the template",
+          "BANDWIDTH=3500000,AVERAGE-BANDWIDTH=3500000" in text, True)
+    variant.write_text(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+        + "".join(f"#EXTINF:6.000000,\nchannel_1080p_{i:05d}.ts\n" for i in (1, 2, 3, 4))
+        + "#EXT-X-ENDLIST\n")
     return variant, segments
 
 

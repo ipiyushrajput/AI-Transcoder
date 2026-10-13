@@ -29,6 +29,7 @@
         "StartTimecode": "00:35:00:08"
       }
     ],
+    "hls_bandwidth_from_segments": true,
     "hls_settings": {
       "hls_time": 6,
       "hls_playlist_type": "vod",
