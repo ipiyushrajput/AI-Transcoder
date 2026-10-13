@@ -368,6 +368,17 @@ A map of template name to ABR ladder. Per rung: `name`, `width`, `height`,
 `-wz264-params` / `-wz265-params`), `bitrate` or `crf`, `preset`, `caeopts`,
 `threads`, `GopSize`, `interlace_mode`, `video_format`, `frame_rate`.
 
+Shipped ladders (as in SDK v2.3):
+
+| Template | Rungs |
+| --- | --- |
+| `h264_standard` | 1080p, 720p, 540p, 360p (H.264) |
+| `h265_standard` | 2160p, 1440p, 1080p, 720p, 540p, 360p (H.265) |
+| `h265_4k_standard` | 2160p, 1440p, 1080p, 720p (H.265, for UHD sources) |
+
+`h265_4k_standard`'s 1080p and 720p rungs have their own settings (CRF,
+maxrate, level), different from `h265_standard`'s.
+
 ### Time limits
 
 | Setting | Default | Meaning |

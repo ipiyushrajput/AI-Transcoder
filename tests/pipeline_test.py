@@ -620,6 +620,34 @@ def test_every_ffmpeg_step_uses_the_budget(work: Path, binaries: dict):
     check("every core is returned", budget.in_use(), 0)
 
 
+def test_hevc_templates(work: Path, binaries: dict):
+    """h265_4k_standard carries the UHD rungs; h265_standard no longer does."""
+    print("hevc templates")
+    from hls_toolkit.runner import run_transcode_job
+
+    media = work / "templates"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+    templates = config["video_templates"]
+    check("h265_4k_standard is 2160p..720p",
+          [r["name"] for r in templates["h265_4k_standard"]],
+          ["2160p", "1440p", "1080p", "720p"])
+
+    result = run_transcode_job(
+        config, overrides=_quick_overrides(source, upload=False, output_dir="uhd",
+                                           template="h265_4k_standard",
+                                           resolution="2160p,1440p,1080p,720p",
+                                           local_output_dir=str(media / "out")),
+        log_root=str(media / "logs"), work_root=str(media / "scratch"))
+    check("a 4K ladder job completes", result["status"], "COMPLETED")
+    master = (Path(result["output_prefix"]) / "channel.m3u8").read_text()
+    check("its master lists all four rungs", master.count("#EXT-X-STREAM-INF"), 4)
+    check_true("…including 3840x2160", "RESOLUTION=3840x2160" in master)
+
+
 def _quick_overrides(source, **extra):
     """Overrides for a fast job: no ESAM, loudnorm or thumbnails."""
     overrides = {"input_video": str(source), "esam": False, "audio_norm": False,
@@ -1263,6 +1291,8 @@ def main():
         test_output_folder_safety(work, binaries)
         print()
         test_local_copies(work, binaries)
+        print()
+        test_hevc_templates(work, binaries)
         print()
         test_safe_publish(work, binaries)
         print()
