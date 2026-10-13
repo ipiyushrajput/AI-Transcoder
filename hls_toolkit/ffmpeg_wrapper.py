@@ -163,6 +163,41 @@ def run_loudnorm_analysis(ffmpeg_executable: str,
         return None
 
 
+# Rates a source's measured average frame rate is snapped to (SDK v2.3).
+STANDARD_BROADCAST_FPS = (fractions.Fraction(24000, 1001), fractions.Fraction(30000, 1001),
+                          fractions.Fraction(60000, 1001), fractions.Fraction(24, 1),
+                          fractions.Fraction(25, 1), fractions.Fraction(30, 1),
+                          fractions.Fraction(50, 1), fractions.Fraction(60, 1))
+
+
+def normalize_encoder_framerate(frame_rate) -> fractions.Fraction:
+    """Frame rate for the encoder's fps filter, without high-denominator values.
+
+    ffprobe's avg_frame_rate can come back as e.g. ``359640/12000`` for a
+    nominal 29.97 fps source. As in SDK v2.3:
+
+    * a missing, malformed or non-positive rate becomes 25/1;
+    * a rate whose denominator is 1001 or less is kept as it is (so
+      30000/1001, 25/1, 24000/1001 ... are unchanged);
+    * otherwise it snaps to a standard broadcast rate within 0.05 fps, or else
+      is reduced with ``limit_denominator(1001)``.
+    """
+    try:
+        rate = (frame_rate if isinstance(frame_rate, fractions.Fraction)
+                else fractions.Fraction(frame_rate))
+    except (ValueError, ZeroDivisionError, TypeError):
+        return fractions.Fraction(25, 1)
+    if rate <= 0:
+        return fractions.Fraction(25, 1)
+    if rate.denominator > 1001:
+        fps_float = float(rate)
+        for std_fps in STANDARD_BROADCAST_FPS:
+            if abs(fps_float - float(std_fps)) < 0.05:
+                return std_fps
+        return rate.limit_denominator(1001)
+    return rate
+
+
 def get_video_info(ffprobe_executable: str,
                    input_video: Union[str, Path]) -> Dict[str, Union[float, fractions.Fraction]]:
     """Gets video information (duration and frame rate) using a single ffprobe call."""
@@ -640,9 +675,10 @@ def _transcode_clip_with_single_command(clip_index,
             video_filters = []
             if res_data.get("interlace_mode") == "PROGRESSIVE":
                 video_filters.append("yadif=mode=0:parity=auto:deint=1")
+            target_fps = normalize_encoder_framerate(res_data.get("frame_rate") or video_fps)
             video_filters.extend([
                 f'scale=w={res_data["width"]}:h={res_data["height"]}',
-                f'fps={str(res_data.get("frame_rate", video_fps))}'])
+                f'fps={str(target_fps)}'])
             filter_complex_parts.append(
                 f'[v{i}]{",".join(video_filters)}[v_out_{res_name}]')
 

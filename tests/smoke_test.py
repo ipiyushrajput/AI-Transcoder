@@ -298,6 +298,38 @@ def test_ffmpeg_command():
     check("10-bit pixel format", "yuv420p10le" in cmd, True)
     check("scte35 cue point", "-scte35_cue_points 6.500" in cmd, True)
     check("outputs mapped", sorted(result["outputs"]), ["1080p", "720p"])
+    check("color range is declared", "-pix_fmt yuv420p -color_range tv" in cmd, True)
+
+    # Frame-rate snapping (SDK v2.3): standard rates pass through unchanged,
+    # high-denominator measurements snap to the broadcast rate.
+    from fractions import Fraction
+    n = fw.normalize_encoder_framerate
+    check("30000/1001 is unchanged", n(Fraction(30000, 1001)), Fraction(30000, 1001))
+    check("25 is unchanged", n(Fraction(25)), Fraction(25))
+    check("a 29.97 float snaps to 30000/1001", n(29.97), Fraction(30000, 1001))
+    check("a high-denominator 59.94 snaps to 60000/1001",
+          n(Fraction(5994006, 100000)), Fraction(60000, 1001))
+    check("an odd high-denominator rate is reduced",
+          n(Fraction(12345, 10007)), Fraction(12345, 10007).limit_denominator(1001))
+    check("a malformed or zero rate becomes 25", (n("abc"), n("0/1"), n(None)),
+          (Fraction(25), Fraction(25), Fraction(25)))
+
+    for label, source_fps, expected in (
+            ("an NTSC source keeps fps=30000/1001", Fraction(30000, 1001), "fps=30000/1001"),
+            ("a high-denominator source is snapped in the filter",
+             Fraction(2997003, 100000), "fps=30000/1001")):
+        captured.clear()
+        fw._run_ffmpeg_command_with_logging = (
+            lambda cmd, **kw: (captured.append(cmd), ("", ""))[1])
+        try:
+            fw._transcode_clip_with_single_command(
+                0, [{"name": "720p", "width": 1280, "height": 720, "codec": "H_264",
+                     "bitrate": "3M", "GopSize": 6.0}],
+                "/in/movie.mp4", "/tmp", "ffmpeg", 0.0, 12.0, False, {}, {},
+                [], 0.0, 12.0, source_fps, 0.0, "video")
+        finally:
+            fw._run_ffmpeg_command_with_logging = original
+        check_true(label, expected in " ".join(str(a) for a in captured[0]))
 
 
 def test_environment_diagnostics():
