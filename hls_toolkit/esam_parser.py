@@ -202,6 +202,12 @@ def inject_elemental_markers(m3u8_path: Path,
                 lines_to_insert_at_end.append(asset_tag_line)
             if ad_break_logic_duration == 0:
                 lines_to_insert_at_end.append("#EXT-X-CUE-IN\n")
+            # Two signals past the end used to stack two CUE-OUTs at the end.
+            if has_marker_near(lines, insert_pos, ["#EXT-X-CUE-OUT"], window=1):
+                log().info(f"{m3u8_path.name}: Signal {npt_to_log:.3f}s is beyond total "
+                           "duration but EXT-X-CUE-OUT already exists at end of playlist. "
+                           "Skipping duplicate.")
+                continue
             for line_to_insert in reversed(lines_to_insert_at_end):
                 lines.insert(insert_pos, line_to_insert)
             inserted_count += len(lines_to_insert_at_end)

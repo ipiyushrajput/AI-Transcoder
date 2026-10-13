@@ -245,6 +245,31 @@ def test_esam(work, variant, segments):
     check("CUE-OUT-CONT injected", "#EXT-X-CUE-OUT-CONT:6.000/12.000" in body, True)
     check("CUE-IN injected", "#EXT-X-CUE-IN" in body, True)
 
+    # Two signals past the end of a 24 s playlist: one CUE-OUT at the end, not two.
+    late = work / "channel_late.m3u8"
+    late.write_text(
+        "#EXTM3U\n#EXT-X-TARGETDURATION:6\n"
+        + "".join(f"#EXTINF:6.000000,\nlate_{i:05d}.ts\n" for i in (1, 2, 3, 4))
+        + "#EXT-X-ENDLIST\n")
+    late_events = parse_esam_xml_string(
+        '<SignalProcessingNotification '
+        'xmlns="urn:cablelabs:iptvservices:esam:xsd:signal:1" '
+        'xmlns:sig="urn:cablelabs:md:xsd:signaling:3.0">'
+        + "".join(
+            f'<ResponseSignal acquisitionSignalID="late-{n}">'
+            f'<sig:NPTPoint nptPoint="{n}"/><sig:SCTE35PointDescriptor>'
+            '<sig:SegmentationDescriptorInfo segmentTypeId="52" duration="PT10.0S"/>'
+            '</sig:SCTE35PointDescriptor></ResponseSignal>' for n in ("30.0", "40.0"))
+        + '</SignalProcessingNotification>')
+    check("two late signals parsed", len(late_events), 2)
+    process_playlist(str(late), late_events, {})
+    late_body = late.read_text()
+    check("only one CUE-OUT is added at the end for signals past the end",
+          late_body.count("#EXT-X-CUE-OUT:"), 1)
+    check_true("…before EXT-X-ENDLIST",
+               late_body.rstrip().endswith("#EXT-X-CUE-OUT:10.000\n#EXT-X-ENDLIST"),
+               late_body)
+
 
 def test_ffmpeg_command():
     print("ffmpeg_wrapper")
