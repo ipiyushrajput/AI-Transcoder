@@ -361,7 +361,7 @@ def process_playlist(m3u8_arg: str,
 
 def remap_esam_events_for_merged_clips(original_events: List[Dict[str, Any]],
                                        clippings: List[Dict[str, Any]],
-                                       video_fps: float) -> List[Dict[str, Any]]:
+                                       video_fps) -> List[Dict[str, Any]]:
     if not original_events:
         return []
     if not clippings:

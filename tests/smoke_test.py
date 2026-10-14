@@ -85,6 +85,20 @@ def test_time_utils():
                all(tu._df_tc_to_frames(*tu._df_frames_to_tc(n, Fraction(30000, 1001)),
                                        Fraction(30000, 1001)) == n
                    for n in range(0, 200000, 997)))
+    # A 1001 rate that went through float() is still that exact rate, so
+    # drop-frame timecodes keep working; a genuinely different rate is not changed.
+    check("float(30000/1001) parses back to 30000/1001",
+          parse_fps(str(float(Fraction(30000, 1001))))[0], Fraction(30000, 1001))
+    check("float(60000/1001) as a Fraction is snapped too",
+          parse_fps(Fraction(float(Fraction(60000, 1001))))[0], Fraction(60000, 1001))
+    check("float(24000/1001) parses back to 24000/1001",
+          parse_fps(str(float(Fraction(24000, 1001))))[0], Fraction(24000, 1001))
+    check("2997/100 is left alone (a different rate, still non-drop)",
+          parse_fps("2997/100")[0], Fraction(2997, 100))
+    check("';' timecodes work with a float-rounded 29.97 rate",
+          float(timecode_to_seconds("00:10:02;27", str(float(Fraction(30000, 1001))),
+                                    allow_colon_df=True)),
+          float(timecode_to_seconds("00:10:02;27", "30000/1001")))
     check("DF seconds_to_timecode uses ';'",
           seconds_to_timecode(Fraction(3600), "30000/1001", drop_frame_tc_format=True),
           "01:00:00;00")
@@ -279,6 +293,21 @@ def test_esam(work, variant, segments):
     check("asset tag injected", "#EXT-X-ASSET:CAID=0x1234" in body, True)
     check("CUE-OUT-CONT injected", "#EXT-X-CUE-OUT-CONT:6.000/12.000" in body, True)
     check("CUE-IN injected", "#EXT-X-CUE-IN" in body, True)
+
+    # Regression: ESAM remap at 29.97 with drop-frame clips, given the exact
+    # rate or a float-rounded one, must remap every event (it used to skip
+    # every clip with "Drop-frame notation is not valid for frame rate").
+    ev = [{"npt": 80.0, "duration": 10.0, "segmentTypeId": "52",
+           "acquisitionSignalID": "1"}]
+    df_clips = [{"StartTimecode": "00:00:00;00", "EndTimecode": "00:00:20;00"},
+                {"StartTimecode": "00:01:10;00", "EndTimecode": "00:01:50;00"}]
+    for label, fps in (("exact 30000/1001", Fraction(30000, 1001)),
+                       ("float-rounded 29.97", float(Fraction(30000, 1001)))):
+        out = remap_esam_events_for_merged_clips(ev, df_clips, fps)
+        # 20;00 = 600 frames = 20.020 s, plus 80 - 70.003 = 9.997 s into clip 2.
+        check(f"ESAM remap at {label} keeps the event", len(out), 1)
+        check(f"ESAM remap at {label} puts it at the right time",
+              out[0]["npt"] if out else None, 30.017)
 
     # Two signals past the end of a 24 s playlist: one CUE-OUT at the end, not two.
     late = work / "channel_late.m3u8"

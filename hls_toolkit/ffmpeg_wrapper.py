@@ -946,8 +946,10 @@ def generate_clipped_transcoded_merged_mp4s(
     temp_clipping_dir = Path(tempfile.mkdtemp(prefix="hls_clips_transcoded_", dir=temp_dir))
     log().info(f"Created temporary directory for transcoded clips: {temp_clipping_dir}")
     abs_input_video = Path(os.path.abspath(str(input_video)))
+    # The exact rate: float(30000/1001) is 29.97002997002997, which is not a
+    # drop-frame rate, so drop-frame clip timecodes would fail to parse.
     remapped_esam_events = remap_esam_events_for_merged_clips(esam_events, clippings,
-                                                              float(video_fps))
+                                                              video_fps)
     tasks = []
     total_merged_duration = 0.0
     for i, clip in enumerate(clippings):

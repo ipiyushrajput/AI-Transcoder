@@ -1066,6 +1066,71 @@ def test_encoder_check(work: Path, binaries: dict):
     _with_env(coord, scenario)
 
 
+def test_esam_at_2997(work: Path, binaries: dict):
+    """Regression: at 30000/1001, ESAM remapping must accept drop-frame clip
+    timecodes (';' and ':') and the cue points must reach the encoder.
+
+    The remap step used to receive float(fps) = 29.97002997002997, which the
+    exact drop-frame check rejected: every clip was skipped ("Drop-frame
+    notation is not valid for frame rate: 2997002997002997/..."), no events
+    were remapped, and -scte35_cue_points was left off every encode.
+    """
+    print("esam at 29.97 fps")
+    from hls_toolkit.runner import run_transcode_job
+
+    scc = ('<SignalProcessingNotification '
+           'xmlns="urn:cablelabs:iptvservices:esam:xsd:signal:1" '
+           'xmlns:sig="urn:cablelabs:md:xsd:signaling:3.0">'
+           '<ResponseSignal acquisitionSignalID="1">'
+           '<sig:NPTPoint nptPoint="80.0"/><sig:SCTE35PointDescriptor>'
+           '<sig:SegmentationDescriptorInfo segmentTypeId="52" duration="PT10.0S"/>'
+           '</sig:SCTE35PointDescriptor></ResponseSignal>'
+           '</SignalProcessingNotification>')
+    media = work / "esam2997"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+
+    for notation, clips in (
+            # Clip 2 starts past the first minute, where drop-frame and
+            # non-drop differ by 2 frames, so a colon list misread as
+            # non-drop would put the cue point in the wrong place.
+            ("';' drop-frame", [{"StartTimecode": "00:00:00;00", "EndTimecode": "00:00:20;00"},
+                                {"StartTimecode": "00:01:10;00", "EndTimecode": "00:01:50;00"}]),
+            ("':' colon", [{"StartTimecode": "00:00:00:00", "EndTimecode": "00:00:20:00"},
+                           {"StartTimecode": "00:01:10:00", "EndTimecode": "00:01:50:00"}])):
+        config = build_config(work, binaries)
+        config["defaults"]["subtitle_file"] = None
+        config["defaults"]["InputClippings"] = clips
+        config["Esam"] = {"SignalProcessingNotification": {"SccXml": scc},
+                          "ManifestConfirmConditionNotification": {"MccXml": ""}}
+        log_root = media / f"logs_{len(notation)}"
+        result = _with_env({"FAKE_MEDIA_FPS": "30000/1001", "FAKE_MEDIA_DURATION": "120"},
+                           lambda: run_transcode_job(
+                               config, overrides=_quick_overrides(
+                                   source, upload=False, esam=True,
+                                   output_dir=f"esam_{len(notation)}",
+                                   local_output_dir=str(media / "out")),
+                               log_root=str(log_root), work_root=str(media / "scratch")))
+        check(f"{notation}: the job completes", result["status"], "COMPLETED")
+        job_log = "".join(p.read_text() for p in log_root.rglob("job.log"))
+        ffmpeg_log = "".join(p.read_text() for p in log_root.rglob("ffmpeg.log"))
+        check_true(f"{notation}: every clip timecode parses in the ESAM remap",
+                   "Error parsing timecode in clipping" not in job_log
+                   and "No valid clippings after processing" not in job_log,
+                   [l for l in job_log.splitlines() if "clipping" in l.lower()][:3])
+        check_true(f"{notation}: the events are remapped to the merged timeline",
+                   "Updated ESAM events to remapped versions" in job_log)
+        # Clip 2 starts at drop-frame 01:10;00 = frame 2098 (70.003 s), so
+        # the event at 80 s is 9.997 s into it (non-drop would say 9.930).
+        check_true(f"{notation}: the cue point reaches the encoder at the right time",
+                   "-scte35_cue_points 9.997" in ffmpeg_log,
+                   [l for l in ffmpeg_log.splitlines() if "scte35" in l][:2])
+        playlist = (Path(result["output_prefix"]) / "channel_720p.m3u8").read_text()
+        check_true(f"{notation}: the playlist carries the ad break",
+                   "#EXT-X-CUE-OUT:10.000" in playlist)
+
+
 def _with_env(env: dict, fn):
     previous = {k: os.environ.get(k) for k in env}
     os.environ.update(env)
@@ -1331,6 +1396,8 @@ def main():
         test_local_copies(work, binaries)
         print()
         test_hevc_templates(work, binaries)
+        print()
+        test_esam_at_2997(work, binaries)
         print()
         test_s3_permission_errors_explain_credentials(work, binaries)
         print()

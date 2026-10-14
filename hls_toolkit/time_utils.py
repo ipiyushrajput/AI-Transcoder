@@ -13,7 +13,9 @@ Rules:
   rate, and drop-frame labels that do not exist (frames 0-1 / 0-3 at the start
   of a minute not divisible by 10) are rejected instead of silently adjusted.
 * Rates are compared as exact fractions; "29.97", "59.94", "23.976" and the
-  like are read as their 1001-denominator rates.
+  like are read as their 1001-denominator rates, and so is a value that is a
+  1001 rate passed through float() (e.g. "29.97002997002997"). A genuinely
+  different rate such as 2997/100 is not changed.
 """
 from fractions import Fraction
 import re
@@ -34,6 +36,24 @@ CANONICAL_FPS_ALIASES: Dict[str, Fraction] = {
 }
 
 
+# Exact 1001-denominator rates a float-rounded value is snapped back to.
+_NTSC_RATES = (Fraction(24000, 1001), Fraction(30000, 1001), Fraction(60000, 1001),
+               Fraction(120000, 1001))
+# Far below any real rate difference (2997/100 is 3e-5 away from 30000/1001),
+# far above float rounding (about 1e-15).
+_FLOAT_ROUNDING_TOLERANCE = Fraction(1, 1000000)
+
+
+def _undo_float_rounding(fps: Fraction) -> Fraction:
+    """30000/1001 that went through float() comes back as
+    2997002997002997/100000000000000; give the exact rate back so drop-frame
+    detection, which compares exactly, still recognises it."""
+    for rate in _NTSC_RATES:
+        if fps != rate and abs(fps - rate) < _FLOAT_ROUNDING_TOLERANCE:
+            return rate
+    return fps
+
+
 def parse_fps(fps_str):
     """Parse a frame rate and an optional ``DF`` marker.
 
@@ -42,7 +62,7 @@ def parse_fps(fps_str):
     Returns: (fps: Fraction, is_df: bool)
     """
     if isinstance(fps_str, Fraction):
-        return (fps_str, False)
+        return (_undo_float_rounding(fps_str), False)
     df = False
     fps_clean = str(fps_str).strip()
     if fps_clean.upper().endswith("DF"):
@@ -51,7 +71,7 @@ def parse_fps(fps_str):
     if fps_clean in CANONICAL_FPS_ALIASES:
         fps = CANONICAL_FPS_ALIASES[fps_clean]
     else:
-        fps = Fraction(fps_clean)
+        fps = _undo_float_rounding(Fraction(fps_clean))
     return (fps, df)
 
 
