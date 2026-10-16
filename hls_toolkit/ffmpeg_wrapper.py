@@ -605,6 +605,51 @@ def _merge_transcoded_clips(ffmpeg_executable: str,
     return merged_mp4_paths_by_resolution
 
 
+def clip_cut_args(start_seconds, end_seconds, video_fps, stream_type: str = "video"):
+    """Frame-exact ``-ss`` / ``-t`` (and frame count) for one clip.
+
+    Clip timecodes name whole frames, but the cut used to be passed to FFmpeg
+    rounded to milliseconds. FFmpeg keeps floor(t x fps) frames, so whenever a
+    clip's length rounded *down* (599.966033 s -> 599.966 for a 17981-frame
+    clip at 29.97) the clip lost its last frame. The ESAM markers and the HLS
+    cut times are computed on the exact timeline, so every lost frame moved the
+    real ad split one frame earlier than its marker, and the gap accumulated
+    clip by clip until markers landed a whole segment late.
+
+    Now, with the clip's first frame S and frame count N (EndTimecode
+    exclusive, as before):
+
+    * video: ``-ss`` is (S - 1/4) / fps, a quarter frame before frame S, so
+      the first frame kept is always S whichever way the source's timestamps
+      round (and never a half-frame tie for the fps filter); ``-t`` is
+      (N + 1/2) / fps, which can never cut the last frame; and ``frames``
+      (passed as ``-frames:v``) caps each output at exactly N;
+    * audio: ``-ss`` is exactly S / fps and ``-t`` exactly N / fps, so the audio
+      starts with the video's first frame and is exactly as long.
+
+    Returns ``{"ss": str, "t": str, "frames": int | None}``; ``frames`` is None
+    for audio, or when the frame rate is unusable (then the old rounding is used).
+    """
+    try:
+        fps = video_fps if isinstance(video_fps, fractions.Fraction) \
+            else fractions.Fraction(str(video_fps))
+        if fps <= 0:
+            raise ValueError(video_fps)
+        start_frame = int(round(fractions.Fraction(start_seconds) * fps))
+        frame_count = max(1, int(round((fractions.Fraction(end_seconds)
+                                        - fractions.Fraction(start_seconds)) * fps)))
+    except (ValueError, ZeroDivisionError, TypeError):
+        duration = float(end_seconds) - float(start_seconds)
+        return {"ss": f"{float(start_seconds):.3f}", "t": f"{duration:.3f}", "frames": None}
+    if stream_type == "video":
+        ss = (start_frame - fractions.Fraction(1, 4)) / fps if start_frame > 0 else 0
+        t = (frame_count + fractions.Fraction(1, 2)) / fps
+        return {"ss": f"{float(ss):.6f}", "t": f"{float(t):.6f}", "frames": frame_count}
+    ss = fractions.Fraction(start_frame) / fps
+    t = fractions.Fraction(frame_count) / fps
+    return {"ss": f"{float(ss):.6f}", "t": f"{float(t):.6f}", "frames": None}
+
+
 def _transcode_clip_with_single_command(clip_index,
                                         video_templates,
                                         abs_input_video,
@@ -658,13 +703,15 @@ def _transcode_clip_with_single_command(clip_index,
         Dict: Information about the generated outputs (type, paths).
     """
     clip_duration = original_clip_end_seconds - original_clip_start_seconds
+    cut = clip_cut_args(original_clip_start_seconds, original_clip_end_seconds, video_fps,
+                        stream_type)
     ffmpeg_cmd = [
         ffmpeg_executable,
         "-y",
         "-ss",
-        f"{float(original_clip_start_seconds):.3f}",
+        cut["ss"],
         "-t",
-        f"{float(clip_duration):.3f}",
+        cut["t"],
         "-i",
         str(abs_input_video)]
     if stream_type == "video":
@@ -754,6 +801,10 @@ def _transcode_clip_with_single_command(clip_index,
                                          f"+ n_forced*{precise_gop_duration:.3f})")
             ffmpeg_cmd.extend(["-force_key_frames", force_key_frames_expr])
             ffmpeg_cmd.extend(["-avoid_negative_ts", "make_zero"])
+            if cut["frames"] is not None:
+                # Exactly the planned frame count, so the merged timeline is the
+                # one the ESAM markers and segment cut times are computed on.
+                ffmpeg_cmd.extend(["-frames:v", str(cut["frames"])])
             ffmpeg_cmd.append(str(output_clip_path))
 
     elif stream_type == "audio":

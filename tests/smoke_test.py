@@ -763,6 +763,87 @@ def test_housekeeping(work):
             os.environ["WZ_CPU_SLOT_DIR"] = saved
 
 
+# The clip lists from the HEVC and AVC test jobs whose ad markers drifted.
+HEVC_CLIPS = [("00:00:00;00", "00:10:00;14"), ("00:10:00;15", "00:20:00;14"),
+              ("00:20:00;15", "00:30:00;14"), ("00:30:00;15", "00:40:00;14"),
+              ("00:40:00;15", "00:50:00;14"), ("00:50:00;15", "00:59:59;28")]
+AVC_CLIPS = [("00:00:00;00", "00:10:02;27"), ("00:10:02;28", "00:19:12;26"),
+             ("00:19:12;27", "00:26:57;05"), ("00:26:57;06", "00:35:00;07"),
+             ("00:35:00;08", "00:42:50;14")]
+
+
+def _ffmpeg_frames(ss, t, frames_cap, fps):
+    """What FFmpeg keeps for -ss/-t on a CFR source, as the real logs show:
+    frames from the first with pts >= ss, while the frame ends within t
+    (floor(t x fps) of them), capped by -frames:v."""
+    import math
+    from fractions import Fraction
+    first = math.ceil(Fraction(ss) * fps)
+    kept = math.floor(Fraction(t) * fps)
+    if frames_cap is not None:
+        kept = min(kept, frames_cap)
+    return first, kept
+
+
+def test_clip_cuts_frame_exact():
+    """Regression: every clip encode gets exactly its planned frames.
+
+    The cut used to be sent as -ss/-t rounded to milliseconds; a length that
+    rounded down (599.966033 -> 599.966) lost the clip's last frame, so the real
+    ad split ran one frame earlier per clip than the ESAM marker, and from the
+    third break on the marker landed a whole segment late.
+    """
+    print("frame-exact clip cuts")
+    from fractions import Fraction
+    from hls_toolkit.time_utils import timecode_to_seconds
+    fps = Fraction(30000, 1001)
+    captured = []
+    original = fw._run_ffmpeg_command_with_logging
+    fw._run_ffmpeg_command_with_logging = lambda cmd, **kw: (captured.append(cmd), ("", ""))[1]
+
+    def arg(cmd, flag):
+        return cmd[cmd.index(flag) + 1] if flag in cmd else None
+
+    try:
+        for name, clips in (("HEVC", HEVC_CLIPS), ("AVC", AVC_CLIPS)):
+            planned_total = actual_total = 0
+            drift = []
+            for i, (start_tc, end_tc) in enumerate(clips):
+                start = timecode_to_seconds(start_tc, fps, allow_colon_df=True)
+                end = timecode_to_seconds(end_tc, fps, allow_colon_df=True)
+                start_frame, planned = int(start * fps), int((end - start) * fps)
+                rung = [{"name": "720p", "width": 1280, "height": 720, "codec": "H_265",
+                         "crf": 26, "GopSize": 6.0}]
+                for kind in ("video", "audio"):
+                    captured.clear()
+                    fw._transcode_clip_with_single_command(
+                        i, rung, "/in/src.mp4", "/tmp", "ffmpeg", start, end, False, {}, {},
+                        [], 0.0, float(end - start), fps, 0.0, kind)
+                    cmd = [str(a) for a in captured[0]]
+                    ss, t = arg(cmd, "-ss"), arg(cmd, "-t")
+                    if kind == "video":
+                        cap = arg(cmd, "-frames:v")
+                        cap = int(cap) if cap else None
+                        first, kept = _ffmpeg_frames(ss, t, cap, fps)
+                        check(f"{name} clip {i}: video starts on its first frame",
+                              first, start_frame)
+                        check(f"{name} clip {i}: video has exactly the planned frames",
+                              kept, planned)
+                    else:
+                        check_true(f"{name} clip {i}: audio starts with the video",
+                                   abs(Fraction(ss) - Fraction(start_frame) / fps)
+                                   < Fraction(1, 10 ** 6))
+                        check_true(f"{name} clip {i}: audio is exactly as long",
+                                   abs(Fraction(t) - Fraction(planned) / fps)
+                                   < Fraction(1, 10 ** 6))
+                planned_total += planned
+                actual_total += kept
+                drift.append(planned_total - actual_total)
+            check(f"{name}: no drift at any clip boundary", drift, [0] * len(clips))
+    finally:
+        fw._run_ffmpeg_command_with_logging = original
+
+
 def test_transcode_scheduling():
     """Cost estimates and the order clips are released into the budget."""
     print("transcode scheduling")
@@ -947,6 +1028,7 @@ def main():
         variant, segments = test_playlists(work)
         test_esam(work, variant, segments)
         test_ffmpeg_command()
+        test_clip_cuts_frame_exact()
         test_hevc_codec_string()
         test_duplicate_rung_guard()
         test_output_dir_names()

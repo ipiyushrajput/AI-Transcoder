@@ -686,6 +686,63 @@ def test_s3_permission_errors_explain_credentials(work: Path, binaries: dict):
                result["error_message"])
 
 
+def test_clip_frames_in_a_real_job(work: Path, binaries: dict):
+    """The HEVC job's 10-minute clip list: every clip encode is told its exact
+    frame count, and the job's markers all land in the package."""
+    print("frame-exact clips in a job")
+    import re
+    from fractions import Fraction
+    from hls_toolkit.runner import run_transcode_job
+    from hls_toolkit.time_utils import timecode_to_seconds
+
+    clips = [("00:00:00;00", "00:10:00;14"), ("00:10:00;15", "00:20:00;14"),
+             ("00:20:00;15", "00:30:00;14"), ("00:30:00;15", "00:40:00;14"),
+             ("00:40:00;15", "00:50:00;14"), ("00:50:00;15", "00:59:59;28")]
+    fps = Fraction(30000, 1001)
+    planned = [int((timecode_to_seconds(e, fps, allow_colon_df=True)
+                    - timecode_to_seconds(s, fps, allow_colon_df=True)) * fps)
+               for s, e in clips]
+    scc = ('<SignalProcessingNotification '
+           'xmlns="urn:cablelabs:iptvservices:esam:xsd:signal:1" '
+           'xmlns:sig="urn:cablelabs:md:xsd:signaling:3.0">'
+           + "".join(f'<ResponseSignal acquisitionSignalID="{n}">'
+                     f'<sig:NPTPoint nptPoint="{npt}"/><sig:SCTE35PointDescriptor>'
+                     '<sig:SegmentationDescriptorInfo segmentTypeId="52" duration="PT0S"/>'
+                     '</sig:SCTE35PointDescriptor></ResponseSignal>'
+                     for n, npt in enumerate(("600.47", "1200.43", "1800.40",
+                                              "2400.37", "3000.33"), 1))
+           + '</SignalProcessingNotification>')
+    media = work / "frames_job"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+    config["defaults"]["InputClippings"] = [{"StartTimecode": s, "EndTimecode": e}
+                                            for s, e in clips]
+    config["Esam"] = {"SignalProcessingNotification": {"SccXml": scc},
+                      "ManifestConfirmConditionNotification": {"MccXml": ""}}
+    log_root = media / "logs"
+    result = _with_env({"FAKE_MEDIA_FPS": "30000/1001", "FAKE_MEDIA_DURATION": "3600"},
+                       lambda: run_transcode_job(
+                           config, overrides=_quick_overrides(
+                               source, upload=False, esam=True, output_dir="frames",
+                               resolution="720p", local_output_dir=str(media / "out")),
+                           log_root=str(log_root), work_root=str(media / "scratch")))
+    check("the 60-minute 6-clip job completes", result["status"], "COMPLETED")
+    ffmpeg_log = "".join(p.read_text() for p in log_root.rglob("ffmpeg.log"))
+    sent = {}
+    for line in ffmpeg_log.splitlines():
+        m = re.search(r"clip_(\d+)_720p_video\.mp4", line)
+        f = re.search(r"-frames:v (\d+)", line)
+        if line.startswith("$ ") and m and f:
+            sent[int(m.group(1))] = int(f.group(1))
+    check("every clip encode is told its exact frame count",
+          [sent.get(i) for i in range(len(clips))], planned)
+    playlist = (Path(result["output_prefix"]) / "channel_720p.m3u8").read_text()
+    check("all five breaks are marked", playlist.count("#EXT-X-CUE-OUT:"), 5)
+
+
 def _quick_overrides(source, **extra):
     """Overrides for a fast job: no ESAM, loudnorm or thumbnails."""
     overrides = {"input_video": str(source), "esam": False, "audio_norm": False,
@@ -1398,6 +1455,8 @@ def main():
         test_hevc_templates(work, binaries)
         print()
         test_esam_at_2997(work, binaries)
+        print()
+        test_clip_frames_in_a_real_job(work, binaries)
         print()
         test_s3_permission_errors_explain_credentials(work, binaries)
         print()
