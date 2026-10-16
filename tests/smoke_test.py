@@ -20,7 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hls_toolkit import ffmpeg_wrapper as fw
 from hls_toolkit.esam_parser import (parse_esam_xml_string, parse_mcc_xml_asset_tags,
                                      process_playlist, remap_esam_events_for_merged_clips)
-from hls_toolkit.playlist_utils import create_master_playlist, parse_variant_segments
+from hls_toolkit.playlist_utils import (calculate_bitrates_from_segments, create_master_playlist,
+                                        parse_variant_segments)
 from hls_toolkit.subtitle_processor import (generate_merged_subtitle_file, parse_vtt_file,
                                             segment_vtt_for_hls)
 from hls_toolkit.time_utils import (parse_fps, seconds_to_timecode, timecode_to_frame,
@@ -52,6 +53,55 @@ def test_time_utils():
     check("seconds_to_timecode 10s @25", seconds_to_timecode(Fraction(10), "25"), "00:00:10:00")
     check("drop-frame 00:01:00;02 @29.97",
           timecode_to_frame("00:01:00;02", "30000/1001"), 1800)
+
+    # SDK v2.3 timecode rules.
+    from hls_toolkit import time_utils as tu
+    check("'29.97' is read as 30000/1001", parse_fps("29.97"), (Fraction(30000, 1001), False))
+    check("'59.94 DF' is read as 60000/1001 drop-frame",
+          parse_fps("59.94 DF"), (Fraction(60000, 1001), True))
+    check("colon at 29.97 is drop-frame with allow_colon_df",
+          timecode_to_frame("00:10:02:27", "30000/1001", allow_colon_df=True),
+          timecode_to_frame("00:10:02;27", "30000/1001"))
+    check("colon at 59.94 is drop-frame with allow_colon_df",
+          timecode_to_frame("00:42:50:14", "60000/1001", allow_colon_df=True),
+          timecode_to_frame("00:42:50;14", "60000/1001"))
+    check("colon at 59.94 is non-drop without it",
+          timecode_to_frame("00:01:00:00", "60000/1001"), 3596)
+    check("25 fps is unaffected by allow_colon_df",
+          timecode_to_frame("00:42:50:14", "25", allow_colon_df=True), 64264)
+    for label, tc, fps, words in (
+            ("a dropped label is rejected", "00:01:00;00", "30000/1001", "does not exist"),
+            ("';' at a non-DF rate is rejected", "00:00:10;00", "25", "not valid for frame rate"),
+            ("frames past the rate are rejected", "00:00:10:30", "30000/1001", "Invalid frames"),
+            ("seconds past 59 are rejected", "00:00:60:00", "25", "Invalid seconds"),
+            ("a malformed timecode is rejected", "0:0:10:00", "25", "Invalid timecode format")):
+        try:
+            timecode_to_seconds(tc, fps, allow_colon_df=True)
+            check(label, "accepted", "rejected")
+        except ValueError as e:
+            check_true(label, words in str(e), str(e))
+    # Frames -> timecode -> frames is exact in drop-frame.
+    check_true("drop-frame frame/timecode round trip is exact",
+               all(tu._df_tc_to_frames(*tu._df_frames_to_tc(n, Fraction(30000, 1001)),
+                                       Fraction(30000, 1001)) == n
+                   for n in range(0, 200000, 997)))
+    # A 1001 rate that went through float() is still that exact rate, so
+    # drop-frame timecodes keep working; a genuinely different rate is not changed.
+    check("float(30000/1001) parses back to 30000/1001",
+          parse_fps(str(float(Fraction(30000, 1001))))[0], Fraction(30000, 1001))
+    check("float(60000/1001) as a Fraction is snapped too",
+          parse_fps(Fraction(float(Fraction(60000, 1001))))[0], Fraction(60000, 1001))
+    check("float(24000/1001) parses back to 24000/1001",
+          parse_fps(str(float(Fraction(24000, 1001))))[0], Fraction(24000, 1001))
+    check("2997/100 is left alone (a different rate, still non-drop)",
+          parse_fps("2997/100")[0], Fraction(2997, 100))
+    check("';' timecodes work with a float-rounded 29.97 rate",
+          float(timecode_to_seconds("00:10:02;27", str(float(Fraction(30000, 1001))),
+                                    allow_colon_df=True)),
+          float(timecode_to_seconds("00:10:02;27", "30000/1001")))
+    check("DF seconds_to_timecode uses ';'",
+          seconds_to_timecode(Fraction(3600), "30000/1001", drop_frame_tc_format=True),
+          "01:00:00;00")
 
 
 def test_subtitles(work):
@@ -124,6 +174,40 @@ def test_playlists(work):
         fw._get_h264_profile_idc)
     check("hevc codec string follows the probed stream",
           "hvc1.2.6.L120.B0" in hevc_master.read_text(), True)
+
+    # BANDWIDTH measured from the real segments: peak x 1.1, plus the average.
+    # Three 6 s segments of 750 kB, 1500 kB, 750 kB -> 1 / 2 / 1 Mbit/s.
+    for i, size in ((1, 750_000), (2, 1_500_000), (3, 750_000)):
+        (work / f"channel_1080p_{i:05d}.ts").write_bytes(b"\0" * size)
+    measured_variant = work / "channel_1080p.m3u8"
+    measured_variant.write_text(
+        "#EXTM3U\n#EXT-X-TARGETDURATION:6\n"
+        + "".join(f"#EXTINF:6.000000,\nchannel_1080p_{i:05d}.ts\n" for i in (1, 2, 3))
+        + "#EXT-X-ENDLIST\n")
+    measured = calculate_bitrates_from_segments(measured_variant)
+    check("measured BANDWIDTH is the peak segment bitrate + 10%",
+          measured["bandwidth"], 2_200_000)
+    check("measured AVERAGE-BANDWIDTH is total bits / duration",
+          measured["avg_bandwidth"], 1_333_333)
+    check("a missing playlist measures as 0 (so the template value is used)",
+          calculate_bitrates_from_segments(work / "nope.m3u8"),
+          {"bandwidth": 0, "avg_bandwidth": 0})
+    measured_master = work / "channel_measured.m3u8"
+    create_master_playlist(
+        str(measured_master), ladder, {"1080p": "a.mp4", "720p": "b.mp4"}, "ffprobe",
+        25.0, None, None, "en",
+        lambda p, f: {"codec_name": "h264", "profile": "High", "level": 40,
+                      "avg_frame_rate": 25.0},
+        fw._get_h264_profile_idc, bitrate_data_by_resolution={"1080p": measured})
+    text = measured_master.read_text()
+    check("the master uses the measured values",
+          "BANDWIDTH=2200000,AVERAGE-BANDWIDTH=1333333" in text, True)
+    check("a rung without a measurement falls back to the template",
+          "BANDWIDTH=3500000,AVERAGE-BANDWIDTH=3500000" in text, True)
+    variant.write_text(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+        + "".join(f"#EXTINF:6.000000,\nchannel_1080p_{i:05d}.ts\n" for i in (1, 2, 3, 4))
+        + "#EXT-X-ENDLIST\n")
     return variant, segments
 
 
@@ -210,6 +294,46 @@ def test_esam(work, variant, segments):
     check("CUE-OUT-CONT injected", "#EXT-X-CUE-OUT-CONT:6.000/12.000" in body, True)
     check("CUE-IN injected", "#EXT-X-CUE-IN" in body, True)
 
+    # Regression: ESAM remap at 29.97 with drop-frame clips, given the exact
+    # rate or a float-rounded one, must remap every event (it used to skip
+    # every clip with "Drop-frame notation is not valid for frame rate").
+    ev = [{"npt": 80.0, "duration": 10.0, "segmentTypeId": "52",
+           "acquisitionSignalID": "1"}]
+    df_clips = [{"StartTimecode": "00:00:00;00", "EndTimecode": "00:00:20;00"},
+                {"StartTimecode": "00:01:10;00", "EndTimecode": "00:01:50;00"}]
+    for label, fps in (("exact 30000/1001", Fraction(30000, 1001)),
+                       ("float-rounded 29.97", float(Fraction(30000, 1001)))):
+        out = remap_esam_events_for_merged_clips(ev, df_clips, fps)
+        # 20;00 = 600 frames = 20.020 s, plus 80 - 70.003 = 9.997 s into clip 2.
+        check(f"ESAM remap at {label} keeps the event", len(out), 1)
+        check(f"ESAM remap at {label} puts it at the right time",
+              out[0]["npt"] if out else None, 30.017)
+
+    # Two signals past the end of a 24 s playlist: one CUE-OUT at the end, not two.
+    late = work / "channel_late.m3u8"
+    late.write_text(
+        "#EXTM3U\n#EXT-X-TARGETDURATION:6\n"
+        + "".join(f"#EXTINF:6.000000,\nlate_{i:05d}.ts\n" for i in (1, 2, 3, 4))
+        + "#EXT-X-ENDLIST\n")
+    late_events = parse_esam_xml_string(
+        '<SignalProcessingNotification '
+        'xmlns="urn:cablelabs:iptvservices:esam:xsd:signal:1" '
+        'xmlns:sig="urn:cablelabs:md:xsd:signaling:3.0">'
+        + "".join(
+            f'<ResponseSignal acquisitionSignalID="late-{n}">'
+            f'<sig:NPTPoint nptPoint="{n}"/><sig:SCTE35PointDescriptor>'
+            '<sig:SegmentationDescriptorInfo segmentTypeId="52" duration="PT10.0S"/>'
+            '</sig:SCTE35PointDescriptor></ResponseSignal>' for n in ("30.0", "40.0"))
+        + '</SignalProcessingNotification>')
+    check("two late signals parsed", len(late_events), 2)
+    process_playlist(str(late), late_events, {})
+    late_body = late.read_text()
+    check("only one CUE-OUT is added at the end for signals past the end",
+          late_body.count("#EXT-X-CUE-OUT:"), 1)
+    check_true("…before EXT-X-ENDLIST",
+               late_body.rstrip().endswith("#EXT-X-CUE-OUT:10.000\n#EXT-X-ENDLIST"),
+               late_body)
+
 
 def test_ffmpeg_command():
     print("ffmpeg_wrapper")
@@ -238,6 +362,38 @@ def test_ffmpeg_command():
     check("10-bit pixel format", "yuv420p10le" in cmd, True)
     check("scte35 cue point", "-scte35_cue_points 6.500" in cmd, True)
     check("outputs mapped", sorted(result["outputs"]), ["1080p", "720p"])
+    check("color range is declared", "-pix_fmt yuv420p -color_range tv" in cmd, True)
+
+    # Frame-rate snapping (SDK v2.3): standard rates pass through unchanged,
+    # high-denominator measurements snap to the broadcast rate.
+    from fractions import Fraction
+    n = fw.normalize_encoder_framerate
+    check("30000/1001 is unchanged", n(Fraction(30000, 1001)), Fraction(30000, 1001))
+    check("25 is unchanged", n(Fraction(25)), Fraction(25))
+    check("a 29.97 float snaps to 30000/1001", n(29.97), Fraction(30000, 1001))
+    check("a high-denominator 59.94 snaps to 60000/1001",
+          n(Fraction(5994006, 100000)), Fraction(60000, 1001))
+    check("an odd high-denominator rate is reduced",
+          n(Fraction(12345, 10007)), Fraction(12345, 10007).limit_denominator(1001))
+    check("a malformed or zero rate becomes 25", (n("abc"), n("0/1"), n(None)),
+          (Fraction(25), Fraction(25), Fraction(25)))
+
+    for label, source_fps, expected in (
+            ("an NTSC source keeps fps=30000/1001", Fraction(30000, 1001), "fps=30000/1001"),
+            ("a high-denominator source is snapped in the filter",
+             Fraction(2997003, 100000), "fps=30000/1001")):
+        captured.clear()
+        fw._run_ffmpeg_command_with_logging = (
+            lambda cmd, **kw: (captured.append(cmd), ("", ""))[1])
+        try:
+            fw._transcode_clip_with_single_command(
+                0, [{"name": "720p", "width": 1280, "height": 720, "codec": "H_264",
+                     "bitrate": "3M", "GopSize": 6.0}],
+                "/in/movie.mp4", "/tmp", "ffmpeg", 0.0, 12.0, False, {}, {},
+                [], 0.0, 12.0, source_fps, 0.0, "video")
+        finally:
+            fw._run_ffmpeg_command_with_logging = original
+        check_true(label, expected in " ".join(str(a) for a in captured[0]))
 
 
 def test_environment_diagnostics():
@@ -266,6 +422,35 @@ def test_environment_diagnostics():
         response = {"Error": {"Code": "AccessDenied"}}
     check("AWS errors stay AWS errors", s3_io.environment_problem(_Denied()), None)
     check("error code extraction", s3_io._error_code(_Denied()), "AccessDenied")
+
+    # Credential failures say which credential sources were found, masked.
+    class NoCredentialsError(Exception):
+        pass
+    check("missing credentials are an auth error",
+          s3_io.is_aws_auth_error(NoCredentialsError("Unable to locate credentials")), True)
+    check("AccessDenied is an auth error", s3_io.is_aws_auth_error(_Denied()), True)
+    check("a 404 is not an auth error",
+          s3_io.is_aws_auth_error(type("E", (Exception,), {
+              "response": {"Error": {"Code": "404"}}})("not found")), False)
+    check("non-auth errors add nothing", s3_io.auth_diagnosis(ValueError("boom")), "")
+    saved = {k: os.environ.get(k) for k in ("AWS_ACCESS_KEY_ID", "AWS_PROFILE",
+                                            "AWS_SECRET_ACCESS_KEY")}
+    os.environ.update(AWS_ACCESS_KEY_ID="AKIAEXAMPLEKEY1234", AWS_PROFILE="transcoder",
+                      AWS_SECRET_ACCESS_KEY="never-shown-secret")
+    try:
+        diagnosis = s3_io.auth_diagnosis(_Denied())
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    check_true("the diagnosis lists the access key masked",
+               "AWS_ACCESS_KEY_ID (AKIA...1234)" in diagnosis, diagnosis)
+    check_true("…and the profile", "AWS_PROFILE ('transcoder')" in diagnosis)
+    check_true("…and never the full key or the secret",
+               "AKIAEXAMPLEKEY1234" not in diagnosis
+               and "never-shown-secret" not in diagnosis)
 
 
 def test_cpu_budget(work):
@@ -578,6 +763,131 @@ def test_housekeeping(work):
             os.environ["WZ_CPU_SLOT_DIR"] = saved
 
 
+# The clip lists from the HEVC and AVC test jobs whose ad markers drifted.
+HEVC_CLIPS = [("00:00:00;00", "00:10:00;14"), ("00:10:00;15", "00:20:00;14"),
+              ("00:20:00;15", "00:30:00;14"), ("00:30:00;15", "00:40:00;14"),
+              ("00:40:00;15", "00:50:00;14"), ("00:50:00;15", "00:59:59;28")]
+AVC_CLIPS = [("00:00:00;00", "00:10:02;27"), ("00:10:02;28", "00:19:12;26"),
+             ("00:19:12;27", "00:26:57;05"), ("00:26:57;06", "00:35:00;07"),
+             ("00:35:00;08", "00:42:50;14")]
+
+
+def _ffmpeg_frames(ss, t, frames_cap, fps):
+    """What FFmpeg keeps for -ss/-t on a CFR source, as the real logs show:
+    frames from the first with pts >= ss, while the frame ends within t
+    (floor(t x fps) of them), capped by -frames:v."""
+    import math
+    from fractions import Fraction
+    first = math.ceil(Fraction(ss) * fps)
+    kept = math.floor(Fraction(t) * fps)
+    if frames_cap is not None:
+        kept = min(kept, frames_cap)
+    return first, kept
+
+
+def test_clip_cuts_frame_exact():
+    """Regression: every clip encode gets exactly its planned frames.
+
+    The cut used to be sent as -ss/-t rounded to milliseconds; a length that
+    rounded down (599.966033 -> 599.966) lost the clip's last frame, so the real
+    ad split ran one frame earlier per clip than the ESAM marker, and from the
+    third break on the marker landed a whole segment late.
+    """
+    print("frame-exact clip cuts")
+    from fractions import Fraction
+    from hls_toolkit.time_utils import timecode_to_seconds
+    fps = Fraction(30000, 1001)
+    captured = []
+    original = fw._run_ffmpeg_command_with_logging
+    fw._run_ffmpeg_command_with_logging = lambda cmd, **kw: (captured.append(cmd), ("", ""))[1]
+
+    def arg(cmd, flag):
+        return cmd[cmd.index(flag) + 1] if flag in cmd else None
+
+    try:
+        for name, clips in (("HEVC", HEVC_CLIPS), ("AVC", AVC_CLIPS)):
+            planned_total = actual_total = 0
+            drift = []
+            for i, (start_tc, end_tc) in enumerate(clips):
+                start = timecode_to_seconds(start_tc, fps, allow_colon_df=True)
+                end = timecode_to_seconds(end_tc, fps, allow_colon_df=True)
+                start_frame, planned = int(start * fps), int((end - start) * fps)
+                rung = [{"name": "720p", "width": 1280, "height": 720, "codec": "H_265",
+                         "crf": 26, "GopSize": 6.0}]
+                for kind in ("video", "audio"):
+                    captured.clear()
+                    fw._transcode_clip_with_single_command(
+                        i, rung, "/in/src.mp4", "/tmp", "ffmpeg", start, end, False, {}, {},
+                        [], 0.0, float(end - start), fps, 0.0, kind)
+                    cmd = [str(a) for a in captured[0]]
+                    ss, t = arg(cmd, "-ss"), arg(cmd, "-t")
+                    if kind == "video":
+                        cap = arg(cmd, "-frames:v")
+                        cap = int(cap) if cap else None
+                        first, kept = _ffmpeg_frames(ss, t, cap, fps)
+                        check(f"{name} clip {i}: video starts on its first frame",
+                              first, start_frame)
+                        check(f"{name} clip {i}: video has exactly the planned frames",
+                              kept, planned)
+                    else:
+                        check_true(f"{name} clip {i}: audio starts with the video",
+                                   abs(Fraction(ss) - Fraction(start_frame) / fps)
+                                   < Fraction(1, 10 ** 6))
+                        check_true(f"{name} clip {i}: audio is exactly as long",
+                                   abs(Fraction(t) - Fraction(planned) / fps)
+                                   < Fraction(1, 10 ** 6))
+                planned_total += planned
+                actual_total += kept
+                drift.append(planned_total - actual_total)
+            check(f"{name}: no drift at any clip boundary", drift, [0] * len(clips))
+    finally:
+        fw._run_ffmpeg_command_with_logging = original
+
+
+def test_markers_follow_real_splits(work):
+    """CUE-OUT goes on the segment boundary where the encoder split, even
+    when the signal time is a few frames off it (it used to go one segment late
+    once the gap passed 0.05 s)."""
+    print("ad markers on real segment boundaries")
+    from hls_toolkit.esam_parser import inject_elemental_markers
+
+    def playlist(path, durations):
+        path.write_text("#EXTM3U\n#EXT-X-TARGETDURATION:7\n" + "".join(
+            f"#EXTINF:{d:.6f},\nseg_{i:05d}.ts\n" for i, d in enumerate(durations, 1))
+            + "#EXT-X-ENDLIST\n")
+        return path
+
+    def segment_after_cue(text):
+        lines = text.splitlines()
+        i = next(n for n, l in enumerate(lines) if l.startswith("#EXT-X-CUE-OUT:"))
+        return next(l for l in lines[i:] if l.endswith(".ts"))
+
+    # HEVC break 3: the encoder split at 1800.332, the signal says 1800.399.
+    durs = [6.006] * 299 + [1800.332 - 6.006 * 299, 1801.633 - 1800.332, 6.006, 6.006]
+    p = playlist(work / "drift.m3u8", durs)
+    inject_elemental_markers(p, [{"npt": 1800.399, "duration": 0.0}], {})
+    check("a signal 2 frames after the split goes on the split",
+          segment_after_cue(p.read_text()), "seg_00301.ts")
+
+    p = playlist(work / "exact.m3u8", durs)
+    inject_elemental_markers(p, [{"npt": 1800.332, "duration": 0.0}], {})
+    check("a signal on the split is unchanged", segment_after_cue(p.read_text()),
+          "seg_00301.ts")
+
+    p = playlist(work / "far.m3u8", [6.0] * 10)
+    inject_elemental_markers(p, [{"npt": 15.0, "duration": 0.0}], {})
+    check("a signal far from any boundary keeps the old placement (after its segment)",
+          segment_after_cue(p.read_text()), "seg_00004.ts")
+
+    # A signal at the very end of the content still goes at the end, not
+    # before a short last segment.
+    p = playlist(work / "end.m3u8", [6.0] * 5 + [0.3])
+    inject_elemental_markers(p, [{"npt": 30.3, "duration": 0.0}], {})
+    text = p.read_text()
+    check_true("a signal at the end of the content stays at the end",
+               text.index("#EXT-X-CUE-OUT:") > text.index("seg_00006.ts"), text)
+
+
 def test_transcode_scheduling():
     """Cost estimates and the order clips are released into the budget."""
     print("transcode scheduling")
@@ -762,6 +1072,8 @@ def main():
         variant, segments = test_playlists(work)
         test_esam(work, variant, segments)
         test_ffmpeg_command()
+        test_clip_cuts_frame_exact()
+        test_markers_follow_real_splits(work)
         test_hevc_codec_string()
         test_duplicate_rung_guard()
         test_output_dir_names()

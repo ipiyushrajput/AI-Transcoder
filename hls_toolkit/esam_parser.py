@@ -16,6 +16,12 @@ ESAM_NS = "{urn:cablelabs:iptvservices:esam:xsd:signal:1}"
 SIG_NS = "{urn:cablelabs:md:xsd:signaling:3.0}"
 COMMON_NS = "{urn:cablelabs:iptvservices:esam:xsd:common:1}"
 FLOAT_TOLERANCE = 0.05
+# A signal this close to a segment boundary goes on that boundary. The encoder
+# splits a segment at every ad signal, so the boundary is where the break
+# really is; a frame or two of disagreement between the signal time and the
+# split (rounding, a frame lost in a cut) must not push CUE-OUT a whole segment
+# later, as matching within FLOAT_TOLERANCE alone used to.
+MARKER_SNAP_SECONDS = 0.5
 
 
 def parse_esam_xml_string(xml_string):
@@ -103,6 +109,16 @@ def parse_mcc_xml_asset_tags(xml_string):
     return asset_tags_map
 
 
+def _nearest_segment_start(segments, npt: float):
+    """(index, start) of the segment whose start is closest to `npt`."""
+    best = None
+    for idx, (sstart, _, _, _) in enumerate(segments):
+        start = normalize_float(sstart)
+        if best is None or abs(npt - start) < abs(npt - best[1]):
+            best = (idx, start)
+    return best
+
+
 def inject_elemental_markers(m3u8_path: Path,
                              esam_events: List[Dict[str, Any]],
                              asset_tags_map: Dict[str, str],
@@ -119,6 +135,20 @@ def inject_elemental_markers(m3u8_path: Path,
         npt = normalize_float(ev.get("npt", 0.0))
         matched = False
         npt_aligned = None
+        nearest = _nearest_segment_start(reference_segments, npt)
+        if nearest is not None:
+            b, boundary = nearest
+            distance = abs(npt - boundary)
+            playlist_end = normalize_float(reference_segments[-1][1])
+            # Closer to the end of the content than to any segment start: the
+            # end-of-playlist handling below places it.
+            nearer_end = abs(npt - playlist_end) <= distance
+            if FLOAT_TOLERANCE < distance <= MARKER_SNAP_SECONDS and not nearer_end:
+                log().info(f"{m3u8_path.name}: Signal {npt:.3f}s placed on the segment "
+                           f"boundary at {boundary:.3f}s ({npt - boundary:+.3f}s).")
+                plans.append({'seg_index': b - 1 if b > 0 else -1, 'event': ev,
+                              'npt_aligned': boundary})
+                continue
         for idx, (sstart, send, sfile, sline) in enumerate(reference_segments):
             sstart_n = normalize_float(sstart)
             send_n = normalize_float(send)
@@ -202,6 +232,12 @@ def inject_elemental_markers(m3u8_path: Path,
                 lines_to_insert_at_end.append(asset_tag_line)
             if ad_break_logic_duration == 0:
                 lines_to_insert_at_end.append("#EXT-X-CUE-IN\n")
+            # Two signals past the end used to stack two CUE-OUTs at the end.
+            if has_marker_near(lines, insert_pos, ["#EXT-X-CUE-OUT"], window=1):
+                log().info(f"{m3u8_path.name}: Signal {npt_to_log:.3f}s is beyond total "
+                           "duration but EXT-X-CUE-OUT already exists at end of playlist. "
+                           "Skipping duplicate.")
+                continue
             for line_to_insert in reversed(lines_to_insert_at_end):
                 lines.insert(insert_pos, line_to_insert)
             inserted_count += len(lines_to_insert_at_end)
@@ -355,7 +391,7 @@ def process_playlist(m3u8_arg: str,
 
 def remap_esam_events_for_merged_clips(original_events: List[Dict[str, Any]],
                                        clippings: List[Dict[str, Any]],
-                                       video_fps: float) -> List[Dict[str, Any]]:
+                                       video_fps) -> List[Dict[str, Any]]:
     if not original_events:
         return []
     if not clippings:
@@ -372,8 +408,9 @@ def remap_esam_events_for_merged_clips(original_events: List[Dict[str, Any]],
             log().warning(f"Clipping missing StartTimecode or EndTimecode. Skipping: {clip}")
             continue
         try:
-            clip_start_orig = timecode_to_seconds(start_timecode, str(video_fps))
-            clip_end_orig = timecode_to_seconds(end_timecode, str(video_fps))
+            clip_start_orig = timecode_to_seconds(start_timecode, str(video_fps),
+                                                  allow_colon_df=True)
+            clip_end_orig = timecode_to_seconds(end_timecode, str(video_fps), allow_colon_df=True)
             if clip_end_orig <= clip_start_orig:
                 log().warning(f"Clipping has non-positive duration. Skipping: {clip}")
                 continue

@@ -200,9 +200,13 @@ def check_aws_identity(region: Optional[str]) -> Result:
                       f"{identity.get('Arn', '').rsplit('/', 1)[-1]}")
     except Exception as e:
         hint = s3_io.environment_problem(e)
+        sources = s3_io.credential_sources()
+        found = ("Credential sources found: " + "; ".join(sources) if sources else
+                 "No credentials in the environment or ~/.aws; an attached instance "
+                 "role is used if there is one.")
         return Result("AWS credentials", FAIL, f"{type(e).__name__}: {e}",
-                      hint or "Attach an instance role, or configure credentials "
-                              "with `aws configure`.")
+                      hint or f"{found}\nAttach an instance role, or configure "
+                              f"credentials with `aws configure`.")
 
 
 def check_input(uri: Optional[str], label: str, region: Optional[str]) -> Result:

@@ -165,6 +165,14 @@ for a local copy. Absolute paths, `..`, backslashes and drive letters are
 refused — such a name used to point the staging folder outside scratch, where
 it was uploaded and then deleted.
 
+**Master playlist bandwidth is measured.** Each rendition's `BANDWIDTH` is the
+highest per-segment bitrate of the segments it actually produced plus 10%
+headroom (so it covers audio and TS overhead, as the HLS spec requires), and
+`AVERAGE-BANDWIDTH` is its total bits over total duration. A rendition that
+cannot be measured falls back to the template's `bitrate` / `vbv-maxrate`. Set
+`defaults.hls_bandwidth_from_segments` to `false` to always use the template
+values, as before.
+
 Correct content types are set on the way up (`application/vnd.apple.mpegurl`
 for `.m3u8`, `video/mp2t` for `.ts`, `text/vtt` for `.vtt`) so players can read
 the package directly from S3 or CloudFront.
@@ -249,8 +257,8 @@ its cores back immediately.
 ### What changed, and why it was slow
 
 The worker count used to be worked out from **every rung in the template**, not
-just the ones being encoded. In `h265_standard` the unselected `2160p` rung has
-`threads: 12`, which made a four-rung H.265 job size itself as needing 36 cores
+just the ones being encoded. In `h265_standard` an unselected `2160p` rung with
+`threads: 12` (the 4K rungs have since moved to `h265_4k_standard`) made a four-rung H.265 job size itself as needing 36 cores
 per clip — so on any server under 96 cores it got **one worker and encoded its
 clips one after another**. Separately, each job sized its pool as if it owned the
 whole machine, so jobs started side by side asked for several machines' worth of
@@ -344,6 +352,16 @@ cleans up scratch space.
 | `esam`, `audio_norm`, `generate_thumbnails`, `upload` | Feature switches |
 | `InputClippings` | `[{"StartTimecode": "HH:MM:SS:FF", "EndTimecode": "..."}]` |
 | `hls_settings` | `hls_time`, `hls_playlist_type`, `hls_flags`, `hls_segment_type` |
+| `hls_bandwidth_from_segments` | `true` (default): measure `BANDWIDTH` from the segments; `false`: use the template |
+
+**Timecodes** (SDK v2.3 rules). `HH:MM:SS:FF` or `HH:MM:SS;FF`, two digits for
+minutes, seconds and frames. At 29.97 (30000/1001) and 59.94 (60000/1001) fps
+both `:` and `;` are read as drop-frame; at every other rate `:` is non-drop
+and `;` is refused. Timecodes are checked: minutes and seconds 0-59, frames
+below the frame rate, and drop-frame labels that do not exist are refused — at
+29.97 frames `00` and `01` of every minute except each tenth (e.g. `00:01:00:00`)
+are skipped, so the first frame of minute 1 is `00:01:00:02` (frames `00`-`03`
+at 59.94). A clip list with such a timecode fails at `VALIDATION`.
 
 ### `s3`
 
@@ -359,6 +377,18 @@ A map of template name to ABR ladder. Per rung: `name`, `width`, `height`,
 `codec` (`H_264` → `libwz264`, `H_265` → `libwz265`), `codec_params` (passed as
 `-wz264-params` / `-wz265-params`), `bitrate` or `crf`, `preset`, `caeopts`,
 `threads`, `GopSize`, `interlace_mode`, `video_format`, `frame_rate`.
+
+Shipped ladders (as in SDK v2.3):
+
+| Template | Rungs |
+| --- | --- |
+| `h264_standard` | 1080p, 720p, 540p, 360p (H.264) |
+| `h265_standard` | 1080p, 720p, 540p, 360p (H.265) |
+| `h265_4k_standard` | 2160p, 1440p, 1080p, 720p (H.265, for UHD sources) |
+
+`h265_standard` no longer contains 2160p / 1440p; a job asking for those rungs
+must use `h265_4k_standard`. Its 1080p and 720p rungs have their own settings
+(CRF, maxrate, level), different from `h265_standard`'s.
 
 ### Time limits
 

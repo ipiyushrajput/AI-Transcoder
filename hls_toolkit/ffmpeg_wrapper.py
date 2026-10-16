@@ -163,6 +163,41 @@ def run_loudnorm_analysis(ffmpeg_executable: str,
         return None
 
 
+# Rates a source's measured average frame rate is snapped to (SDK v2.3).
+STANDARD_BROADCAST_FPS = (fractions.Fraction(24000, 1001), fractions.Fraction(30000, 1001),
+                          fractions.Fraction(60000, 1001), fractions.Fraction(24, 1),
+                          fractions.Fraction(25, 1), fractions.Fraction(30, 1),
+                          fractions.Fraction(50, 1), fractions.Fraction(60, 1))
+
+
+def normalize_encoder_framerate(frame_rate) -> fractions.Fraction:
+    """Frame rate for the encoder's fps filter, without high-denominator values.
+
+    ffprobe's avg_frame_rate can come back as e.g. ``359640/12000`` for a
+    nominal 29.97 fps source. As in SDK v2.3:
+
+    * a missing, malformed or non-positive rate becomes 25/1;
+    * a rate whose denominator is 1001 or less is kept as it is (so
+      30000/1001, 25/1, 24000/1001 ... are unchanged);
+    * otherwise it snaps to a standard broadcast rate within 0.05 fps, or else
+      is reduced with ``limit_denominator(1001)``.
+    """
+    try:
+        rate = (frame_rate if isinstance(frame_rate, fractions.Fraction)
+                else fractions.Fraction(frame_rate))
+    except (ValueError, ZeroDivisionError, TypeError):
+        return fractions.Fraction(25, 1)
+    if rate <= 0:
+        return fractions.Fraction(25, 1)
+    if rate.denominator > 1001:
+        fps_float = float(rate)
+        for std_fps in STANDARD_BROADCAST_FPS:
+            if abs(fps_float - float(std_fps)) < 0.05:
+                return std_fps
+        return rate.limit_denominator(1001)
+    return rate
+
+
 def get_video_info(ffprobe_executable: str,
                    input_video: Union[str, Path]) -> Dict[str, Union[float, fractions.Fraction]]:
     """Gets video information (duration and frame rate) using a single ffprobe call."""
@@ -570,6 +605,51 @@ def _merge_transcoded_clips(ffmpeg_executable: str,
     return merged_mp4_paths_by_resolution
 
 
+def clip_cut_args(start_seconds, end_seconds, video_fps, stream_type: str = "video"):
+    """Frame-exact ``-ss`` / ``-t`` (and frame count) for one clip.
+
+    Clip timecodes name whole frames, but the cut used to be passed to FFmpeg
+    rounded to milliseconds. FFmpeg keeps floor(t x fps) frames, so whenever a
+    clip's length rounded *down* (599.966033 s -> 599.966 for a 17981-frame
+    clip at 29.97) the clip lost its last frame. The ESAM markers and the HLS
+    cut times are computed on the exact timeline, so every lost frame moved the
+    real ad split one frame earlier than its marker, and the gap accumulated
+    clip by clip until markers landed a whole segment late.
+
+    Now, with the clip's first frame S and frame count N (EndTimecode
+    exclusive, as before):
+
+    * video: ``-ss`` is (S - 1/4) / fps, a quarter frame before frame S, so
+      the first frame kept is always S whichever way the source's timestamps
+      round (and never a half-frame tie for the fps filter); ``-t`` is
+      (N + 1/2) / fps, which can never cut the last frame; and ``frames``
+      (passed as ``-frames:v``) caps each output at exactly N;
+    * audio: ``-ss`` is exactly S / fps and ``-t`` exactly N / fps, so the audio
+      starts with the video's first frame and is exactly as long.
+
+    Returns ``{"ss": str, "t": str, "frames": int | None}``; ``frames`` is None
+    for audio, or when the frame rate is unusable (then the old rounding is used).
+    """
+    try:
+        fps = video_fps if isinstance(video_fps, fractions.Fraction) \
+            else fractions.Fraction(str(video_fps))
+        if fps <= 0:
+            raise ValueError(video_fps)
+        start_frame = int(round(fractions.Fraction(start_seconds) * fps))
+        frame_count = max(1, int(round((fractions.Fraction(end_seconds)
+                                        - fractions.Fraction(start_seconds)) * fps)))
+    except (ValueError, ZeroDivisionError, TypeError):
+        duration = float(end_seconds) - float(start_seconds)
+        return {"ss": f"{float(start_seconds):.3f}", "t": f"{duration:.3f}", "frames": None}
+    if stream_type == "video":
+        ss = (start_frame - fractions.Fraction(1, 4)) / fps if start_frame > 0 else 0
+        t = (frame_count + fractions.Fraction(1, 2)) / fps
+        return {"ss": f"{float(ss):.6f}", "t": f"{float(t):.6f}", "frames": frame_count}
+    ss = fractions.Fraction(start_frame) / fps
+    t = fractions.Fraction(frame_count) / fps
+    return {"ss": f"{float(ss):.6f}", "t": f"{float(t):.6f}", "frames": None}
+
+
 def _transcode_clip_with_single_command(clip_index,
                                         video_templates,
                                         abs_input_video,
@@ -623,13 +703,15 @@ def _transcode_clip_with_single_command(clip_index,
         Dict: Information about the generated outputs (type, paths).
     """
     clip_duration = original_clip_end_seconds - original_clip_start_seconds
+    cut = clip_cut_args(original_clip_start_seconds, original_clip_end_seconds, video_fps,
+                        stream_type)
     ffmpeg_cmd = [
         ffmpeg_executable,
         "-y",
         "-ss",
-        f"{float(original_clip_start_seconds):.3f}",
+        cut["ss"],
         "-t",
-        f"{float(clip_duration):.3f}",
+        cut["t"],
         "-i",
         str(abs_input_video)]
     if stream_type == "video":
@@ -640,9 +722,10 @@ def _transcode_clip_with_single_command(clip_index,
             video_filters = []
             if res_data.get("interlace_mode") == "PROGRESSIVE":
                 video_filters.append("yadif=mode=0:parity=auto:deint=1")
+            target_fps = normalize_encoder_framerate(res_data.get("frame_rate") or video_fps)
             video_filters.extend([
                 f'scale=w={res_data["width"]}:h={res_data["height"]}',
-                f'fps={str(res_data.get("frame_rate", video_fps))}'])
+                f'fps={str(target_fps)}'])
             filter_complex_parts.append(
                 f'[v{i}]{",".join(video_filters)}[v_out_{res_name}]')
 
@@ -718,6 +801,10 @@ def _transcode_clip_with_single_command(clip_index,
                                          f"+ n_forced*{precise_gop_duration:.3f})")
             ffmpeg_cmd.extend(["-force_key_frames", force_key_frames_expr])
             ffmpeg_cmd.extend(["-avoid_negative_ts", "make_zero"])
+            if cut["frames"] is not None:
+                # Exactly the planned frame count, so the merged timeline is the
+                # one the ESAM markers and segment cut times are computed on.
+                ffmpeg_cmd.extend(["-frames:v", str(cut["frames"])])
             ffmpeg_cmd.append(str(output_clip_path))
 
     elif stream_type == "audio":
@@ -910,13 +997,16 @@ def generate_clipped_transcoded_merged_mp4s(
     temp_clipping_dir = Path(tempfile.mkdtemp(prefix="hls_clips_transcoded_", dir=temp_dir))
     log().info(f"Created temporary directory for transcoded clips: {temp_clipping_dir}")
     abs_input_video = Path(os.path.abspath(str(input_video)))
+    # The exact rate: float(30000/1001) is 29.97002997002997, which is not a
+    # drop-frame rate, so drop-frame clip timecodes would fail to parse.
     remapped_esam_events = remap_esam_events_for_merged_clips(esam_events, clippings,
-                                                              float(video_fps))
+                                                              video_fps)
     tasks = []
     total_merged_duration = 0.0
     for i, clip in enumerate(clippings):
-        start_seconds = timecode_to_seconds(clip["StartTimecode"], str(video_fps))
-        end_seconds = timecode_to_seconds(clip["EndTimecode"], str(video_fps))
+        start_seconds = timecode_to_seconds(clip["StartTimecode"], str(video_fps),
+                                            allow_colon_df=True)
+        end_seconds = timecode_to_seconds(clip["EndTimecode"], str(video_fps), allow_colon_df=True)
         clip_duration = float(end_seconds) - float(start_seconds)
         clip_start_compacted = total_merged_duration
         clip_end_compacted = total_merged_duration + clip_duration
@@ -1073,8 +1163,9 @@ def validate_clippings(clippings: List[Dict[str, Any]], video_fps: fractions.Fra
     """Validates a list of clipping configurations to ensure they have positive durations."""
     for i, clip in enumerate(clippings):
         try:
-            s_check = timecode_to_seconds(clip["StartTimecode"], str(video_fps))
-            e_check = timecode_to_seconds(clip["EndTimecode"], str(video_fps))
+            s_check = timecode_to_seconds(clip["StartTimecode"], str(video_fps),
+                                          allow_colon_df=True)
+            e_check = timecode_to_seconds(clip["EndTimecode"], str(video_fps), allow_colon_df=True)
             if e_check <= s_check:
                 raise ValueError("Duration must be positive.")
         except Exception as e:

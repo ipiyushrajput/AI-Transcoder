@@ -213,8 +213,10 @@ def generate_merged_subtitle_file(input_subtitle_path: Path,
                 log().warning(f"Warning: Clipping {i + 1} is missing StartTimecode or "
                                 "EndTimecode. Skipping subtitle part.")
                 continue
-            clip_start_abs = timecode_to_seconds(start_timecode_str, str(video_fps))
-            clip_end_abs = timecode_to_seconds(end_timecode_str, str(video_fps))
+            clip_start_abs = timecode_to_seconds(start_timecode_str, str(video_fps),
+                                                 allow_colon_df=True)
+            clip_end_abs = timecode_to_seconds(end_timecode_str, str(video_fps),
+                                               allow_colon_df=True)
             clip_duration = clip_end_abs - clip_start_abs
             if clip_duration <= 0:
                 log().warning(f"Warning: Clipping {i + 1} has non-positive duration "
