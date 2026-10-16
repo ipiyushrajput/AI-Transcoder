@@ -844,6 +844,50 @@ def test_clip_cuts_frame_exact():
         fw._run_ffmpeg_command_with_logging = original
 
 
+def test_markers_follow_real_splits(work):
+    """CUE-OUT goes on the segment boundary where the encoder split, even
+    when the signal time is a few frames off it (it used to go one segment late
+    once the gap passed 0.05 s)."""
+    print("ad markers on real segment boundaries")
+    from hls_toolkit.esam_parser import inject_elemental_markers
+
+    def playlist(path, durations):
+        path.write_text("#EXTM3U\n#EXT-X-TARGETDURATION:7\n" + "".join(
+            f"#EXTINF:{d:.6f},\nseg_{i:05d}.ts\n" for i, d in enumerate(durations, 1))
+            + "#EXT-X-ENDLIST\n")
+        return path
+
+    def segment_after_cue(text):
+        lines = text.splitlines()
+        i = next(n for n, l in enumerate(lines) if l.startswith("#EXT-X-CUE-OUT:"))
+        return next(l for l in lines[i:] if l.endswith(".ts"))
+
+    # HEVC break 3: the encoder split at 1800.332, the signal says 1800.399.
+    durs = [6.006] * 299 + [1800.332 - 6.006 * 299, 1801.633 - 1800.332, 6.006, 6.006]
+    p = playlist(work / "drift.m3u8", durs)
+    inject_elemental_markers(p, [{"npt": 1800.399, "duration": 0.0}], {})
+    check("a signal 2 frames after the split goes on the split",
+          segment_after_cue(p.read_text()), "seg_00301.ts")
+
+    p = playlist(work / "exact.m3u8", durs)
+    inject_elemental_markers(p, [{"npt": 1800.332, "duration": 0.0}], {})
+    check("a signal on the split is unchanged", segment_after_cue(p.read_text()),
+          "seg_00301.ts")
+
+    p = playlist(work / "far.m3u8", [6.0] * 10)
+    inject_elemental_markers(p, [{"npt": 15.0, "duration": 0.0}], {})
+    check("a signal far from any boundary keeps the old placement (after its segment)",
+          segment_after_cue(p.read_text()), "seg_00004.ts")
+
+    # A signal at the very end of the content still goes at the end, not
+    # before a short last segment.
+    p = playlist(work / "end.m3u8", [6.0] * 5 + [0.3])
+    inject_elemental_markers(p, [{"npt": 30.3, "duration": 0.0}], {})
+    text = p.read_text()
+    check_true("a signal at the end of the content stays at the end",
+               text.index("#EXT-X-CUE-OUT:") > text.index("seg_00006.ts"), text)
+
+
 def test_transcode_scheduling():
     """Cost estimates and the order clips are released into the budget."""
     print("transcode scheduling")
@@ -1029,6 +1073,7 @@ def main():
         test_esam(work, variant, segments)
         test_ffmpeg_command()
         test_clip_cuts_frame_exact()
+        test_markers_follow_real_splits(work)
         test_hevc_codec_string()
         test_duplicate_rung_guard()
         test_output_dir_names()
