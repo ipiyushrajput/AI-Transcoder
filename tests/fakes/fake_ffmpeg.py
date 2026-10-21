@@ -88,7 +88,7 @@ def run_ffmpeg(argv):
         for i, seg_duration in enumerate(durations, 1):
             segment = Path(pattern % i) if pattern else playlist.with_suffix(f".{i}.ts")
             segment.parent.mkdir(parents=True, exist_ok=True)
-            segment.write_bytes(os.urandom(2048))
+            write_ts_segment(segment, pts_seconds=sum(durations[:i - 1]))
             lines.append(f"#EXTINF:{seg_duration:.6f},\n{segment.name}\n")
         lines.append("#EXT-X-ENDLIST\n")
         playlist.write_text("".join(lines))
@@ -131,6 +131,46 @@ def run_ffmpeg(argv):
     _emit_progress(float(arg_after(argv, "-t") or DURATION))
     _record_timeline(argv, started)
     return 0
+
+
+def _crc32_mpeg2(data):
+    crc = 0xFFFFFFFF
+    for byte in data:
+        crc ^= byte << 24
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x04C11DB7) if crc & 0x80000000 else (crc << 1)
+            crc &= 0xFFFFFFFF
+    return crc
+
+
+def _psi_packet(pid, section):
+    section = section + _crc32_mpeg2(section).to_bytes(4, "big")
+    body = bytes([0x47, 0x40 | (pid >> 8), pid & 0xFF, 0x10, 0x00]) + section
+    return body + b"\xff" * (188 - len(body))
+
+
+def write_ts_segment(path, pts_seconds=0.0, video_packets=10):
+    """A small MPEG-TS segment shaped like FFmpeg's HLS output: PAT, then a PMT
+    on PID 0x1000 listing H.264 on 0x100 and AAC on 0x101 (with an ISO 639
+    'und' descriptor, as FFmpeg writes), then video PES packets with a PTS."""
+    pat = bytes([0x00, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00,
+                 0x00, 0x01, 0xF0, 0x00])                        # program 1 -> PMT 0x1000
+    es = (bytes([0x1B, 0xE1, 0x00, 0xF0, 0x00])
+          + bytes([0x0F, 0xE1, 0x01, 0xF0, 0x06, 0x0A, 0x04]) + b"und" + b"\x00")
+    body = bytes([0x00, 0x01, 0xC1, 0x00, 0x00, 0xE1, 0x00, 0xF0, 0x00]) + es
+    length = len(body) + 4
+    pmt = bytes([0x02, 0xB0 | (length >> 8), length & 0xFF]) + body
+    packets = [_psi_packet(0x0000, pat), _psi_packet(0x1000, pmt)]
+    pts = int(round((pts_seconds + 1.4) * 90000))
+    pts_bytes = bytes([0x21 | ((pts >> 29) & 0x0E), (pts >> 22) & 0xFF,
+                       0x01 | ((pts >> 14) & 0xFE), (pts >> 7) & 0xFF,
+                       0x01 | ((pts << 1) & 0xFE)])
+    pes = b"\x00\x00\x01\xe0\x00\x00\x80\x80\x05" + pts_bytes
+    for n in range(video_packets):
+        head = bytes([0x47, (0x40 if n == 0 else 0x00) | 0x01, 0x00, 0x10 | (n & 0x0F)])
+        payload = (pes if n == 0 else b"") + os.urandom(184)
+        packets.append((head + payload)[:188])
+    Path(path).write_bytes(b"".join(packets))
 
 
 def _encode_kind(argv):

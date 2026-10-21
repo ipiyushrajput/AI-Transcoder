@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
-from hls_toolkit import s3_io, time_utils
+from hls_toolkit import s3_io, time_utils, ts_pmt
 from hls_toolkit.cpu_budget import BudgetAcquireAborted, get_shared_budget
 from hls_toolkit.job_context import (JobCancelled, JobContext, TranscodeError,
                                      current_context, log)
@@ -21,7 +21,8 @@ from hls_toolkit.ffmpeg_wrapper import (get_video_info, run_loudnorm_analysis,
                                         _get_video_stream_details, _get_h264_profile_idc,
                                         get_ffprobe_first_pts, validate_clippings)
 from hls_toolkit.package_validator import validate_package
-from hls_toolkit.playlist_utils import create_master_playlist, parse_variant_segments
+from hls_toolkit.playlist_utils import (calculate_bitrates_from_segments,
+                                        create_master_playlist, parse_variant_segments)
 from hls_toolkit.subtitle_processor import (generate_merged_subtitle_file,
                                             segment_vtt_for_hls)
 from hls_toolkit.time_utils import timecode_to_seconds, seconds_to_timecode
@@ -49,6 +50,19 @@ def _cores(count: int, what: str):
         yield
     finally:
         lease.release()
+
+
+def _df_rate(video_fps) -> bool:
+    """True at 30000/1001 and 60000/1001, where clip timecodes are drop-frame."""
+    try:
+        return time_utils.is_drop_frame_rate(time_utils.parse_fps(str(video_fps))[0])
+    except (ValueError, ZeroDivisionError):
+        return False
+
+
+def _zero_timecode(video_fps) -> str:
+    """The first frame's timecode, in the notation the rate uses."""
+    return "00:00:00;00" if _df_rate(video_fps) else "00:00:00:00"
 
 
 def validate_unique_rung_names(template_name: str,
@@ -182,8 +196,10 @@ def generate_hls_workflow(config: Dict[str, Any],
                      "Using full input video as a single clip.")
         duration_seconds = get_video_info(ffprobe_executable, input_video).get("duration", 0.0)
         if duration_seconds > 0:
-            clippings = [{'StartTimecode': "00:00:00:00",
-                          'EndTimecode': seconds_to_timecode(duration_seconds, str(video_fps))}]
+            clippings = [{'StartTimecode': _zero_timecode(video_fps),
+                          'EndTimecode': seconds_to_timecode(
+                              duration_seconds, str(video_fps),
+                              drop_frame_tc_format=_df_rate(video_fps))}]
         else:
             raise TranscodeError(
                 "Could not determine the video duration and no InputClippings were "
@@ -214,9 +230,10 @@ def generate_hls_workflow(config: Dict[str, Any],
                              f"Frame {frame_number} -> "
                              f"{quantized_effective_end_duration:.6f}s")
                 effective_clippings = [{
-                    'StartTimecode': "00:00:00:00",
+                    'StartTimecode': _zero_timecode(video_fps),
                     'EndTimecode': seconds_to_timecode(quantized_effective_end_duration,
-                                                       str(video_fps)),
+                                                       str(video_fps),
+                                                       drop_frame_tc_format=_df_rate(video_fps)),
                     'Name': "FullDurationClip"}]
             except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as e:
                 log().error(f"Failed to get video duration: {e}")
@@ -243,7 +260,8 @@ def generate_hls_workflow(config: Dict[str, Any],
         gop_size_frames = int(round(gop_size_seconds * float(video_fps)))
         for clip in effective_clippings:
             start_tc = clip["StartTimecode"]
-            absolute_start_frame = time_utils.timecode_to_frame(start_tc, str(video_fps))
+            absolute_start_frame = time_utils.timecode_to_frame(start_tc, str(video_fps),
+                                                                allow_colon_df=True)
             offset_frames = (gop_size_frames - absolute_start_frame % gop_size_frames) % gop_size_frames
             offset_seconds = float(offset_frames) / float(video_fps)
             clip_gop_offsets.append(offset_seconds)
@@ -271,7 +289,8 @@ def generate_hls_workflow(config: Dict[str, Any],
                 log().info(f"Applying ad snapping logic with a tolerance of "
                              f"{tolerance_frames} frames.")
                 clip_end_frames = [
-                    math.floor(timecode_to_seconds(c.get("EndTimecode"), str(video_fps))
+                    math.floor(timecode_to_seconds(c.get("EndTimecode"), str(video_fps),
+                                                   allow_colon_df=True)
                                * float(video_fps))
                     for c in effective_clippings]
 
@@ -297,8 +316,10 @@ def generate_hls_workflow(config: Dict[str, Any],
                 accumulated_duration = 0.0
                 for i, clip in enumerate(effective_clippings):
                     duration_seconds = (
-                        timecode_to_seconds(clip.get("EndTimecode"), str(video_fps))
-                        - timecode_to_seconds(clip.get("StartTimecode"), str(video_fps)))
+                        timecode_to_seconds(clip.get("EndTimecode"), str(video_fps),
+                                            allow_colon_df=True)
+                        - timecode_to_seconds(clip.get("StartTimecode"), str(video_fps),
+                                              allow_colon_df=True))
                     quantized_duration = float(
                         round(duration_seconds * float(video_fps)) / float(video_fps))
                     accumulated_duration += quantized_duration
@@ -388,9 +409,9 @@ def generate_hls_workflow(config: Dict[str, Any],
             if effective_clippings:
                 first_clip = effective_clippings[0]
                 start_seconds = timecode_to_seconds(first_clip.get("StartTimecode"),
-                                                    str(video_fps))
+                                                    str(video_fps), allow_colon_df=True)
                 end_seconds = timecode_to_seconds(first_clip.get("EndTimecode"),
-                                                  str(video_fps))
+                                                  str(video_fps), allow_colon_df=True)
                 loudnorm_analysis_duration = end_seconds - start_seconds
                 log().info("Performing loudnorm analysis on the first clipping for "
                              f"{float(loudnorm_analysis_duration):.3f} seconds.")
@@ -484,6 +505,8 @@ def generate_hls_workflow(config: Dict[str, Any],
                         merged_timeline_cue_points_str)
                     hls_output_paths.append(hls_playlist_res_path)
 
+        scte35_pid = _declare_scte35_pid(output_dir, selected_resolutions_data, defaults)
+
         _ = []
         video_segments = []
         _ = None
@@ -541,11 +564,24 @@ def generate_hls_workflow(config: Dict[str, Any],
 
         if ctx is not None:
             ctx.set_stage("MANIFEST", 0.0)
+        # BANDWIDTH / AVERAGE-BANDWIDTH measured from the segments produced,
+        # not taken from the template (defaults.hls_bandwidth_from_segments).
+        bitrate_data_by_resolution = {}
+        if defaults.get("hls_bandwidth_from_segments", True):
+            for res_data in selected_resolutions_data:
+                res_name = res_data["name"]
+                if res_name in merged_video_paths_by_resolution:
+                    bitrate_data_by_resolution[res_name] = calculate_bitrates_from_segments(
+                        output_dir / f"channel_{res_name}.m3u8")
+        else:
+            log().info("hls_bandwidth_from_segments is off: BANDWIDTH comes from the "
+                       "template bitrate / vbv-maxrate.")
         create_master_playlist(str(master_playlist_path), selected_resolutions_data,
                                merged_video_paths_by_resolution, ffprobe_executable,
                                float(video_fps), subtitle_file, hls_sub_playlist_path,
                                default_subtitle_language, _get_video_stream_details,
-                               _get_h264_profile_idc)
+                               _get_h264_profile_idc,
+                               bitrate_data_by_resolution=bitrate_data_by_resolution)
 
         if thumbnails_enabled:
             if ctx is not None:
@@ -575,7 +611,8 @@ def generate_hls_workflow(config: Dict[str, Any],
             output_dir, [r["name"] for r in selected_resolutions_data],
             expected_duration=total_merged_duration,
             hls_time=float(hls_settings.get("hls_time", 6)),
-            expect_thumbnails=bool(thumbnails_enabled))
+            expect_thumbnails=bool(thumbnails_enabled),
+            scte35_pid=scte35_pid)
         log().info("Package validated: " + ", ".join(
             f"{uri} {info['segments']} segment(s) / {info['duration']:.3f}s"
             for uri, info in summary["renditions"].items()))
@@ -644,6 +681,29 @@ def generate_hls_workflow(config: Dict[str, Any],
         _cleanup_temp_dirs(temp_clipping_dir, debug)
 
     return 0
+
+
+def _declare_scte35_pid(output_dir: Path, selected_resolutions_data, defaults) -> Optional[int]:
+    """List a SCTE-35 PID in every video segment's PMT, as MediaConvert does.
+
+    Controlled by defaults.scte35_pid_in_pmt (default true) and
+    defaults.scte35_pid (default 0x1F4). Returns the PID, or None when off.
+    The segments' size and every non-PMT packet are unchanged.
+    """
+    if not defaults.get("scte35_pid_in_pmt", True):
+        log().info("scte35_pid_in_pmt is off: no SCTE-35 PID is declared in the segments.")
+        return None
+    try:
+        pid = ts_pmt.parse_pid(defaults.get("scte35_pid"))
+    except ValueError as e:
+        raise TranscodeError(f"Invalid defaults.scte35_pid: {e}", stage="VALIDATION") from e
+    segments = [seg for res in selected_resolutions_data
+                for seg in sorted(Path(output_dir).glob(f"channel_{res['name']}_*.ts"))]
+    counts = ts_pmt.declare_in_segments(segments, pid)
+    log().info(f"SCTE-35 PID {pid:#x} declared in the PMT of {counts['added']} segment(s)"
+               + (f" ({counts['present']} already had it)" if counts["present"] else "")
+               + (f", {counts['skipped']} skipped" if counts["skipped"] else "") + ".")
+    return pid
 
 
 def _package_rendition(res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,

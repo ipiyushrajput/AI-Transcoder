@@ -463,8 +463,8 @@ def test_parallel_cli_jobs(work: Path, binaries: dict):
             "resolutions": "1080p,720p,540p,360p", "output_dir": f"job{k}",
             "InputClippings": [
                 {"StartTimecode": "00:00:00:00", "EndTimecode": "00:00:30:00"},
-                {"StartTimecode": "00:00:30:01", "EndTimecode": "00:01:00:00"},
-                {"StartTimecode": "00:01:00:01", "EndTimecode": "00:01:30:00"}]})
+                {"StartTimecode": "00:00:30:01", "EndTimecode": "00:00:59:29"},
+                {"StartTimecode": "00:01:00:02", "EndTimecode": "00:01:30:00"}]})
         for rung in config["video_templates"]["h265_standard"]:
             rung["threads"] = 4
         path = media / f"config{k}.json"
@@ -620,6 +620,129 @@ def test_every_ffmpeg_step_uses_the_budget(work: Path, binaries: dict):
     check("every core is returned", budget.in_use(), 0)
 
 
+def test_hevc_templates(work: Path, binaries: dict):
+    """h265_4k_standard carries the UHD rungs; h265_standard no longer does."""
+    print("hevc templates")
+    from api import job_manager
+    from hls_toolkit.runner import run_transcode_job
+
+    media = work / "templates"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+    templates = config["video_templates"]
+    check("h265_standard is 1080p..360p", [r["name"] for r in templates["h265_standard"]],
+          ["1080p", "720p", "540p", "360p"])
+    check("h265_4k_standard is 2160p..720p",
+          [r["name"] for r in templates["h265_4k_standard"]],
+          ["2160p", "1440p", "1080p", "720p"])
+
+    result = run_transcode_job(
+        config, overrides=_quick_overrides(source, upload=False, output_dir="uhd",
+                                           template="h265_4k_standard",
+                                           resolution="2160p,1440p,1080p,720p",
+                                           local_output_dir=str(media / "out")),
+        log_root=str(media / "logs"), work_root=str(media / "scratch"))
+    check("a 4K ladder job completes", result["status"], "COMPLETED")
+    master = (Path(result["output_prefix"]) / "channel.m3u8").read_text()
+    check("its master lists all four rungs", master.count("#EXT-X-STREAM-INF"), 4)
+    check_true("…including 3840x2160", "RESOLUTION=3840x2160" in master)
+
+    try:
+        job_manager._validate(config, {**job_manager.build_run_settings(
+            config, {"input_video": str(source), "template": "h265_standard",
+                     "resolution": "2160p", "upload": False})})
+        check("2160p under h265_standard is refused", "accepted", "refused")
+    except ValueError as e:
+        check_true("2160p under h265_standard is refused, naming the rungs",
+                   "2160p" in str(e) and "1080p" in str(e), str(e))
+
+
+def test_s3_permission_errors_explain_credentials(work: Path, binaries: dict):
+    """An S3 403 says which credentials were in play."""
+    print("s3 permission diagnostics")
+    from hls_toolkit import s3_io
+    from hls_toolkit.runner import run_transcode_job
+
+    client = fake_s3.install(s3_io, work / "s3_denied")
+    uri = client.put(BUCKET, f"denied/{CHANNEL}.mp4", os.urandom(4096))
+
+    def denied(Bucket, Key):
+        raise fake_s3.FakeClientError("403")
+
+    client.head_object = denied
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+    media = work / "denied"
+    result = run_transcode_job(
+        config, overrides=_quick_overrides(uri, upload=False, output_dir="denied",
+                                           local_output_dir=str(media / "out")),
+        log_root=str(media / "logs"), work_root=str(media / "scratch"))
+    check("the job fails at FETCHING_INPUT", result["stage"], "FETCHING_INPUT")
+    check_true("the error lists the credential sources",
+               "Active credential sources detected" in (result["error_message"] or ""),
+               result["error_message"])
+
+
+def test_clip_frames_in_a_real_job(work: Path, binaries: dict):
+    """The HEVC job's 10-minute clip list: every clip encode is told its exact
+    frame count, and the job's markers all land in the package."""
+    print("frame-exact clips in a job")
+    import re
+    from fractions import Fraction
+    from hls_toolkit.runner import run_transcode_job
+    from hls_toolkit.time_utils import timecode_to_seconds
+
+    clips = [("00:00:00;00", "00:10:00;14"), ("00:10:00;15", "00:20:00;14"),
+             ("00:20:00;15", "00:30:00;14"), ("00:30:00;15", "00:40:00;14"),
+             ("00:40:00;15", "00:50:00;14"), ("00:50:00;15", "00:59:59;28")]
+    fps = Fraction(30000, 1001)
+    planned = [int((timecode_to_seconds(e, fps, allow_colon_df=True)
+                    - timecode_to_seconds(s, fps, allow_colon_df=True)) * fps)
+               for s, e in clips]
+    scc = ('<SignalProcessingNotification '
+           'xmlns="urn:cablelabs:iptvservices:esam:xsd:signal:1" '
+           'xmlns:sig="urn:cablelabs:md:xsd:signaling:3.0">'
+           + "".join(f'<ResponseSignal acquisitionSignalID="{n}">'
+                     f'<sig:NPTPoint nptPoint="{npt}"/><sig:SCTE35PointDescriptor>'
+                     '<sig:SegmentationDescriptorInfo segmentTypeId="52" duration="PT0S"/>'
+                     '</sig:SCTE35PointDescriptor></ResponseSignal>'
+                     for n, npt in enumerate(("600.47", "1200.43", "1800.40",
+                                              "2400.37", "3000.33"), 1))
+           + '</SignalProcessingNotification>')
+    media = work / "frames_job"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+    config = build_config(work, binaries)
+    config["defaults"]["subtitle_file"] = None
+    config["defaults"]["InputClippings"] = [{"StartTimecode": s, "EndTimecode": e}
+                                            for s, e in clips]
+    config["Esam"] = {"SignalProcessingNotification": {"SccXml": scc},
+                      "ManifestConfirmConditionNotification": {"MccXml": ""}}
+    log_root = media / "logs"
+    result = _with_env({"FAKE_MEDIA_FPS": "30000/1001", "FAKE_MEDIA_DURATION": "3600"},
+                       lambda: run_transcode_job(
+                           config, overrides=_quick_overrides(
+                               source, upload=False, esam=True, output_dir="frames",
+                               resolution="720p", local_output_dir=str(media / "out")),
+                           log_root=str(log_root), work_root=str(media / "scratch")))
+    check("the 60-minute 6-clip job completes", result["status"], "COMPLETED")
+    ffmpeg_log = "".join(p.read_text() for p in log_root.rglob("ffmpeg.log"))
+    sent = {}
+    for line in ffmpeg_log.splitlines():
+        m = re.search(r"clip_(\d+)_720p_video\.mp4", line)
+        f = re.search(r"-frames:v (\d+)", line)
+        if line.startswith("$ ") and m and f:
+            sent[int(m.group(1))] = int(f.group(1))
+    check("every clip encode is told its exact frame count",
+          [sent.get(i) for i in range(len(clips))], planned)
+    playlist = (Path(result["output_prefix"]) / "channel_720p.m3u8").read_text()
+    check("all five breaks are marked", playlist.count("#EXT-X-CUE-OUT:"), 5)
+
+
 def _quick_overrides(source, **extra):
     """Overrides for a fast job: no ESAM, loudnorm or thumbnails."""
     overrides = {"input_video": str(source), "esam": False, "audio_norm": False,
@@ -689,6 +812,35 @@ def test_local_copies(work: Path, binaries: dict):
     check_true("the package survives the job", (saved / "channel.m3u8").exists())
     check("playback points at the saved copy", result["metadata"]["playback_url"],
           str(saved / "channel.m3u8"))
+
+    # Every segment of every rung declares SCTE-35 on PID 0x1F4, as
+    # MediaConvert's do; the switch turns it off.
+    from hls_toolkit.ts_pmt import declares_scte35
+    segments = sorted(saved.glob("channel_*p_*.ts"))
+    check_true("every video segment declares the SCTE-35 PID",
+               segments and all(declares_scte35(p) for p in segments), len(segments))
+    config["defaults"]["scte35_pid_in_pmt"] = False
+    plain = run(upload=False, output_dir="no_scte35")
+    config["defaults"].pop("scte35_pid_in_pmt")
+    check_true("scte35_pid_in_pmt=false leaves the segments as FFmpeg wrote them",
+               not any(declares_scte35(p) for p in
+                       Path(plain["output_prefix"]).glob("channel_*p_*.ts")))
+
+    # BANDWIDTH in the master comes from the segments the job produced.
+    from hls_toolkit.playlist_utils import calculate_bitrates_from_segments
+    master_text = (saved / "channel.m3u8").read_text()
+    for rung in ("1080p", "720p"):
+        measured = calculate_bitrates_from_segments(saved / f"channel_{rung}.m3u8")
+        check_true(f"{rung} BANDWIDTH is measured from its segments",
+                   f"BANDWIDTH={measured['bandwidth']},"
+                   f"AVERAGE-BANDWIDTH={measured['avg_bandwidth']}" in master_text,
+                   master_text)
+    config["defaults"]["hls_bandwidth_from_segments"] = False
+    template_run = run(upload=False, output_dir="template_bandwidth")
+    config["defaults"].pop("hls_bandwidth_from_segments")
+    check_true("hls_bandwidth_from_segments=false restores the template values",
+               "BANDWIDTH=3000000,AVERAGE-BANDWIDTH=3000000" in
+               (Path(template_run["output_prefix"]) / "channel.m3u8").read_text())
 
     again = run(upload=False, output_dir="show")
     check("a second run never overwrites the first", Path(again["output_prefix"]).name,
@@ -984,6 +1136,71 @@ def test_encoder_check(work: Path, binaries: dict):
     _with_env(coord, scenario)
 
 
+def test_esam_at_2997(work: Path, binaries: dict):
+    """Regression: at 30000/1001, ESAM remapping must accept drop-frame clip
+    timecodes (';' and ':') and the cue points must reach the encoder.
+
+    The remap step used to receive float(fps) = 29.97002997002997, which the
+    exact drop-frame check rejected: every clip was skipped ("Drop-frame
+    notation is not valid for frame rate: 2997002997002997/..."), no events
+    were remapped, and -scte35_cue_points was left off every encode.
+    """
+    print("esam at 29.97 fps")
+    from hls_toolkit.runner import run_transcode_job
+
+    scc = ('<SignalProcessingNotification '
+           'xmlns="urn:cablelabs:iptvservices:esam:xsd:signal:1" '
+           'xmlns:sig="urn:cablelabs:md:xsd:signaling:3.0">'
+           '<ResponseSignal acquisitionSignalID="1">'
+           '<sig:NPTPoint nptPoint="80.0"/><sig:SCTE35PointDescriptor>'
+           '<sig:SegmentationDescriptorInfo segmentTypeId="52" duration="PT10.0S"/>'
+           '</sig:SCTE35PointDescriptor></ResponseSignal>'
+           '</SignalProcessingNotification>')
+    media = work / "esam2997"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+
+    for notation, clips in (
+            # Clip 2 starts past the first minute, where drop-frame and
+            # non-drop differ by 2 frames, so a colon list misread as
+            # non-drop would put the cue point in the wrong place.
+            ("';' drop-frame", [{"StartTimecode": "00:00:00;00", "EndTimecode": "00:00:20;00"},
+                                {"StartTimecode": "00:01:10;00", "EndTimecode": "00:01:50;00"}]),
+            ("':' colon", [{"StartTimecode": "00:00:00:00", "EndTimecode": "00:00:20:00"},
+                           {"StartTimecode": "00:01:10:00", "EndTimecode": "00:01:50:00"}])):
+        config = build_config(work, binaries)
+        config["defaults"]["subtitle_file"] = None
+        config["defaults"]["InputClippings"] = clips
+        config["Esam"] = {"SignalProcessingNotification": {"SccXml": scc},
+                          "ManifestConfirmConditionNotification": {"MccXml": ""}}
+        log_root = media / f"logs_{len(notation)}"
+        result = _with_env({"FAKE_MEDIA_FPS": "30000/1001", "FAKE_MEDIA_DURATION": "120"},
+                           lambda: run_transcode_job(
+                               config, overrides=_quick_overrides(
+                                   source, upload=False, esam=True,
+                                   output_dir=f"esam_{len(notation)}",
+                                   local_output_dir=str(media / "out")),
+                               log_root=str(log_root), work_root=str(media / "scratch")))
+        check(f"{notation}: the job completes", result["status"], "COMPLETED")
+        job_log = "".join(p.read_text() for p in log_root.rglob("job.log"))
+        ffmpeg_log = "".join(p.read_text() for p in log_root.rglob("ffmpeg.log"))
+        check_true(f"{notation}: every clip timecode parses in the ESAM remap",
+                   "Error parsing timecode in clipping" not in job_log
+                   and "No valid clippings after processing" not in job_log,
+                   [l for l in job_log.splitlines() if "clipping" in l.lower()][:3])
+        check_true(f"{notation}: the events are remapped to the merged timeline",
+                   "Updated ESAM events to remapped versions" in job_log)
+        # Clip 2 starts at drop-frame 01:10;00 = frame 2098 (70.003 s), so
+        # the event at 80 s is 9.997 s into it (non-drop would say 9.930).
+        check_true(f"{notation}: the cue point reaches the encoder at the right time",
+                   "-scte35_cue_points 9.997" in ffmpeg_log,
+                   [l for l in ffmpeg_log.splitlines() if "scte35" in l][:2])
+        playlist = (Path(result["output_prefix"]) / "channel_720p.m3u8").read_text()
+        check_true(f"{notation}: the playlist carries the ad break",
+                   "#EXT-X-CUE-OUT:10.000" in playlist)
+
+
 def _with_env(env: dict, fn):
     previous = {k: os.environ.get(k) for k in env}
     os.environ.update(env)
@@ -1247,6 +1464,14 @@ def main():
         test_output_folder_safety(work, binaries)
         print()
         test_local_copies(work, binaries)
+        print()
+        test_hevc_templates(work, binaries)
+        print()
+        test_esam_at_2997(work, binaries)
+        print()
+        test_clip_frames_in_a_real_job(work, binaries)
+        print()
+        test_s3_permission_errors_explain_credentials(work, binaries)
         print()
         test_safe_publish(work, binaries)
         print()
