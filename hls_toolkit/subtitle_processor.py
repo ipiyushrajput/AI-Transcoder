@@ -27,6 +27,9 @@ class VttCue:
 
 
 def _parse_time_string(time_str: str) -> float:
+    # SRT-style "00:10:01,000" is accepted too: a .vtt converted from SRT often
+    # keeps the comma, and those cues used to be dropped.
+    time_str = time_str.replace(",", ".")
     match_ms = re.match("^(?:(\\d{2,})?:)?(\\d{2}):(\\d{2}\\.\\d{3})", time_str)
     if match_ms:
         h_str, m_str, s_ms_str = match_ms.groups()
@@ -83,7 +86,7 @@ def parse_vtt_file(vtt_path: Path, video_fps: float = 29.97002997002997) -> List
                 start_str = parts[0].strip()
                 end_str_and_settings = parts[1].strip()
                 settings = None
-                match_settings = re.match("([\\d:.]+)\\s*(.*)", end_str_and_settings)
+                match_settings = re.match("([\\d:.,]+)\\s*(.*)", end_str_and_settings)
                 if match_settings:
                     end_str = match_settings.group(1)
                     settings = match_settings.group(2) if match_settings.group(2) else None
@@ -104,8 +107,8 @@ def parse_vtt_file(vtt_path: Path, video_fps: float = 29.97002997002997) -> List
             current_cue_time_line = None
             current_cue_text_lines = []
 
-    for line in lines[1:]:
-        line = line.strip()
+    body = [line.strip() for line in lines[1:]]
+    for index, line in enumerate(body):
         if not line:
             flush_current_cue()
             continue
@@ -118,7 +121,13 @@ def parse_vtt_file(vtt_path: Path, video_fps: float = 29.97002997002997) -> List
             current_cue_id = line
         elif line.startswith("NOTE") or "X-TIMESTAMP-MAP" in line:
             continue
-        elif line.isdigit() and current_cue_time_line:
+        elif (line.isdigit() and current_cue_time_line
+              and index + 1 < len(body) and "-->" in body[index + 1]):
+            # A cue number directly followed by a timing line starts the next
+            # cue (numbered cues with no blank line between them). A number
+            # that is not followed by a timing line is the cue's text: a
+            # caption reading "800" used to end its own cue empty and become
+            # the next cue's identifier.
             flush_current_cue()
             current_cue_id = line
         else:

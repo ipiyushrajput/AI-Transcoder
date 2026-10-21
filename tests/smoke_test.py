@@ -135,6 +135,51 @@ def test_subtitles(work):
           "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:126000"
           in (out / "channel_en-vtt-1_00001.vtt").read_text(), True)
 
+    # Regression: a caption whose text is a number ("800" in the AVC test asset)
+    # used to end its own cue empty and turn into the next cue's identifier.
+    numeric = work / "numeric.vtt"
+    numeric.write_text(
+        "WEBVTT\n\n"
+        "00:00:01.468 --> 00:00:02.469\n800\n\n"
+        "00:00:02.602 --> 00:00:03.837\n800?\n\n"
+        "00:00:03.970 --> 00:00:06.006\nHe's at full boat on the prices,\n"
+        "and what we have to consider\n")
+    cues = parse_vtt_file(numeric)
+    check("a numeric caption keeps its text", [(c.text, c.id) for c in cues[:2]],
+          [("800", None), ("800?", None)])
+    num_out = work / "numeric_out"
+    num_out.mkdir(exist_ok=True)
+    merged, _, dur = generate_merged_subtitle_file(
+        numeric, "ffmpeg", [{"StartTimecode": "00:00:00:00", "EndTimecode": "00:00:06:00"}],
+        25.0, num_out, tmp)
+    segment_vtt_for_hls(merged, num_out, "en", dur,
+                        [(0.0, 3.0, "s0.ts", 1), (3.0, 6.0, "s1.ts", 3)],
+                        global_stream_mpegts_start=126000, vtt_index=1)
+    seg = (num_out / "channel_en-vtt-1_00001.vtt").read_text()
+    check_true("the written segment shows 800 under its own timing line",
+               "00:00:01.468 --> 00:00:02.469\n800\n" in seg, seg)
+    check_true("…and not as the next cue's identifier", "800\n00:00:02.602" not in seg, seg)
+
+    # Numbered cues with no blank line between them still split.
+    packed = work / "packed.vtt"
+    packed.write_text("WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.000\nFirst\n"
+                      "2\n00:00:03.000 --> 00:00:04.000\nSecond\n")
+    check("numbered cues without blank lines still split",
+          [(c.id, c.text) for c in parse_vtt_file(packed)], [("1", "First"), ("2", "Second")])
+    years = work / "years.vtt"
+    years.write_text("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n911\n2024\n\n"
+                     "00:00:03.000 --> 00:00:04.000\nIn 2024\n42\n")
+    check("numbers inside multi-line captions stay text",
+          [c.text for c in parse_vtt_file(years)], ["911\n2024", "In 2024\n42"])
+
+    # SRT-style comma timestamps (the HEVC test asset) are no longer dropped.
+    srt = work / "srt_style.vtt"
+    srt.write_text("WEBVTT\n\n00:10:01,000 --> 00:10:11,000 line:90%\nComma times\n")
+    cues = parse_vtt_file(srt)
+    check("SRT-style comma timestamps parse",
+          [(c.start, c.end, c.text, c.settings) for c in cues],
+          [(601.0, 611.0, "Comma times", "line:90%")])
+
 
 def test_playlists(work):
     print("playlist_utils")
