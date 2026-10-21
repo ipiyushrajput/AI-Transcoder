@@ -38,7 +38,9 @@
     "generate_thumbnails": true,
     "template": "h264_standard",
     "subtitle_language": "en",
-    "log_dir": "logs"
+    "log_dir": "logs",
+    "scte35_pid_in_pmt": true,
+    "scte35_pid": "0x1F4"
   },
   "video_templates": {
     "h264_standard": [

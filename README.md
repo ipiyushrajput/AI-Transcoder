@@ -353,6 +353,14 @@ cleans up scratch space.
 | `InputClippings` | `[{"StartTimecode": "HH:MM:SS:FF", "EndTimecode": "..."}]` |
 | `hls_settings` | `hls_time`, `hls_playlist_type`, `hls_flags`, `hls_segment_type` |
 | `hls_bandwidth_from_segments` | `true` (default): measure `BANDWIDTH` from the segments; `false`: use the template |
+| `scte35_pid_in_pmt`, `scte35_pid` | `true` / `"0x1F4"` (default): every TS segment's PMT lists a SCTE-35 stream on that PID, as MediaConvert's do; `false`: segments are left as FFmpeg writes them |
+
+**SCTE-35 PID.** MediaConvert's segments declare a SCTE-35 stream (type 0x86,
+PID 0x1F4, with a `CUEI` registration in the program info) in every segment's
+PMT, so ffprobe and downstream packagers see `Data: scte_35`. It sends no SCTE-35
+packets on it. After packaging, each segment's PMT is rewritten in place to match:
+only the PMT packet changes, the segment size stays the same, and validation
+checks every segment carries the declaration.
 
 **Timecodes** (SDK v2.3 rules). `HH:MM:SS:FF` or `HH:MM:SS;FF`, two digits for
 minutes, seconds and frames. At 29.97 (30000/1001) and 59.94 (60000/1001) fps

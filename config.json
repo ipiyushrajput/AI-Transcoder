@@ -30,6 +30,8 @@
       }
     ],
     "hls_bandwidth_from_segments": true,
+    "scte35_pid_in_pmt": true,
+    "scte35_pid": "0x1F4",
     "hls_settings": {
       "hls_time": 6,
       "hls_playlist_type": "vod",

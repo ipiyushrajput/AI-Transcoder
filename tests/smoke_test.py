@@ -933,6 +933,55 @@ def test_markers_follow_real_splits(work):
                text.index("#EXT-X-CUE-OUT:") > text.index("seg_00006.ts"), text)
 
 
+def test_scte35_pid_in_pmt(work):
+    """Every segment declares SCTE-35 on PID 0x1F4 in its PMT, the way
+    MediaConvert's segments do (program-level CUEI registration + stream type
+    0x86, no descriptors); nothing else in the segment changes."""
+    print("scte-35 pid in pmt")
+    import runpy
+    from hls_toolkit import ts_pmt
+    fake = runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "fakes", "fake_ffmpeg.py"))
+    seg = work / "pmt_seg.ts"
+    fake["write_ts_segment"](seg, 6.006)
+    before = seg.read_bytes()
+    check("an FFmpeg-shaped segment has no SCTE-35 PID", ts_pmt.declares_scte35(seg), False)
+    check("the PID is added", ts_pmt.add_scte35_pid(seg), "added")
+    after = seg.read_bytes()
+    pmt = ts_pmt.parse_pmt(ts_pmt._section_at(after[188:376])[1])
+    check("program info carries the CUEI registration, as in MediaConvert",
+          pmt["program_info"].hex(), "050443554549")
+    check("the streams are H.264, AAC and SCTE-35 on 0x1F4",
+          [(t, p) for t, p, _ in pmt["streams"]], [(0x1B, 0x100), (0x0F, 0x101), (0x86, 0x1F4)])
+    check("the SCTE-35 entry is MediaConvert's exact bytes (86 E1F4 F000)",
+          bytes.fromhex("86e1f4f000") in after[188:376], True)
+    check("the PMT CRC is valid", pmt["crc_ok"], True)
+    check("the audio stream keeps its language descriptor", pmt["streams"][1][2].hex(),
+          "0a04756e6400")
+    check("the segment size is unchanged", len(after), len(before))
+    check_true("every packet but the PMT is byte-identical",
+               before[:188] == after[:188] and before[376:] == after[376:])
+    check("running it again changes nothing", ts_pmt.add_scte35_pid(seg), "present")
+    check("…and the file is identical", seg.read_bytes(), after)
+
+    clash = work / "clash.ts"
+    clash.write_bytes(before[:376] + bytes([0x47, 0x01, 0xF4, 0x10]) + bytes(184))
+    original = clash.read_bytes()
+    check_true("a PID already carrying data is not reused",
+               ts_pmt.add_scte35_pid(clash).startswith("skipped"))
+    check("…and the file is untouched", clash.read_bytes(), original)
+    junk = work / "junk.ts"
+    junk.write_bytes(os.urandom(500))
+    check_true("a non-TS file is left alone", ts_pmt.add_scte35_pid(junk).startswith("skipped"))
+    check("custom PIDs parse from config", (ts_pmt.parse_pid("0x1F4"), ts_pmt.parse_pid(600),
+                                            ts_pmt.parse_pid(None)), (0x1F4, 600, 0x1F4))
+    try:
+        ts_pmt.parse_pid("0x1FFF")
+        check("a reserved PID is refused", "accepted", "refused")
+    except ValueError:
+        check("a reserved PID is refused", "refused", "refused")
+
+
 def test_transcode_scheduling():
     """Cost estimates and the order clips are released into the budget."""
     print("transcode scheduling")
@@ -1079,6 +1128,10 @@ def test_package_validator(work):
     except TranscodeError as e:
         check("a whole package passes", f"failed: {e}", "passed")
 
+    problem("segments without the SCTE-35 PID are caught when it is required",
+            build(work / "pkg_no_scte35"), "do not declare the SCTE-35 PID 0x1f4",
+            scte35_pid=0x1F4)
+
     root = build(work / "pkg_missing_seg")
     (root / "channel_720p_00002.ts").unlink()
     problem("a missing segment is caught", root, "1 segment(s) missing")
@@ -1123,6 +1176,7 @@ def main():
         test_duplicate_rung_guard()
         test_output_dir_names()
         test_package_validator(work)
+        test_scte35_pid_in_pmt(work)
         test_cpu_budget(work)
         test_disk_budget(work)
         test_housekeeping(work)

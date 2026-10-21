@@ -813,6 +813,19 @@ def test_local_copies(work: Path, binaries: dict):
     check("playback points at the saved copy", result["metadata"]["playback_url"],
           str(saved / "channel.m3u8"))
 
+    # Every segment of every rung declares SCTE-35 on PID 0x1F4, as
+    # MediaConvert's do; the switch turns it off.
+    from hls_toolkit.ts_pmt import declares_scte35
+    segments = sorted(saved.glob("channel_*p_*.ts"))
+    check_true("every video segment declares the SCTE-35 PID",
+               segments and all(declares_scte35(p) for p in segments), len(segments))
+    config["defaults"]["scte35_pid_in_pmt"] = False
+    plain = run(upload=False, output_dir="no_scte35")
+    config["defaults"].pop("scte35_pid_in_pmt")
+    check_true("scte35_pid_in_pmt=false leaves the segments as FFmpeg wrote them",
+               not any(declares_scte35(p) for p in
+                       Path(plain["output_prefix"]).glob("channel_*p_*.ts")))
+
     # BANDWIDTH in the master comes from the segments the job produced.
     from hls_toolkit.playlist_utils import calculate_bitrates_from_segments
     master_text = (saved / "channel.m3u8").read_text()

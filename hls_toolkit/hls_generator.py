@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
-from hls_toolkit import s3_io, time_utils
+from hls_toolkit import s3_io, time_utils, ts_pmt
 from hls_toolkit.cpu_budget import BudgetAcquireAborted, get_shared_budget
 from hls_toolkit.job_context import (JobCancelled, JobContext, TranscodeError,
                                      current_context, log)
@@ -505,6 +505,8 @@ def generate_hls_workflow(config: Dict[str, Any],
                         merged_timeline_cue_points_str)
                     hls_output_paths.append(hls_playlist_res_path)
 
+        scte35_pid = _declare_scte35_pid(output_dir, selected_resolutions_data, defaults)
+
         _ = []
         video_segments = []
         _ = None
@@ -609,7 +611,8 @@ def generate_hls_workflow(config: Dict[str, Any],
             output_dir, [r["name"] for r in selected_resolutions_data],
             expected_duration=total_merged_duration,
             hls_time=float(hls_settings.get("hls_time", 6)),
-            expect_thumbnails=bool(thumbnails_enabled))
+            expect_thumbnails=bool(thumbnails_enabled),
+            scte35_pid=scte35_pid)
         log().info("Package validated: " + ", ".join(
             f"{uri} {info['segments']} segment(s) / {info['duration']:.3f}s"
             for uri, info in summary["renditions"].items()))
@@ -678,6 +681,29 @@ def generate_hls_workflow(config: Dict[str, Any],
         _cleanup_temp_dirs(temp_clipping_dir, debug)
 
     return 0
+
+
+def _declare_scte35_pid(output_dir: Path, selected_resolutions_data, defaults) -> Optional[int]:
+    """List a SCTE-35 PID in every video segment's PMT, as MediaConvert does.
+
+    Controlled by defaults.scte35_pid_in_pmt (default true) and
+    defaults.scte35_pid (default 0x1F4). Returns the PID, or None when off.
+    The segments' size and every non-PMT packet are unchanged.
+    """
+    if not defaults.get("scte35_pid_in_pmt", True):
+        log().info("scte35_pid_in_pmt is off: no SCTE-35 PID is declared in the segments.")
+        return None
+    try:
+        pid = ts_pmt.parse_pid(defaults.get("scte35_pid"))
+    except ValueError as e:
+        raise TranscodeError(f"Invalid defaults.scte35_pid: {e}", stage="VALIDATION") from e
+    segments = [seg for res in selected_resolutions_data
+                for seg in sorted(Path(output_dir).glob(f"channel_{res['name']}_*.ts"))]
+    counts = ts_pmt.declare_in_segments(segments, pid)
+    log().info(f"SCTE-35 PID {pid:#x} declared in the PMT of {counts['added']} segment(s)"
+               + (f" ({counts['present']} already had it)" if counts["present"] else "")
+               + (f", {counts['skipped']} skipped" if counts["skipped"] else "") + ".")
+    return pid
 
 
 def _package_rendition(res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,
