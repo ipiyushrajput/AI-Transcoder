@@ -350,6 +350,8 @@ cleans up scratch space.
 | `template` | Which `video_templates` ladder to use |
 | `resolutions` | Comma-separated rung names from that ladder |
 | `esam`, `audio_norm`, `generate_thumbnails`, `upload` | Feature switches |
+| `audio_bitrate` | AAC bitrate for rungs without their own (default `192k`) |
+| `deinterlace` | `auto` (default), `always` or `never`; see below. `WZ_DEINTERLACE` overrides it |
 | `InputClippings` | `[{"StartTimecode": "HH:MM:SS:FF", "EndTimecode": "..."}]` |
 | `hls_settings` | `hls_time`, `hls_playlist_type`, `hls_flags`, `hls_segment_type` |
 | `hls_bandwidth_from_segments` | `true` (default): measure `BANDWIDTH` from the segments; `false`: use the template |
@@ -361,6 +363,21 @@ PMT, so ffprobe and downstream packagers see `Data: scte_35`. It sends no SCTE-3
 packets on it. After packaging, each segment's PMT is rewritten in place to match:
 only the PMT packet changes, the segment size stays the same, and validation
 checks every segment carries the declaration.
+
+**Deinterlacing** (SDK v2.7). The input is probed for its field order
+(`tt`/`bb`/`tb`/`bt` is interlaced, `progressive` is not; when the container
+does not say, the first frame's interlace flag decides). With `auto`, rungs with
+`interlace_mode: PROGRESSIVE` get `yadif` only when the input is interlaced, or
+when detection could not tell, which keeps the old behaviour. When every rung
+deinterlaces, one `yadif` runs before the split. `always` gives the pre-v2.7
+commands (yadif on every input), and `never` turns it off. Each job's log states
+the field order found and the decision.
+
+**Audio bitrate per rung** (SDK v2.7). A rung's AAC bitrate is `--audio-bitrate`
+(or the API's `audio_bitrate`) for the whole job, else the rung's
+`audio_bitrate`, else `defaults.audio_bitrate`, else `192k`. Each clip's audio
+is encoded once with one output per distinct bitrate, and each rung's segments
+carry the track at its own bitrate.
 
 **Timecodes** (SDK v2.3 rules). `HH:MM:SS:FF` or `HH:MM:SS;FF`, two digits for
 minutes, seconds and frames. At 29.97 (30000/1001) and 59.94 (60000/1001) fps
@@ -384,9 +401,11 @@ at 59.94). A clip list with such a timecode fails at `VALIDATION`.
 A map of template name to ABR ladder. Per rung: `name`, `width`, `height`,
 `codec` (`H_264` → `libwz264`, `H_265` → `libwz265`), `codec_params` (passed as
 `-wz264-params` / `-wz265-params`), `bitrate` or `crf`, `preset`, `caeopts`,
-`threads`, `GopSize`, `interlace_mode`, `video_format`, `frame_rate`.
+`threads`, `GopSize`, `interlace_mode`, `video_format`, `frame_rate`,
+`audio_bitrate`.
 
-Shipped ladders (as in SDK v2.3):
+Shipped ladders (as in SDK v2.7; audio 192k / 160k / 128k / 96k from 1080p
+down, 192k for 4K rungs above 720p):
 
 | Template | Rungs |
 | --- | --- |
