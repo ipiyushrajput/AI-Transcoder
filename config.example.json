@@ -6,6 +6,8 @@
     "resolutions": "1080p,720p,540p,360p",
     "esam": true,
     "audio_norm": true,
+    "audio_bitrate": "192k",
+    "deinterlace": "auto",
     "upload": true,
     "InputClippings": [
       {
@@ -56,7 +58,8 @@
         "GopSizeUnits": "SECONDS",
         "caeopts": "1",
         "preset": "slower",
-        "threads": 8
+        "threads": 8,
+        "audio_bitrate": "192k"
       },
       {
         "name": "720p",
@@ -70,7 +73,8 @@
         "GopSizeUnits": "SECONDS",
         "caeopts": "1",
         "preset": "slower",
-        "threads": 8
+        "threads": 8,
+        "audio_bitrate": "160k"
       },
       {
         "name": "540p",
@@ -84,7 +88,8 @@
         "GopSizeUnits": "SECONDS",
         "caeopts": "1",
         "preset": "slower",
-        "threads": 4
+        "threads": 4,
+        "audio_bitrate": "128k"
       },
       {
         "name": "360p",
@@ -98,7 +103,8 @@
         "GopSizeUnits": "SECONDS",
         "caeopts": "2",
         "preset": "slower",
-        "threads": 4
+        "threads": 4,
+        "audio_bitrate": "96k"
       }
     ],
     "h265_standard": [
@@ -114,7 +120,8 @@
         "caeopts": "1",
         "crf": "26.2",
         "preset": "slower",
-        "threads": 4
+        "threads": 4,
+        "audio_bitrate": "192k"
       },
       {
         "name": "720p",
@@ -128,7 +135,8 @@
         "caeopts": "1",
         "crf": "26.4",
         "preset": "slower",
-        "threads": 4
+        "threads": 4,
+        "audio_bitrate": "160k"
       },
       {
         "name": "540p",
@@ -142,7 +150,8 @@
         "caeopts": "1",
         "crf": "27.1",
         "preset": "slower",
-        "threads": 4
+        "threads": 4,
+        "audio_bitrate": "128k"
       },
       {
         "name": "360p",
@@ -156,7 +165,8 @@
         "caeopts": "2",
         "crf": "29.0",
         "preset": "slower",
-        "threads": 4
+        "threads": 4,
+        "audio_bitrate": "96k"
       }
     ],
     "h265_4k_standard": [
@@ -172,7 +182,8 @@
         "caeopts": "1",
         "crf": "26.0",
         "preset": "slower",
-        "threads": 4
+        "threads": 4,
+        "audio_bitrate": "192k"
       },
       {
         "name": "1440p",
@@ -186,7 +197,8 @@
         "caeopts": "1",
         "crf": "26.7",
         "preset": "slower",
-        "threads": 4
+        "threads": 4,
+        "audio_bitrate": "192k"
       },
       {
         "name": "1080p",
@@ -200,7 +212,8 @@
         "caeopts": "1",
         "crf": "29.5",
         "preset": "slower",
-        "threads": 4
+        "threads": 4,
+        "audio_bitrate": "192k"
       },
       {
         "name": "720p",
@@ -214,7 +227,8 @@
         "caeopts": "1",
         "crf": "30.4",
         "preset": "slower",
-        "threads": 4
+        "threads": 4,
+        "audio_bitrate": "160k"
       }
     ]
   },
