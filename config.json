@@ -119,7 +119,7 @@
         "GopSize": 6,
         "GopSizeUnits": "SECONDS",
         "caeopts": "1",
-        "crf": "26.2",
+        "crf": "28.0",
         "preset": "slower",
         "threads": 4,
         "audio_bitrate": "192k"
