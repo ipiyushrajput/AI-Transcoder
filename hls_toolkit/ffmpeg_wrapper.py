@@ -12,6 +12,7 @@ import tempfile
 import math
 import collections
 import concurrent.futures
+import functools
 import threading
 import time
 from pathlib import Path
@@ -163,9 +164,78 @@ def run_loudnorm_analysis(ffmpeg_executable: str,
         return None
 
 
+# Rates a source's measured average frame rate is snapped to (SDK v2.3).
+STANDARD_BROADCAST_FPS = (fractions.Fraction(24000, 1001), fractions.Fraction(30000, 1001),
+                          fractions.Fraction(60000, 1001), fractions.Fraction(24, 1),
+                          fractions.Fraction(25, 1), fractions.Fraction(30, 1),
+                          fractions.Fraction(50, 1), fractions.Fraction(60, 1))
+
+
+def normalize_encoder_framerate(frame_rate) -> fractions.Fraction:
+    """Frame rate for the encoder's fps filter, without high-denominator values.
+
+    ffprobe's avg_frame_rate can come back as e.g. ``359640/12000`` for a
+    nominal 29.97 fps source. As in SDK v2.3:
+
+    * a missing, malformed or non-positive rate becomes 25/1;
+    * a rate whose denominator is 1001 or less is kept as it is (so
+      30000/1001, 25/1, 24000/1001 ... are unchanged);
+    * otherwise it snaps to a standard broadcast rate within 0.05 fps, or else
+      is reduced with ``limit_denominator(1001)``.
+    """
+    try:
+        rate = (frame_rate if isinstance(frame_rate, fractions.Fraction)
+                else fractions.Fraction(frame_rate))
+    except (ValueError, ZeroDivisionError, TypeError):
+        return fractions.Fraction(25, 1)
+    if rate <= 0:
+        return fractions.Fraction(25, 1)
+    if rate.denominator > 1001:
+        fps_float = float(rate)
+        for std_fps in STANDARD_BROADCAST_FPS:
+            if abs(fps_float - float(std_fps)) < 0.05:
+                return std_fps
+        return rate.limit_denominator(1001)
+    return rate
+
+
+INTERLACED_FIELD_ORDERS = ("tt", "bb", "tb", "bt")
+
+
+def _video_info_defaults() -> Dict[str, Any]:
+    return {'duration': 0.0, 'frame_rate': fractions.Fraction(25, 1),
+            'is_interlaced': None, 'field_order': "unknown", 'color_space': "unknown",
+            'color_transfer': "unknown", 'color_primaries': "unknown"}
+
+
+def _first_frame_interlaced(ffprobe_executable: str,
+                            input_video: Union[str, Path]) -> Optional[bool]:
+    """Whether the first video frame is flagged interlaced; None if unreadable."""
+    cmd = [ffprobe_executable, "-v", "error", "-select_streams", "v:0",
+           "-read_intervals", "%+#1",
+           "-show_entries", "frame=interlaced_frame,top_field_first",
+           "-of", "json", str(input_video)]
+    try:
+        result_json = _run_ffprobe_command(cmd, log_prefix="FFprobe frame interlace")
+        frames = json.loads(result_json or "{}").get("frames") or []
+        if not frames or "interlaced_frame" not in frames[0]:
+            return None
+        return int(frames[0]["interlaced_frame"]) == 1
+    except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError,
+            TypeError, AttributeError) as e:
+        log().warning(f"Could not read the first frame's interlace flag: {e}")
+        return None
+
+
 def get_video_info(ffprobe_executable: str,
-                   input_video: Union[str, Path]) -> Dict[str, Union[float, fractions.Fraction]]:
-    """Gets video information (duration and frame rate) using a single ffprobe call."""
+                   input_video: Union[str, Path]) -> Dict[str, Any]:
+    """Probes duration, frame rate, interlacing and colour description.
+
+    ``is_interlaced`` (SDK v2.7) comes from the stream's ``field_order``
+    (tt/bb/tb/bt is interlaced, progressive is not). When the container does
+    not say, the first frame's ``interlaced_frame`` flag decides. It is None
+    when neither could be read, so callers can fall back to the safe choice.
+    """
     ffprobe_cmd = [
         ffprobe_executable,
         "-v",
@@ -173,31 +243,92 @@ def get_video_info(ffprobe_executable: str,
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=avg_frame_rate",
+        "stream=avg_frame_rate,field_order,color_space,color_transfer,color_primaries",
         "-show_entries",
         "format=duration",
         "-of",
         "json",
         str(input_video)]
+    info = _video_info_defaults()
     try:
         result_json = _run_ffprobe_command(ffprobe_cmd, log_prefix="FFprobe video info")
         if not result_json:
-            return {'duration': 0.0, 'frame_rate': fractions.Fraction(25, 1)}
+            return info
         data = json.loads(result_json)
         duration_str = data.get("format", {}).get("duration")
-        duration = float(duration_str) if duration_str else 0.0
+        info['duration'] = float(duration_str) if duration_str else 0.0
         streams = data.get("streams", [])
-        frame_rate_str = "25/1"
-        if streams:
-            frame_rate_str = streams[0].get("avg_frame_rate", "25/1")
-        frame_rate = (fractions.Fraction(frame_rate_str)
-                      if (frame_rate_str and frame_rate_str != "0/0")
-                      else fractions.Fraction(25, 1))
-        return {'duration': duration, 'frame_rate': frame_rate}
+        stream = streams[0] if streams else {}
+        frame_rate_str = stream.get("avg_frame_rate", "25/1")
+        info['frame_rate'] = (fractions.Fraction(frame_rate_str)
+                              if (frame_rate_str and frame_rate_str != "0/0")
+                              else fractions.Fraction(25, 1))
+        for key in ("field_order", "color_space", "color_transfer", "color_primaries"):
+            info[key] = str(stream.get(key) or "unknown")
     except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError,
             IndexError, TypeError) as e:
         log().warning(f"Could not get video info: {e}. Defaulting duration to 0 and FPS to 25/1.")
-        return {'duration': 0.0, 'frame_rate': fractions.Fraction(25, 1)}
+        return _video_info_defaults()
+    field_order = info['field_order'].lower()
+    if field_order in INTERLACED_FIELD_ORDERS:
+        info['is_interlaced'] = True
+    elif field_order == "progressive":
+        info['is_interlaced'] = False
+    else:
+        info['is_interlaced'] = _first_frame_interlaced(ffprobe_executable, input_video)
+    return info
+
+
+YADIF_FILTER = "yadif=mode=0:parity=auto:deint=1"
+DEFAULT_AUDIO_BITRATE = "192k"
+_AUDIO_BITRATE_RE = re.compile(r"^(\d+)k$")
+
+
+def normalize_audio_bitrate(value: Any) -> str:
+    """'128k' / '128K' / 128 -> '128k'; rejects anything outside 32k-512k."""
+    text = str(value).strip().lower()
+    if text.isdigit():
+        text += "k"
+    match = _AUDIO_BITRATE_RE.match(text)
+    if not match or not 32 <= int(match.group(1)) <= 512:
+        raise ValueError(f"audio bitrate must look like '128k' (32k-512k), not {value!r}")
+    return f"{int(match.group(1))}k"
+
+
+def rung_audio_bitrate(rung: Dict[str, Any], defaults: Optional[Dict[str, Any]] = None,
+                       override: Optional[str] = None) -> str:
+    """A rung's AAC bitrate (SDK v2.7): the job-wide override (``--audio-bitrate``),
+    else the rung's ``audio_bitrate``, else ``defaults.audio_bitrate``, else 192k."""
+    value = (override or rung.get("audio_bitrate")
+             or (defaults or {}).get("audio_bitrate") or DEFAULT_AUDIO_BITRATE)
+    return normalize_audio_bitrate(value)
+
+
+DEINTERLACE_MODES = ("auto", "always", "never")
+
+
+def deinterlace_mode(defaults: Optional[Dict[str, Any]] = None) -> str:
+    """``WZ_DEINTERLACE``, else ``defaults.deinterlace``, else ``auto``."""
+    raw = os.getenv("WZ_DEINTERLACE") or (defaults or {}).get("deinterlace") or "auto"
+    mode = str(raw).strip().lower()
+    if mode not in DEINTERLACE_MODES:
+        raise ValueError(f"deinterlace must be one of {', '.join(DEINTERLACE_MODES)}, "
+                         f"not {raw!r}")
+    return mode
+
+
+def should_deinterlace(mode: str, is_interlaced: Optional[bool]) -> bool:
+    """Whether the PROGRESSIVE rungs get yadif for this input.
+
+    ``auto`` skips it only for input known to be progressive; when detection
+    could not tell, it keeps the yadif that every input had before v2.7
+    (``deint=1`` passes progressive-flagged frames through untouched anyway).
+    """
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return is_interlaced is not False
 
 
 def _run_ffprobe_command(cmd_list: List[str],
@@ -570,6 +701,51 @@ def _merge_transcoded_clips(ffmpeg_executable: str,
     return merged_mp4_paths_by_resolution
 
 
+def clip_cut_args(start_seconds, end_seconds, video_fps, stream_type: str = "video"):
+    """Frame-exact ``-ss`` / ``-t`` (and frame count) for one clip.
+
+    Clip timecodes name whole frames, but the cut used to be passed to FFmpeg
+    rounded to milliseconds. FFmpeg keeps floor(t x fps) frames, so whenever a
+    clip's length rounded *down* (599.966033 s -> 599.966 for a 17981-frame
+    clip at 29.97) the clip lost its last frame. The ESAM markers and the HLS
+    cut times are computed on the exact timeline, so every lost frame moved the
+    real ad split one frame earlier than its marker, and the gap accumulated
+    clip by clip until markers landed a whole segment late.
+
+    Now, with the clip's first frame S and frame count N (EndTimecode
+    exclusive, as before):
+
+    * video: ``-ss`` is (S - 1/4) / fps, a quarter frame before frame S, so
+      the first frame kept is always S whichever way the source's timestamps
+      round (and never a half-frame tie for the fps filter); ``-t`` is
+      (N + 1/2) / fps, which can never cut the last frame; and ``frames``
+      (passed as ``-frames:v``) caps each output at exactly N;
+    * audio: ``-ss`` is exactly S / fps and ``-t`` exactly N / fps, so the audio
+      starts with the video's first frame and is exactly as long.
+
+    Returns ``{"ss": str, "t": str, "frames": int | None}``; ``frames`` is None
+    for audio, or when the frame rate is unusable (then the old rounding is used).
+    """
+    try:
+        fps = video_fps if isinstance(video_fps, fractions.Fraction) \
+            else fractions.Fraction(str(video_fps))
+        if fps <= 0:
+            raise ValueError(video_fps)
+        start_frame = int(round(fractions.Fraction(start_seconds) * fps))
+        frame_count = max(1, int(round((fractions.Fraction(end_seconds)
+                                        - fractions.Fraction(start_seconds)) * fps)))
+    except (ValueError, ZeroDivisionError, TypeError):
+        duration = float(end_seconds) - float(start_seconds)
+        return {"ss": f"{float(start_seconds):.3f}", "t": f"{duration:.3f}", "frames": None}
+    if stream_type == "video":
+        ss = (start_frame - fractions.Fraction(1, 4)) / fps if start_frame > 0 else 0
+        t = (frame_count + fractions.Fraction(1, 2)) / fps
+        return {"ss": f"{float(ss):.6f}", "t": f"{float(t):.6f}", "frames": frame_count}
+    ss = fractions.Fraction(start_frame) / fps
+    t = fractions.Fraction(frame_count) / fps
+    return {"ss": f"{float(ss):.6f}", "t": f"{float(t):.6f}", "frames": None}
+
+
 def _transcode_clip_with_single_command(clip_index,
                                         video_templates,
                                         abs_input_video,
@@ -585,7 +761,10 @@ def _transcode_clip_with_single_command(clip_index,
                                         current_clip_end_compacted,
                                         video_fps,
                                         current_clip_gop_offset_seconds: float = 0.0,
-                                        stream_type='video'):
+                                        stream_type='video',
+                                        deinterlace: bool = True,
+                                        share_deinterlace: bool = False,
+                                        audio_bitrates: Optional[List[str]] = None):
     """
     Transcodes a single time slice of the input video into multiple outputs.
 
@@ -618,31 +797,44 @@ def _transcode_clip_with_single_command(clip_index,
         video_fps: Frame rate of the video.
         current_clip_gop_offset_seconds: Time offset for the GOP structure.
         stream_type: 'video' or 'audio'.
+        deinterlace: Give PROGRESSIVE rungs yadif (False for progressive input).
+        share_deinterlace: When every rung deinterlaces, run one yadif before
+            the split instead of one per rung (same frames, less CPU).
+        audio_bitrates: The distinct AAC bitrates to encode, one output each
+            (default 192k only, written to the same file name as before).
 
     Returns:
         Dict: Information about the generated outputs (type, paths).
     """
     clip_duration = original_clip_end_seconds - original_clip_start_seconds
+    cut = clip_cut_args(original_clip_start_seconds, original_clip_end_seconds, video_fps,
+                        stream_type)
     ffmpeg_cmd = [
         ffmpeg_executable,
         "-y",
         "-ss",
-        f"{float(original_clip_start_seconds):.3f}",
+        cut["ss"],
         "-t",
-        f"{float(clip_duration):.3f}",
+        cut["t"],
         "-i",
         str(abs_input_video)]
     if stream_type == "video":
         split_labels = "".join([f"[v{i}]" for i in range(len(video_templates))])
-        filter_complex_parts = [f"[0:v]split={len(video_templates)}{split_labels}"]
+        deint_rungs = [deinterlace and res_data.get("interlace_mode") == "PROGRESSIVE"
+                       for res_data in video_templates]
+        shared_yadif = share_deinterlace and bool(deint_rungs) and all(deint_rungs)
+        filter_complex_parts = [
+            f"[0:v]{YADIF_FILTER + ',' if shared_yadif else ''}"
+            f"split={len(video_templates)}{split_labels}"]
         for i, res_data in enumerate(video_templates):
             res_name = res_data["name"]
             video_filters = []
-            if res_data.get("interlace_mode") == "PROGRESSIVE":
-                video_filters.append("yadif=mode=0:parity=auto:deint=1")
+            if deint_rungs[i] and not shared_yadif:
+                video_filters.append(YADIF_FILTER)
+            target_fps = normalize_encoder_framerate(res_data.get("frame_rate") or video_fps)
             video_filters.extend([
                 f'scale=w={res_data["width"]}:h={res_data["height"]}',
-                f'fps={str(res_data.get("frame_rate", video_fps))}'])
+                f'fps={str(target_fps)}'])
             filter_complex_parts.append(
                 f'[v{i}]{",".join(video_filters)}[v_out_{res_name}]')
 
@@ -718,11 +910,15 @@ def _transcode_clip_with_single_command(clip_index,
                                          f"+ n_forced*{precise_gop_duration:.3f})")
             ffmpeg_cmd.extend(["-force_key_frames", force_key_frames_expr])
             ffmpeg_cmd.extend(["-avoid_negative_ts", "make_zero"])
+            if cut["frames"] is not None:
+                # Exactly the planned frame count, so the merged timeline is the
+                # one the ESAM markers and segment cut times are computed on.
+                ffmpeg_cmd.extend(["-frames:v", str(cut["frames"])])
             ffmpeg_cmd.append(str(output_clip_path))
 
     elif stream_type == "audio":
-        output_clip_path = Path(temp_clipping_dir) / f"clip_{clip_index:03d}_audio.mp4"
-        ffmpeg_cmd.extend(["-vn"])
+        bitrates = list(audio_bitrates or [DEFAULT_AUDIO_BITRATE])
+        l_filter = None
         if audio_normalization_enabled and loudnorm_analysis_results:
             s = loudnorm_settings
             r = loudnorm_analysis_results
@@ -730,9 +926,20 @@ def _transcode_clip_with_single_command(clip_index,
                         f':TP={s.get("tp", -2.0)}:measured_I={r.get("input_i")}'
                         f':measured_LRA={r.get("input_lra")}:measured_TP={r.get("input_tp")}'
                         f':offset={r.get("target_offset")}:linear=true:print_format=summary')
-            ffmpeg_cmd.extend(["-af", l_filter])
-        ffmpeg_cmd.extend(["-c:a", "aac", "-ar", "48000", "-b:a", "192k",
-                           "-avoid_negative_ts", "make_zero", str(output_clip_path)])
+        # One output per bitrate from a single decode. Each output repeats the
+        # options, so each picks the same source track as a single output does.
+        audio_outputs = {}
+        for bitrate in bitrates:
+            name = (f"clip_{clip_index:03d}_audio.mp4" if len(bitrates) == 1
+                    else f"clip_{clip_index:03d}_audio_{bitrate}.mp4")
+            audio_outputs[bitrate] = Path(temp_clipping_dir) / name
+            ffmpeg_cmd.extend(["-vn"])
+            if l_filter:
+                ffmpeg_cmd.extend(["-af", l_filter])
+            ffmpeg_cmd.extend(["-c:a", "aac", "-ar", "48000", "-b:a", bitrate,
+                               "-avoid_negative_ts", "make_zero",
+                               str(audio_outputs[bitrate])])
+        output_clip_path = audio_outputs[bitrates[0]]
     else:
         raise ValueError(f"Unsupported stream_type: {stream_type}")
 
@@ -745,7 +952,8 @@ def _transcode_clip_with_single_command(clip_index,
         return {'type': "video",
                 'outputs': {k: str(v) for k, v in results_this_clip.items()}}
     else:
-        return {'type': "audio", 'output': str(output_clip_path)}
+        return {'type': "audio", 'output': str(output_clip_path),
+                'outputs': {k: str(v) for k, v in audio_outputs.items()}}
 
 
 # What an audio-only clip encode reserves from the CPU budget. AAC is cheap next
@@ -860,8 +1068,11 @@ def generate_clipped_transcoded_merged_mp4s(
         loudnorm_analysis_results: Dict[str, Any],
         loudnorm_settings: Dict[str, Any],
         clip_gop_offsets: List[float] = [],
-        esam_events: List[Dict[str, Any]] = []
-) -> Tuple[Dict[str, str], Optional[str], float, Optional[Path], List[Dict[str, Any]]]:
+        esam_events: List[Dict[str, Any]] = [],
+        deinterlace: bool = True,
+        share_deinterlace: bool = False,
+        audio_bitrate_by_rung: Optional[Dict[str, str]] = None
+) -> Tuple[Dict[str, str], Dict[str, str], float, Optional[Path], List[Dict[str, Any]]]:
     """
     Orchestrates the parallel transcoding and merging of video clips.
 
@@ -894,11 +1105,16 @@ def generate_clipped_transcoded_merged_mp4s(
         loudnorm_settings: Configuration settings for audio normalization.
         clip_gop_offsets: List of time offsets to shift GOP boundaries for each clip.
         esam_events: List of ESAM events to be remapped to the output timeline.
+        deinterlace: Give PROGRESSIVE rungs yadif (see :func:`should_deinterlace`).
+        share_deinterlace: One yadif before the split when every rung needs it.
+        audio_bitrate_by_rung: Rung name -> AAC bitrate. Missing rungs get 192k.
+            Each distinct bitrate is encoded and merged once.
 
     Returns:
         A tuple containing:
         - merged_video_paths (Dict[str, str]): Map of resolution name to path of the merged video MP4.
-        - merged_audio_path (Optional[str]): Path to the merged audio AAC file.
+        - merged_audio_by_rung (Dict[str, str]): Map of resolution name to the
+          merged audio at that rung's bitrate (empty when nothing was produced).
         - final_duration (float): Total duration of the merged content in seconds.
         - temp_clipping_dir (Optional[Path]): Path to the temporary directory created.
         - remapped_esam_events (List[Dict[str, Any]]): ESAM events adjusted for the merged timeline.
@@ -910,18 +1126,34 @@ def generate_clipped_transcoded_merged_mp4s(
     temp_clipping_dir = Path(tempfile.mkdtemp(prefix="hls_clips_transcoded_", dir=temp_dir))
     log().info(f"Created temporary directory for transcoded clips: {temp_clipping_dir}")
     abs_input_video = Path(os.path.abspath(str(input_video)))
+    # The exact rate: float(30000/1001) is 29.97002997002997, which is not a
+    # drop-frame rate, so drop-frame clip timecodes would fail to parse.
     remapped_esam_events = remap_esam_events_for_merged_clips(esam_events, clippings,
-                                                              float(video_fps))
+                                                              video_fps)
+    audio_bitrate_by_rung = {res["name"]: (audio_bitrate_by_rung or {}).get(
+        res["name"], DEFAULT_AUDIO_BITRATE) for res in video_templates}
+    audio_bitrates = sorted(set(audio_bitrate_by_rung.values()) or {DEFAULT_AUDIO_BITRATE},
+                            key=lambda b: -int(b[:-1]))
+    transcode_video = functools.partial(_transcode_clip_with_single_command,
+                                        deinterlace=deinterlace,
+                                        share_deinterlace=share_deinterlace)
+    transcode_audio = functools.partial(_transcode_clip_with_single_command,
+                                        audio_bitrates=audio_bitrates)
+    log().info(f"Deinterlace: {'on' if deinterlace else 'off'} for PROGRESSIVE rungs"
+               + (" (one shared yadif)" if deinterlace and share_deinterlace else "")
+               + f". Audio bitrate(s): {', '.join(audio_bitrates)} "
+               f"({', '.join(f'{k}={v}' for k, v in audio_bitrate_by_rung.items())}).")
     tasks = []
     total_merged_duration = 0.0
     for i, clip in enumerate(clippings):
-        start_seconds = timecode_to_seconds(clip["StartTimecode"], str(video_fps))
-        end_seconds = timecode_to_seconds(clip["EndTimecode"], str(video_fps))
+        start_seconds = timecode_to_seconds(clip["StartTimecode"], str(video_fps),
+                                            allow_colon_df=True)
+        end_seconds = timecode_to_seconds(clip["EndTimecode"], str(video_fps), allow_colon_df=True)
         clip_duration = float(end_seconds) - float(start_seconds)
         clip_start_compacted = total_merged_duration
         clip_end_compacted = total_merged_duration + clip_duration
         tasks.append((
-            _transcode_clip_with_single_command,
+            transcode_video,
             i,
             video_templates,
             abs_input_video,
@@ -939,7 +1171,7 @@ def generate_clipped_transcoded_merged_mp4s(
             clip_gop_offsets[i] if i < len(clip_gop_offsets) else 0.0,
             "video"))
         tasks.append((
-            _transcode_clip_with_single_command,
+            transcode_audio,
             i, [],
             abs_input_video,
             temp_clipping_dir,
@@ -957,7 +1189,7 @@ def generate_clipped_transcoded_merged_mp4s(
         total_merged_duration = clip_end_compacted
 
     video_clips_per_res = {res["name"]: [] for res in video_templates}
-    audio_clips = []
+    audio_clips = {bitrate: [] for bitrate in audio_bitrates}
     ctx = current_context()
     completed = 0
     total_tasks = len(tasks)
@@ -1012,7 +1244,8 @@ def generate_clipped_transcoded_merged_mp4s(
                     for res_name, path in result["outputs"].items():
                         video_clips_per_res[res_name].append(Path(path))
                 elif result["type"] == "audio":
-                    audio_clips.append(Path(result["output"]))
+                    for bitrate, path in result["outputs"].items():
+                        audio_clips[bitrate].append(Path(path))
 
                 completed += 1
                 if ctx is not None:
@@ -1031,16 +1264,23 @@ def generate_clipped_transcoded_merged_mp4s(
         ctx.set_stage("MERGING", 0.0)
     merged_video_paths = _merge_transcoded_clips(ffmpeg_executable, video_clips_per_res,
                                                  temp_clipping_dir)
-    audio_clips_for_merge = {"audio": audio_clips}
-    merged_audio_paths = _merge_transcoded_clips(ffmpeg_executable, audio_clips_for_merge,
-                                                 temp_clipping_dir)
-    merged_audio_path = merged_audio_paths.get("audio")
+    # One bitrate keeps the old name (merged_audio.mp4); several get one each.
+    merge_key = {bitrate: ("audio" if len(audio_bitrates) == 1 else f"audio_{bitrate}")
+                 for bitrate in audio_bitrates}
+    merged_audio_paths = _merge_transcoded_clips(
+        ffmpeg_executable, {merge_key[b]: clips for b, clips in audio_clips.items()},
+        temp_clipping_dir)
+    merged_audio_by_rung = {}
+    for res_name, bitrate in audio_bitrate_by_rung.items():
+        path = merged_audio_paths.get(merge_key[bitrate])
+        if path:
+            merged_audio_by_rung[res_name] = path
     final_duration = 0.0
     if merged_video_paths:
         ref_path = next(iter(merged_video_paths.values()))
         final_duration = get_video_info(ffprobe_executable, ref_path)["duration"]
     return (merged_video_paths,
-            merged_audio_path,
+            merged_audio_by_rung,
             final_duration,
             temp_clipping_dir,
             remapped_esam_events)
@@ -1073,8 +1313,9 @@ def validate_clippings(clippings: List[Dict[str, Any]], video_fps: fractions.Fra
     """Validates a list of clipping configurations to ensure they have positive durations."""
     for i, clip in enumerate(clippings):
         try:
-            s_check = timecode_to_seconds(clip["StartTimecode"], str(video_fps))
-            e_check = timecode_to_seconds(clip["EndTimecode"], str(video_fps))
+            s_check = timecode_to_seconds(clip["StartTimecode"], str(video_fps),
+                                          allow_colon_df=True)
+            e_check = timecode_to_seconds(clip["EndTimecode"], str(video_fps), allow_colon_df=True)
             if e_check <= s_check:
                 raise ValueError("Duration must be positive.")
         except Exception as e:

@@ -181,7 +181,7 @@ def _create_job(config, payload, overrides, settings, idempotency_key) -> Dict[s
 # ---------------------------------------------------------------------------
 _STRING_FIELDS = ("name", "input_video", "subtitle_file", "subtitle_language",
                   "output_dir", "template", "resolutions", "s3_bucket", "s3_key_prefix",
-                  "esam_scc_xml", "esam_mcc_xml")
+                  "esam_scc_xml", "esam_mcc_xml", "audio_bitrate")
 _BOOL_FIELDS = ("esam", "audio_norm", "generate_thumbnails", "upload",
                 "delete_local_output", "debug")
 _OTHER_FIELDS = ("duration", "transcode_workers", "clippings", "hls_settings", "config")
@@ -251,6 +251,10 @@ def validate_payload(payload: Dict[str, Any]) -> List[str]:
                 except ValueError:
                     raise ValueError(f"clippings[{i}].{key} is not a timecode "
                                      f"(HH:MM:SS:FF): {value!r}") from None
+
+    if payload.get("audio_bitrate") is not None:
+        from hls_toolkit.ffmpeg_wrapper import normalize_audio_bitrate
+        normalize_audio_bitrate(payload["audio_bitrate"])
 
     inline = payload.get("config")
     if inline is not None and not isinstance(inline, dict):
@@ -368,6 +372,7 @@ def _overrides_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "resolution": payload.get("resolutions"),
         "esam": payload.get("esam"),
         "audio_norm": payload.get("audio_norm"),
+        "audio_bitrate": payload.get("audio_bitrate"),
         "thumbnails_enabled": payload.get("generate_thumbnails"),
         "upload": payload.get("upload"),
         "delete_local_output": payload.get("delete_local_output"),

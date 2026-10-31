@@ -161,6 +161,9 @@ def build_parser(config: Dict[str, Any], config_path: str) -> argparse.ArgumentP
                         help="Override the resolutions from config, e.g. 1080p,720p.")
     parser.add_argument("--duration", type=int,
                         help="Process only the first N seconds.")
+    parser.add_argument("--audio-bitrate", default=None,
+                        help="AAC bitrate for every rung, e.g. 128k. Overrides the "
+                             "template's per-rung audio_bitrate.")
     parser.add_argument("--transcode-workers", type=int, default=None,
                         help="Cap on how many clips this job encodes at once. By "
                              "default there is no per-job cap: clips start as soon "
@@ -251,6 +254,7 @@ def main() -> int:
         "resolution": args.resolution,
         "esam": args.esam,
         "audio_norm": args.audio_norm,
+        "audio_bitrate": args.audio_bitrate,
         "thumbnails_enabled": args.thumbnails_enabled,
         "upload": args.upload,
         "delete_local_output": not args.keep_local,

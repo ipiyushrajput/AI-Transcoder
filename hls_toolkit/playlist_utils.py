@@ -1,7 +1,7 @@
 import logging
 import re
 from pathlib import Path
-from typing import List, Tuple, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 from hls_toolkit.job_context import log
 
@@ -76,6 +76,56 @@ def has_marker_near(lines: List[str], insert_index: int, prefixes: List[str], wi
     return False
 
 
+def calculate_bitrates_from_segments(media_playlist_path: Path) -> Dict[str, int]:
+    """Measure a rendition's bitrates from the segments it actually produced.
+
+    Returns ``{"bandwidth": ..., "avg_bandwidth": ...}`` in bits per second:
+    BANDWIDTH is the highest per-segment bitrate plus 10% headroom (the HLS
+    spec requires it to cover the peak, including audio and TS overhead), and
+    AVERAGE-BANDWIDTH is total bits over total duration. Both are 0 when the
+    playlist or its segments cannot be read, so the caller can fall back.
+    """
+    empty = {"bandwidth": 0, "avg_bandwidth": 0}
+    media_playlist_path = Path(media_playlist_path)
+    if not media_playlist_path.exists():
+        log().warning(f"Media playlist not found for bitrate calculation: {media_playlist_path}")
+        return empty
+    try:
+        _, segments, _, _ = parse_variant_segments(media_playlist_path)
+    except (OSError, IOError) as e:
+        log().warning(f"Could not read media playlist {media_playlist_path} "
+                      f"for bitrate calculation: {e}")
+        return empty
+    if not segments:
+        log().warning(f"No segments found in {media_playlist_path} for bitrate calculation.")
+        return empty
+
+    output_dir = media_playlist_path.parent
+    segment_bitrates = []
+    total_bits = 0
+    total_duration = 0.0
+    for start, end, filename, _ in segments:
+        segment_path = output_dir / filename
+        if not segment_path.exists():
+            continue
+        size_bits = segment_path.stat().st_size * 8
+        total_bits += size_bits
+        duration = end - start
+        if duration > 0:
+            segment_bitrates.append(size_bits / duration)
+            total_duration += duration
+    if not segment_bitrates:
+        return empty
+
+    peak = int(max(segment_bitrates))
+    average = int(total_bits / total_duration) if total_duration > 0 else 0
+    peak_buffered = int(peak * 1.1)
+    log().info(f"Calculated for {media_playlist_path.name}: Peak Bitrate={peak / 1e6:.2f} Mbps, "
+               f"Avg Bitrate={average / 1e6:.2f} Mbps, "
+               f"Buffered Peak (BANDWIDTH)={peak_buffered / 1e6:.2f} Mbps")
+    return {"bandwidth": peak_buffered, "avg_bandwidth": average}
+
+
 # RFC 6381 profile_idc values, keyed by the profile name ffprobe reports.
 _HEVC_PROFILE_IDC = {"main": 1, "main 10": 2, "main10": 2,
                      "main still picture": 3, "rext": 4, "main 4:2:2 10": 4}
@@ -118,8 +168,15 @@ def create_master_playlist(master_playlist_path: str,
                            hls_sub_playlist_path: Path,
                            sub_lang: str,
                            _get_video_stream_details,
-                           _get_h264_profile_idc):
-    """Generates the HLS master playlist."""
+                           _get_h264_profile_idc,
+                           bitrate_data_by_resolution: Optional[Dict[str, Dict[str, int]]] = None):
+    """Generates the HLS master playlist.
+
+    `bitrate_data_by_resolution` holds bitrates measured from the generated
+    segments (see :func:`calculate_bitrates_from_segments`); a rendition
+    without a measurement falls back to the template's bitrate / vbv-maxrate.
+    """
+    bitrate_data_by_resolution = bitrate_data_by_resolution or {}
     with open(master_playlist_path, "w") as master_pl_file:
         master_pl_file.write("#EXTM3U\n")
         master_pl_file.write("#EXT-X-VERSION:3\n")
@@ -144,8 +201,12 @@ def create_master_playlist(master_playlist_path: str,
                     level_hex = f"{level:02x}"
                     constraint = "40" if profile_idc == "4d" else "00"
                     video_codec_str = f"avc1.{profile_idc}{constraint}{level_hex}"
-            bandwidth = 0
-            if "bitrate" in res_data and res_data["bitrate"]:
+            measured = bitrate_data_by_resolution.get(res_name) or {}
+            bandwidth = int(measured.get("bandwidth") or 0)
+            avg_bandwidth = int(measured.get("avg_bandwidth") or 0) or bandwidth
+            if bandwidth:
+                pass
+            elif "bitrate" in res_data and res_data["bitrate"]:
                 bandwidth = int(res_data["bitrate"].replace("M", "000000").replace("k", "000"))
             elif "codec_params" in res_data:
                 match = re.search("vbv-maxrate=(\\d+)", res_data["codec_params"])
@@ -155,7 +216,8 @@ def create_master_playlist(master_playlist_path: str,
                 bandwidth = 2500000
                 log().warning(f"Could not determine bandwidth for resolution {res_name}. "
                                 f"Defaulting to {bandwidth} bps.")
-            avg_bandwidth = bandwidth
+            if not avg_bandwidth:
+                avg_bandwidth = bandwidth
             frame_rate_val = stream_details.get("avg_frame_rate") if stream_details else video_fps
             frame_rate = f"{frame_rate_val:.3f}" if frame_rate_val else f"{video_fps:.3f}"
             stream_inf_parts = [

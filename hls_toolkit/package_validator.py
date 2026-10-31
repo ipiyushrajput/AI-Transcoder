@@ -86,7 +86,8 @@ def validate_package(output_dir: Path,
                      expected_renditions: List[str],
                      expected_duration: Optional[float] = None,
                      hls_time: float = 6.0,
-                     expect_thumbnails: bool = False) -> Dict[str, Any]:
+                     expect_thumbnails: bool = False,
+                     scte35_pid: Optional[int] = None) -> Dict[str, Any]:
     """Raise TranscodeError(stage VALIDATING_OUTPUT) unless the package is whole.
 
     Checks that the master playlist exists and lists every expected rendition;
@@ -128,6 +129,20 @@ def validate_package(output_dir: Path,
                 problems.append(
                     f"{uri}: runs {totals['duration']:.3f}s but {expected_duration:.3f}s "
                     f"was expected (off by {gap:.3f}s; tolerance {tolerance:.1f}s)")
+
+    if scte35_pid is not None:
+        from hls_toolkit.ts_pmt import declares_scte35
+        for uri in variants:
+            playlist = output_dir / uri
+            if not playlist.is_file():
+                continue
+            segments = [output_dir / line.strip() for line in
+                        playlist.read_text(encoding="utf-8").splitlines()
+                        if line.strip().endswith(".ts")]
+            missing = [s.name for s in segments if s.is_file() and not declares_scte35(s, scte35_pid)]
+            if missing:
+                problems.append(f"{uri}: {len(missing)} segment(s) do not declare the SCTE-35 "
+                                f"PID {scte35_pid:#x} in their PMT, e.g. {missing[0]}")
 
     if expect_thumbnails and not any((output_dir / "thumbnails").glob("*.jpg")):
         problems.append("thumbnails were requested but none were produced")

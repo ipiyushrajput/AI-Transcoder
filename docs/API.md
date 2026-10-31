@@ -40,6 +40,8 @@ server's configured defaults.
 
   "esam": true,
   "audio_norm": true,
+  "audio_bitrate": "128k",                      // AAC bitrate for every rung; omit to
+                                                // use each rung's audio_bitrate
   "generate_thumbnails": true,
   "upload": true,
   "duration": 120,                              // transcode only the first N seconds
