@@ -743,6 +743,56 @@ def test_clip_frames_in_a_real_job(work: Path, binaries: dict):
     check("all five breaks are marked", playlist.count("#EXT-X-CUE-OUT:"), 5)
 
 
+def test_v27_interlace_and_audio(work: Path, binaries: dict):
+    """SDK v2.7 in a real job: yadif only for interlaced input."""
+    print("v2.7 interlace detection in a job")
+    import re
+    from hls_toolkit.runner import run_transcode_job
+
+    media = work / "v27_job"
+    media.mkdir(parents=True, exist_ok=True)
+    source = media / f"{CHANNEL}.mp4"
+    source.write_bytes(os.urandom(4096))
+
+    def run(name, env, extra_defaults=None, **overrides):
+        config = build_config(work, binaries)
+        config["defaults"]["subtitle_file"] = None
+        config["defaults"].update(extra_defaults or {})
+        log_root = media / f"logs_{name}"
+        result = _with_env(env, lambda: run_transcode_job(
+            config, overrides=_quick_overrides(
+                source, upload=False, output_dir=name,
+                local_output_dir=str(media / "out"), **overrides),
+            log_root=str(log_root), work_root=str(media / "scratch")))
+        commands = [line[2:] for p in log_root.rglob("ffmpeg.log")
+                    for line in p.read_text().splitlines() if line.startswith("$ ")]
+        return result, commands
+
+    def video_encodes(commands):
+        return [c for c in commands if "_video.mp4" in c and "-filter_complex" in c]
+
+    result, commands = run("v27_progressive", {"FAKE_FIELD_ORDER": "progressive"})
+    check("a progressive job completes", result["status"], "COMPLETED")
+    check_true("progressive input: no yadif in any encode",
+               video_encodes(commands) and not any("yadif" in c for c in commands))
+    master = (Path(result["output_prefix"]) / "channel.m3u8").read_text()
+    check_true("the master playlist lists both rungs",
+               "channel_1080p.m3u8" in master and "channel_720p.m3u8" in master)
+
+    result, commands = run("v27_interlaced", {"FAKE_FIELD_ORDER": "tt"})
+    check("an interlaced job completes", result["status"], "COMPLETED")
+    check_true("interlaced input: one shared yadif per clip encode",
+               video_encodes(commands) and all(c.count("yadif") == 1
+                                               and "deint=1,split=" in c
+                                               for c in video_encodes(commands)))
+
+    result, commands = run("v27_always", {"FAKE_FIELD_ORDER": "progressive"},
+                           {"deinterlace": "always"})
+    check("deinterlace=always still completes", result["status"], "COMPLETED")
+    check_true("deinterlace=always: yadif per rung as before v2.7",
+               all(c.count("yadif") == 2 for c in video_encodes(commands)))
+
+
 def _quick_overrides(source, **extra):
     """Overrides for a fast job: no ESAM, loudnorm or thumbnails."""
     overrides = {"input_video": str(source), "esam": False, "audio_norm": False,
@@ -1470,6 +1520,8 @@ def main():
         test_esam_at_2997(work, binaries)
         print()
         test_clip_frames_in_a_real_job(work, binaries)
+        print()
+        test_v27_interlace_and_audio(work, binaries)
         print()
         test_s3_permission_errors_explain_credentials(work, binaries)
         print()

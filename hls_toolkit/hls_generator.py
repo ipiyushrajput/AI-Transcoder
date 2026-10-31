@@ -19,7 +19,8 @@ from hls_toolkit.ffmpeg_wrapper import (get_video_info, run_loudnorm_analysis,
                                         generate_clipped_transcoded_merged_mp4s,
                                         _generate_hls_for_resolution, generate_thumbnails,
                                         _get_video_stream_details, _get_h264_profile_idc,
-                                        get_ffprobe_first_pts, validate_clippings)
+                                        get_ffprobe_first_pts, validate_clippings,
+                                        deinterlace_mode, should_deinterlace)
 from hls_toolkit.package_validator import validate_package
 from hls_toolkit.playlist_utils import (calculate_bitrates_from_segments,
                                         create_master_playlist, parse_variant_segments)
@@ -179,10 +180,13 @@ def generate_hls_workflow(config: Dict[str, Any],
                 f"input file '{input_video}' may be corrupt, empty or not a video.",
                 stage="PROBING")
         log().info(f"Detected video properties: FPS={video_fps}, "
-                   f"Duration={original_video_duration}s")
+                   f"Duration={original_video_duration}s, "
+                   f"field_order={video_info.get('field_order', 'unknown')}, "
+                   f"interlaced={_interlace_text(video_info.get('is_interlaced'))}")
         if ctx is not None:
             ctx.metadata["source_duration_seconds"] = round(original_video_duration, 3)
             ctx.metadata["source_fps"] = str(video_fps)
+            ctx.metadata["source_field_order"] = video_info.get("field_order", "unknown")
             ctx.set_stage("PROBING", 1.0)
     except TranscodeError:
         raise
@@ -388,6 +392,18 @@ def generate_hls_workflow(config: Dict[str, Any],
 
         validate_unique_rung_names(template_name, selected_resolutions_data)
 
+        try:
+            mode = deinterlace_mode(defaults)
+        except ValueError as e:
+            raise TranscodeError(str(e), stage="VALIDATION") from e
+        is_interlaced = video_info.get("is_interlaced")
+        deinterlace = should_deinterlace(mode, is_interlaced)
+        log().info(f"Deinterlace mode '{mode}': input is "
+                   f"{_interlace_text(is_interlaced)}, so PROGRESSIVE rungs are "
+                   + ("deinterlaced (yadif)." if deinterlace else "not deinterlaced."))
+        if ctx is not None:
+            ctx.metadata["deinterlaced"] = deinterlace
+
         log().info('Processing for the following resolutions: '
                      f'{[res["name"] for res in selected_resolutions_data]}')
         for res_data in selected_resolutions_data:
@@ -446,7 +462,8 @@ def generate_hls_workflow(config: Dict[str, Any],
                     video_fps, selected_resolutions_data, output_dir, duration,
                     transcode_workers, Path(temp_dir), audio_norm, loudnorm_analysis_results,
                     loudnorm_settings, clip_gop_offsets=clip_gop_offsets,
-                    esam_events=(events if esam else []))
+                    esam_events=(events if esam else []),
+                    deinterlace=deinterlace, share_deinterlace=(mode == "auto"))
 
             if esam and remapped_esam_events_for_video:
                 events = remapped_esam_events_for_video
@@ -704,6 +721,11 @@ def _declare_scte35_pid(output_dir: Path, selected_resolutions_data, defaults) -
                + (f" ({counts['present']} already had it)" if counts["present"] else "")
                + (f", {counts['skipped']} skipped" if counts["skipped"] else "") + ".")
     return pid
+
+
+def _interlace_text(is_interlaced: Optional[bool]) -> str:
+    return {True: "interlaced", False: "progressive"}.get(is_interlaced,
+                                                          "of unknown scan type")
 
 
 def _package_rendition(res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,

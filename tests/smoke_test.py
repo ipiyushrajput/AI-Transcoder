@@ -441,6 +441,113 @@ def test_ffmpeg_command():
         check_true(label, expected in " ".join(str(a) for a in captured[0]))
 
 
+def test_interlace_detection():
+    """SDK v2.7: field_order decides, the first frame's flag is the fallback."""
+    print("interlace detection")
+    import json as _json
+    original = fw._run_ffprobe_command
+
+    def probe(field_order, frame_flag=None, fail=False):
+        def fake(cmd, **kw):
+            if fail:
+                raise fw.subprocess.CalledProcessError(1, cmd, output="")
+            if "frame=interlaced_frame,top_field_first" in cmd:
+                frames = [] if frame_flag is None else [{"interlaced_frame": frame_flag}]
+                return _json.dumps({"frames": frames})
+            stream = {"avg_frame_rate": "25/1"}
+            if field_order is not None:
+                stream["field_order"] = field_order
+            return _json.dumps({"streams": [stream], "format": {"duration": "10.0"}})
+        fw._run_ffprobe_command = fake
+        try:
+            return fw.get_video_info("ffprobe", "/in/movie.mp4")
+        finally:
+            fw._run_ffprobe_command = original
+
+    check("tt is interlaced", probe("tt")["is_interlaced"], True)
+    check("bb is interlaced", probe("bb")["is_interlaced"], True)
+    check("progressive is not", probe("progressive")["is_interlaced"], False)
+    check("unknown field order: an interlaced first frame decides",
+          probe("unknown", 1)["is_interlaced"], True)
+    check("no field order: a progressive first frame decides",
+          probe(None, 0)["is_interlaced"], False)
+    check("nothing readable: unknown (None)", probe(None)["is_interlaced"], None)
+    info = probe("tt")
+    check("duration and fps are still returned", (info["duration"], info["frame_rate"]),
+          (10.0, Fraction(25)))
+    check("a failed probe keeps the old defaults and None",
+          {k: probe(None, fail=True)[k] for k in ("duration", "frame_rate", "is_interlaced")},
+          {"duration": 0.0, "frame_rate": Fraction(25), "is_interlaced": None})
+
+    s = fw.should_deinterlace
+    check("auto: progressive input is not deinterlaced", s("auto", False), False)
+    check("auto: interlaced input is", s("auto", True), True)
+    check("auto: unknown input keeps the old yadif", s("auto", None), True)
+    check("always / never ignore detection",
+          (s("always", False), s("never", True)), (True, False))
+    check("the default mode is auto", fw.deinterlace_mode({}), "auto")
+    check("defaults.deinterlace is read", fw.deinterlace_mode({"deinterlace": "Always"}),
+          "always")
+    os.environ["WZ_DEINTERLACE"] = "never"
+    try:
+        check("WZ_DEINTERLACE wins over the config",
+              fw.deinterlace_mode({"deinterlace": "always"}), "never")
+    finally:
+        del os.environ["WZ_DEINTERLACE"]
+    try:
+        fw.deinterlace_mode({"deinterlace": "sometimes"})
+        check("an unknown mode is rejected", False, True)
+    except ValueError:
+        check("an unknown mode is rejected", True, True)
+
+
+def _clip_command(ladder, kind="video", **kw):
+    captured = []
+    original = fw._run_ffmpeg_command_with_logging
+    fw._run_ffmpeg_command_with_logging = lambda cmd, **k: (captured.append(cmd), ("", ""))[1]
+    try:
+        result = fw._transcode_clip_with_single_command(
+            3, ladder, "/in/movie.mp4", "/tmp/clips", "ffmpeg", 0.0, 12.0, False, {}, {},
+            [], 0.0, 12.0, 25, 0.0, kind, **kw)
+    finally:
+        fw._run_ffmpeg_command_with_logging = original
+    return [str(a) for a in captured[0]], result
+
+
+def test_deinterlace_commands():
+    print("deinterlace commands")
+    ladder = [{"name": "1080p", "width": 1920, "height": 1080, "codec": "H_264",
+               "interlace_mode": "PROGRESSIVE", "bitrate": "3000k", "GopSize": 6},
+              {"name": "720p", "width": 1280, "height": 720, "codec": "H_264",
+               "interlace_mode": "PROGRESSIVE", "bitrate": "1500k", "GopSize": 6}]
+
+    def graph(cmd):
+        return cmd[cmd.index("-filter_complex") + 1]
+
+    before = ("[0:v]split=2[v0][v1];"
+              "[v0]yadif=mode=0:parity=auto:deint=1,scale=w=1920:h=1080,fps=25[v_out_1080p];"
+              "[v1]yadif=mode=0:parity=auto:deint=1,scale=w=1280:h=720,fps=25[v_out_720p]")
+    check("default arguments: the pre-v2.7 filter graph", graph(_clip_command(ladder)[0]),
+          before)
+    check("always (no sharing): the pre-v2.7 filter graph",
+          graph(_clip_command(ladder, deinterlace=True, share_deinterlace=False)[0]), before)
+    check("auto, progressive input: no yadif",
+          graph(_clip_command(ladder, deinterlace=False, share_deinterlace=True)[0]),
+          "[0:v]split=2[v0][v1];[v0]scale=w=1920:h=1080,fps=25[v_out_1080p];"
+          "[v1]scale=w=1280:h=720,fps=25[v_out_720p]")
+    check("auto, interlaced input: one yadif before the split",
+          graph(_clip_command(ladder, deinterlace=True, share_deinterlace=True)[0]),
+          "[0:v]yadif=mode=0:parity=auto:deint=1,split=2[v0][v1];"
+          "[v0]scale=w=1920:h=1080,fps=25[v_out_1080p];"
+          "[v1]scale=w=1280:h=720,fps=25[v_out_720p]")
+    mixed = [dict(ladder[0]), dict(ladder[1], interlace_mode="INTERLACED")]
+    check("a rung that is not PROGRESSIVE keeps its fields, so yadif stays per rung",
+          graph(_clip_command(mixed, deinterlace=True, share_deinterlace=True)[0]),
+          "[0:v]split=2[v0][v1];"
+          "[v0]yadif=mode=0:parity=auto:deint=1,scale=w=1920:h=1080,fps=25[v_out_1080p];"
+          "[v1]scale=w=1280:h=720,fps=25[v_out_720p]")
+
+
 def test_environment_diagnostics():
     """A broken TLS stack must be named as such, not blamed on S3."""
     print("environment diagnostics")
@@ -1171,6 +1278,8 @@ def main():
         test_esam(work, variant, segments)
         test_ffmpeg_command()
         test_clip_cuts_frame_exact()
+        test_interlace_detection()
+        test_deinterlace_commands()
         test_markers_follow_real_splits(work)
         test_hevc_codec_string()
         test_duplicate_rung_guard()

@@ -40,8 +40,17 @@ def run_ffprobe(argv):
                                        "codec_name": "h264",
                                        "codec_tag_string": "avc1"}]}))
         return 0
+    if "frame=interlaced_frame" in entries:
+        # Test switch: the first frame's interlace flag (absent when unset).
+        flag = os.getenv("FAKE_INTERLACED_FRAME")
+        frames = [{"interlaced_frame": int(flag), "top_field_first": 1}] if flag else []
+        print(json.dumps({"frames": frames}))
+        return 0
     if "format=duration" in entries and "-of" in argv and arg_after(argv, "-of") == "json":
-        print(json.dumps({"streams": [{"avg_frame_rate": FPS}],
+        stream = {"avg_frame_rate": FPS}
+        if os.getenv("FAKE_FIELD_ORDER"):        # test switch: tt, bb, progressive...
+            stream["field_order"] = os.getenv("FAKE_FIELD_ORDER")
+        print(json.dumps({"streams": [stream],
                           "format": {"duration": f"{DURATION:.6f}"}}))
         return 0
     if "format=duration" in entries:

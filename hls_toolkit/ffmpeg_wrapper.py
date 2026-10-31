@@ -12,6 +12,7 @@ import tempfile
 import math
 import collections
 import concurrent.futures
+import functools
 import threading
 import time
 from pathlib import Path
@@ -198,9 +199,43 @@ def normalize_encoder_framerate(frame_rate) -> fractions.Fraction:
     return rate
 
 
+INTERLACED_FIELD_ORDERS = ("tt", "bb", "tb", "bt")
+
+
+def _video_info_defaults() -> Dict[str, Any]:
+    return {'duration': 0.0, 'frame_rate': fractions.Fraction(25, 1),
+            'is_interlaced': None, 'field_order': "unknown", 'color_space': "unknown",
+            'color_transfer': "unknown", 'color_primaries': "unknown"}
+
+
+def _first_frame_interlaced(ffprobe_executable: str,
+                            input_video: Union[str, Path]) -> Optional[bool]:
+    """Whether the first video frame is flagged interlaced; None if unreadable."""
+    cmd = [ffprobe_executable, "-v", "error", "-select_streams", "v:0",
+           "-read_intervals", "%+#1",
+           "-show_entries", "frame=interlaced_frame,top_field_first",
+           "-of", "json", str(input_video)]
+    try:
+        result_json = _run_ffprobe_command(cmd, log_prefix="FFprobe frame interlace")
+        frames = json.loads(result_json or "{}").get("frames") or []
+        if not frames or "interlaced_frame" not in frames[0]:
+            return None
+        return int(frames[0]["interlaced_frame"]) == 1
+    except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError,
+            TypeError, AttributeError) as e:
+        log().warning(f"Could not read the first frame's interlace flag: {e}")
+        return None
+
+
 def get_video_info(ffprobe_executable: str,
-                   input_video: Union[str, Path]) -> Dict[str, Union[float, fractions.Fraction]]:
-    """Gets video information (duration and frame rate) using a single ffprobe call."""
+                   input_video: Union[str, Path]) -> Dict[str, Any]:
+    """Probes duration, frame rate, interlacing and colour description.
+
+    ``is_interlaced`` (SDK v2.7) comes from the stream's ``field_order``
+    (tt/bb/tb/bt is interlaced, progressive is not). When the container does
+    not say, the first frame's ``interlaced_frame`` flag decides. It is None
+    when neither could be read, so callers can fall back to the safe choice.
+    """
     ffprobe_cmd = [
         ffprobe_executable,
         "-v",
@@ -208,31 +243,70 @@ def get_video_info(ffprobe_executable: str,
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=avg_frame_rate",
+        "stream=avg_frame_rate,field_order,color_space,color_transfer,color_primaries",
         "-show_entries",
         "format=duration",
         "-of",
         "json",
         str(input_video)]
+    info = _video_info_defaults()
     try:
         result_json = _run_ffprobe_command(ffprobe_cmd, log_prefix="FFprobe video info")
         if not result_json:
-            return {'duration': 0.0, 'frame_rate': fractions.Fraction(25, 1)}
+            return info
         data = json.loads(result_json)
         duration_str = data.get("format", {}).get("duration")
-        duration = float(duration_str) if duration_str else 0.0
+        info['duration'] = float(duration_str) if duration_str else 0.0
         streams = data.get("streams", [])
-        frame_rate_str = "25/1"
-        if streams:
-            frame_rate_str = streams[0].get("avg_frame_rate", "25/1")
-        frame_rate = (fractions.Fraction(frame_rate_str)
-                      if (frame_rate_str and frame_rate_str != "0/0")
-                      else fractions.Fraction(25, 1))
-        return {'duration': duration, 'frame_rate': frame_rate}
+        stream = streams[0] if streams else {}
+        frame_rate_str = stream.get("avg_frame_rate", "25/1")
+        info['frame_rate'] = (fractions.Fraction(frame_rate_str)
+                              if (frame_rate_str and frame_rate_str != "0/0")
+                              else fractions.Fraction(25, 1))
+        for key in ("field_order", "color_space", "color_transfer", "color_primaries"):
+            info[key] = str(stream.get(key) or "unknown")
     except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError,
             IndexError, TypeError) as e:
         log().warning(f"Could not get video info: {e}. Defaulting duration to 0 and FPS to 25/1.")
-        return {'duration': 0.0, 'frame_rate': fractions.Fraction(25, 1)}
+        return _video_info_defaults()
+    field_order = info['field_order'].lower()
+    if field_order in INTERLACED_FIELD_ORDERS:
+        info['is_interlaced'] = True
+    elif field_order == "progressive":
+        info['is_interlaced'] = False
+    else:
+        info['is_interlaced'] = _first_frame_interlaced(ffprobe_executable, input_video)
+    return info
+
+
+YADIF_FILTER = "yadif=mode=0:parity=auto:deint=1"
+
+
+DEINTERLACE_MODES = ("auto", "always", "never")
+
+
+def deinterlace_mode(defaults: Optional[Dict[str, Any]] = None) -> str:
+    """``WZ_DEINTERLACE``, else ``defaults.deinterlace``, else ``auto``."""
+    raw = os.getenv("WZ_DEINTERLACE") or (defaults or {}).get("deinterlace") or "auto"
+    mode = str(raw).strip().lower()
+    if mode not in DEINTERLACE_MODES:
+        raise ValueError(f"deinterlace must be one of {', '.join(DEINTERLACE_MODES)}, "
+                         f"not {raw!r}")
+    return mode
+
+
+def should_deinterlace(mode: str, is_interlaced: Optional[bool]) -> bool:
+    """Whether the PROGRESSIVE rungs get yadif for this input.
+
+    ``auto`` skips it only for input known to be progressive; when detection
+    could not tell, it keeps the yadif that every input had before v2.7
+    (``deint=1`` passes progressive-flagged frames through untouched anyway).
+    """
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return is_interlaced is not False
 
 
 def _run_ffprobe_command(cmd_list: List[str],
@@ -665,7 +739,9 @@ def _transcode_clip_with_single_command(clip_index,
                                         current_clip_end_compacted,
                                         video_fps,
                                         current_clip_gop_offset_seconds: float = 0.0,
-                                        stream_type='video'):
+                                        stream_type='video',
+                                        deinterlace: bool = True,
+                                        share_deinterlace: bool = False):
     """
     Transcodes a single time slice of the input video into multiple outputs.
 
@@ -698,6 +774,9 @@ def _transcode_clip_with_single_command(clip_index,
         video_fps: Frame rate of the video.
         current_clip_gop_offset_seconds: Time offset for the GOP structure.
         stream_type: 'video' or 'audio'.
+        deinterlace: Give PROGRESSIVE rungs yadif (False for progressive input).
+        share_deinterlace: When every rung deinterlaces, run one yadif before
+            the split instead of one per rung (same frames, less CPU).
 
     Returns:
         Dict: Information about the generated outputs (type, paths).
@@ -716,12 +795,17 @@ def _transcode_clip_with_single_command(clip_index,
         str(abs_input_video)]
     if stream_type == "video":
         split_labels = "".join([f"[v{i}]" for i in range(len(video_templates))])
-        filter_complex_parts = [f"[0:v]split={len(video_templates)}{split_labels}"]
+        deint_rungs = [deinterlace and res_data.get("interlace_mode") == "PROGRESSIVE"
+                       for res_data in video_templates]
+        shared_yadif = share_deinterlace and bool(deint_rungs) and all(deint_rungs)
+        filter_complex_parts = [
+            f"[0:v]{YADIF_FILTER + ',' if shared_yadif else ''}"
+            f"split={len(video_templates)}{split_labels}"]
         for i, res_data in enumerate(video_templates):
             res_name = res_data["name"]
             video_filters = []
-            if res_data.get("interlace_mode") == "PROGRESSIVE":
-                video_filters.append("yadif=mode=0:parity=auto:deint=1")
+            if deint_rungs[i] and not shared_yadif:
+                video_filters.append(YADIF_FILTER)
             target_fps = normalize_encoder_framerate(res_data.get("frame_rate") or video_fps)
             video_filters.extend([
                 f'scale=w={res_data["width"]}:h={res_data["height"]}',
@@ -947,7 +1031,9 @@ def generate_clipped_transcoded_merged_mp4s(
         loudnorm_analysis_results: Dict[str, Any],
         loudnorm_settings: Dict[str, Any],
         clip_gop_offsets: List[float] = [],
-        esam_events: List[Dict[str, Any]] = []
+        esam_events: List[Dict[str, Any]] = [],
+        deinterlace: bool = True,
+        share_deinterlace: bool = False
 ) -> Tuple[Dict[str, str], Optional[str], float, Optional[Path], List[Dict[str, Any]]]:
     """
     Orchestrates the parallel transcoding and merging of video clips.
@@ -981,6 +1067,8 @@ def generate_clipped_transcoded_merged_mp4s(
         loudnorm_settings: Configuration settings for audio normalization.
         clip_gop_offsets: List of time offsets to shift GOP boundaries for each clip.
         esam_events: List of ESAM events to be remapped to the output timeline.
+        deinterlace: Give PROGRESSIVE rungs yadif (see :func:`should_deinterlace`).
+        share_deinterlace: One yadif before the split when every rung needs it.
 
     Returns:
         A tuple containing:
@@ -1001,6 +1089,11 @@ def generate_clipped_transcoded_merged_mp4s(
     # drop-frame rate, so drop-frame clip timecodes would fail to parse.
     remapped_esam_events = remap_esam_events_for_merged_clips(esam_events, clippings,
                                                               video_fps)
+    transcode_video = functools.partial(_transcode_clip_with_single_command,
+                                        deinterlace=deinterlace,
+                                        share_deinterlace=share_deinterlace)
+    log().info(f"Deinterlace: {'on' if deinterlace else 'off'} for PROGRESSIVE rungs"
+               + (" (one shared yadif)" if deinterlace and share_deinterlace else "") + ".")
     tasks = []
     total_merged_duration = 0.0
     for i, clip in enumerate(clippings):
@@ -1011,7 +1104,7 @@ def generate_clipped_transcoded_merged_mp4s(
         clip_start_compacted = total_merged_duration
         clip_end_compacted = total_merged_duration + clip_duration
         tasks.append((
-            _transcode_clip_with_single_command,
+            transcode_video,
             i,
             video_templates,
             abs_input_video,
