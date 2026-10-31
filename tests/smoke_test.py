@@ -548,6 +548,73 @@ def test_deinterlace_commands():
           "[v1]scale=w=1280:h=720,fps=25[v_out_720p]")
 
 
+def test_audio_bitrates():
+    """SDK v2.7: an AAC bitrate per rung, each distinct one encoded once."""
+    print("audio bitrate per rung")
+    cmd, result = _clip_command([], "audio")
+    check("default: the pre-v2.7 audio command", cmd,
+          ["ffmpeg", "-y", "-ss", cmd[3], "-t", cmd[5], "-i", "/in/movie.mp4", "-vn",
+           "-c:a", "aac", "-ar", "48000", "-b:a", "192k", "-avoid_negative_ts",
+           "make_zero", "/tmp/clips/clip_003_audio.mp4"])
+    check("default: the same output name", result["output"], "/tmp/clips/clip_003_audio.mp4")
+    cmd, result = _clip_command([], "audio", audio_bitrates=["192k", "96k"])
+    check("two bitrates: one output each, from one command",
+          [cmd[i + 1] for i, a in enumerate(cmd) if a == "-b:a"], ["192k", "96k"])
+    check("two bitrates: named by bitrate", result["outputs"],
+          {"192k": "/tmp/clips/clip_003_audio_192k.mp4",
+           "96k": "/tmp/clips/clip_003_audio_96k.mp4"})
+    check("each output repeats -vn, so each picks the same source track",
+          cmd.count("-vn"), 2)
+
+    r = fw.rung_audio_bitrate
+    check("the rung's own bitrate", r({"audio_bitrate": "128k"}, {"audio_bitrate": "160k"}),
+          "128k")
+    check("else defaults.audio_bitrate", r({}, {"audio_bitrate": "160k"}), "160k")
+    check("else 192k", r({}, {}), "192k")
+    check("--audio-bitrate overrides every rung", r({"audio_bitrate": "96k"}, {}, "64K"),
+          "64k")
+    for bad in ("loud", "8k", "1000k", "128kbps"):
+        try:
+            fw.normalize_audio_bitrate(bad)
+            check(f"{bad!r} is rejected", False, True)
+        except ValueError:
+            check(f"{bad!r} is rejected", True, True)
+
+    # The orchestration: each rung gets the merged audio at its own bitrate.
+    calls = []
+    saved = (fw._run_ffmpeg_command_with_logging, fw.get_video_info)
+    fw._run_ffmpeg_command_with_logging = lambda cmd, **k: (calls.append(cmd), ("", ""))[1]
+    fw.get_video_info = lambda *a, **k: {"duration": 12.0}
+    work = Path(tempfile.mkdtemp(prefix="aitx_audio_"))
+    ladder = [{"name": n, "width": 640, "height": 360, "codec": "H_264", "bitrate": "1M",
+               "GopSize": 6} for n in ("1080p", "720p", "360p")]
+    clips = [{"StartTimecode": "00:00:00:00", "EndTimecode": "00:00:12:00"}]
+    try:
+        def run(by_rung):
+            calls.clear()
+            return fw.generate_clipped_transcoded_merged_mp4s(
+                "/in/movie.mp4", "ffmpeg", "ffprobe", clips, Fraction(25), ladder, work,
+                None, None, work, False, {}, {}, audio_bitrate_by_rung=by_rung)
+        _, audio, _, tmp, _ = run({"1080p": "192k", "720p": "128k", "360p": "128k"})
+        check("rungs sharing a bitrate share one merged track",
+              {k: Path(v).name for k, v in audio.items()},
+              {"1080p": "merged_audio_192k.mp4", "720p": "merged_audio_128k.mp4",
+               "360p": "merged_audio_128k.mp4"})
+        audio_encodes = [c for c in calls if "-vn" in c]
+        check("one audio encode per clip, whatever the number of bitrates",
+              len(audio_encodes), 1)
+        shutil.rmtree(tmp, ignore_errors=True)
+        _, audio, _, tmp, _ = run(None)
+        check("no bitrates configured: every rung gets merged_audio.mp4 as before",
+              {Path(v).name for v in audio.values()}, {"merged_audio.mp4"})
+        check("no bitrates configured: 192k", [c[c.index("-b:a") + 1] for c in calls
+                                              if "-vn" in c], ["192k"])
+        shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        fw._run_ffmpeg_command_with_logging, fw.get_video_info = saved
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_environment_diagnostics():
     """A broken TLS stack must be named as such, not blamed on S3."""
     print("environment diagnostics")
@@ -1280,6 +1347,7 @@ def main():
         test_clip_cuts_frame_exact()
         test_interlace_detection()
         test_deinterlace_commands()
+        test_audio_bitrates()
         test_markers_follow_real_splits(work)
         test_hevc_codec_string()
         test_duplicate_rung_guard()

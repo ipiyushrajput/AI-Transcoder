@@ -744,8 +744,9 @@ def test_clip_frames_in_a_real_job(work: Path, binaries: dict):
 
 
 def test_v27_interlace_and_audio(work: Path, binaries: dict):
-    """SDK v2.7 in a real job: yadif only for interlaced input."""
-    print("v2.7 interlace detection in a job")
+    """SDK v2.7 in a real job: yadif only for interlaced input, and each rung
+    packaged with the audio encoded at its own bitrate."""
+    print("v2.7 interlace detection and per-rung audio in a job")
     import re
     from hls_toolkit.runner import run_transcode_job
 
@@ -758,6 +759,10 @@ def test_v27_interlace_and_audio(work: Path, binaries: dict):
         config = build_config(work, binaries)
         config["defaults"]["subtitle_file"] = None
         config["defaults"].update(extra_defaults or {})
+        for rung, bitrate in (("1080p", "192k"), ("720p", "128k")):
+            for r in config["video_templates"]["h264_standard"]:
+                if r["name"] == rung:
+                    r["audio_bitrate"] = bitrate
         log_root = media / f"logs_{name}"
         result = _with_env(env, lambda: run_transcode_job(
             config, overrides=_quick_overrides(
@@ -775,6 +780,14 @@ def test_v27_interlace_and_audio(work: Path, binaries: dict):
     check("a progressive job completes", result["status"], "COMPLETED")
     check_true("progressive input: no yadif in any encode",
                video_encodes(commands) and not any("yadif" in c for c in commands))
+    audio = [c for c in commands if " -vn " in c]
+    check_true("one audio encode per clip with both bitrates",
+               audio and all("-b:a 192k" in c and "-b:a 128k" in c for c in audio))
+    packaging = {re.search(r"channel_(\w+)\.m3u8$", c).group(1):
+                 re.search(r"merged_audio\S*\.mp4", c).group(0)
+                 for c in commands if "-f hls" in c}
+    check("each rung is packaged with its own bitrate's audio", packaging,
+          {"1080p": "merged_audio_192k.mp4", "720p": "merged_audio_128k.mp4"})
     master = (Path(result["output_prefix"]) / "channel.m3u8").read_text()
     check_true("the master playlist lists both rungs",
                "channel_1080p.m3u8" in master and "channel_720p.m3u8" in master)
@@ -787,10 +800,13 @@ def test_v27_interlace_and_audio(work: Path, binaries: dict):
                                                for c in video_encodes(commands)))
 
     result, commands = run("v27_always", {"FAKE_FIELD_ORDER": "progressive"},
-                           {"deinterlace": "always"})
+                           {"deinterlace": "always"}, audio_bitrate="96k")
     check("deinterlace=always still completes", result["status"], "COMPLETED")
     check_true("deinterlace=always: yadif per rung as before v2.7",
                all(c.count("yadif") == 2 for c in video_encodes(commands)))
+    check_true("--audio-bitrate: every rung at 96k, under the old file names",
+               all("-b:a 96k" in c and "-b:a 192k" not in c and "clip_" in c
+                   and "_audio.mp4" in c for c in commands if " -vn " in c))
 
 
 def _quick_overrides(source, **extra):

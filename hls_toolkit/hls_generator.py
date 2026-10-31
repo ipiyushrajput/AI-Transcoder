@@ -20,7 +20,8 @@ from hls_toolkit.ffmpeg_wrapper import (get_video_info, run_loudnorm_analysis,
                                         _generate_hls_for_resolution, generate_thumbnails,
                                         _get_video_stream_details, _get_h264_profile_idc,
                                         get_ffprobe_first_pts, validate_clippings,
-                                        deinterlace_mode, should_deinterlace)
+                                        deinterlace_mode, should_deinterlace,
+                                        rung_audio_bitrate)
 from hls_toolkit.package_validator import validate_package
 from hls_toolkit.playlist_utils import (calculate_bitrates_from_segments,
                                         create_master_playlist, parse_variant_segments)
@@ -119,7 +120,8 @@ def generate_hls_workflow(config: Dict[str, Any],
                           esam: bool = False,
                           upload: bool = False,
                           delete_local_output: bool = True,
-                          resolution: Optional[str] = None) -> int:
+                          resolution: Optional[str] = None,
+                          audio_bitrate: Optional[str] = None) -> int:
     """Executes the main HLS VOD generation workflow.
 
     Clips, transcodes, packages as HLS, processes subtitles, injects ESAM ad
@@ -149,6 +151,8 @@ def generate_hls_workflow(config: Dict[str, Any],
         upload: Publish the finished package to S3.
         delete_local_output: Remove the local output directory once every object
             is verified in S3.
+        audio_bitrate: AAC bitrate for every rung (``--audio-bitrate``); None uses
+            each rung's ``audio_bitrate``, then ``defaults.audio_bitrate``, then 192k.
 
     Returns:
         0 on success.
@@ -394,6 +398,9 @@ def generate_hls_workflow(config: Dict[str, Any],
 
         try:
             mode = deinterlace_mode(defaults)
+            audio_bitrate_by_rung = {
+                res["name"]: rung_audio_bitrate(res, defaults, audio_bitrate)
+                for res in selected_resolutions_data}
         except ValueError as e:
             raise TranscodeError(str(e), stage="VALIDATION") from e
         is_interlaced = video_info.get("is_interlaced")
@@ -452,10 +459,10 @@ def generate_hls_workflow(config: Dict[str, Any],
                     log().info(f"  {k}: {v}")
 
         merged_video_paths_by_resolution = {}
-        merged_audio_path = None
+        merged_audio_by_rung = {}
 
         if effective_clippings:
-            (merged_video_paths_by_resolution, merged_audio_path, total_merged_duration,
+            (merged_video_paths_by_resolution, merged_audio_by_rung, total_merged_duration,
              temp_clipping_dir, remapped_esam_events_for_video) = \
                 generate_clipped_transcoded_merged_mp4s(
                     input_video, ffmpeg_executable, ffprobe_executable, effective_clippings,
@@ -463,7 +470,8 @@ def generate_hls_workflow(config: Dict[str, Any],
                     transcode_workers, Path(temp_dir), audio_norm, loudnorm_analysis_results,
                     loudnorm_settings, clip_gop_offsets=clip_gop_offsets,
                     esam_events=(events if esam else []),
-                    deinterlace=deinterlace, share_deinterlace=(mode == "auto"))
+                    deinterlace=deinterlace, share_deinterlace=(mode == "auto"),
+                    audio_bitrate_by_rung=audio_bitrate_by_rung)
 
             if esam and remapped_esam_events_for_video:
                 events = remapped_esam_events_for_video
@@ -504,8 +512,8 @@ def generate_hls_workflow(config: Dict[str, Any],
                         f"No transcoded video was produced for rendition {res_name}, "
                         f"so it cannot be packaged.", stage="PACKAGING_HLS")
                 _package_rendition(
-                    res_data, merged_mp4_path, merged_audio_path, ffmpeg_executable,
-                    total_merged_duration, output_dir, hls_settings,
+                    res_data, merged_mp4_path, merged_audio_by_rung.get(res_name),
+                    ffmpeg_executable, total_merged_duration, output_dir, hls_settings,
                     merged_timeline_cue_points_str)
                 hls_output_paths.append(output_dir / f"channel_{res_name}.m3u8")
         else:
